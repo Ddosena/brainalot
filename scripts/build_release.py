@@ -218,7 +218,8 @@ def extension_zip() -> Path:
 def checksums() -> None:
     lines = []
     for item in sorted(RELEASES.iterdir()):
-        if item.is_file() and item.name != "SHA256SUMS.txt":
+        # assets.win.json is vpk's local upload manifest, not a published asset.
+        if item.is_file() and item.name not in {"SHA256SUMS.txt", "assets.win.json"}:
             lines.append(f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}")
     (RELEASES / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

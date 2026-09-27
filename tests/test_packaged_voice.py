@@ -75,3 +75,13 @@ def test_previous_nupkg_is_available_to_pack_then_removed_from_release_assets(tm
     assert not previous.exists()
     assert {item.name for item in releases.iterdir()} == {
         f"BrainalotApp-{build_release.__version__}-full.nupkg", "releases.win.json"}
+
+
+def test_release_checksums_cover_downloads_without_private_upload_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_release, "RELEASES", tmp_path)
+    (tmp_path / "BrainalotApp-win-Setup.exe").write_bytes(b"installer")
+    (tmp_path / "releases.win.json").write_bytes(b"feed")
+    (tmp_path / "assets.win.json").write_bytes(b"local vpk upload instructions")
+    build_release.checksums()
+    rows = (tmp_path / "SHA256SUMS.txt").read_text().splitlines()
+    assert {line.split("  ", 1)[1] for line in rows} == {"BrainalotApp-win-Setup.exe", "releases.win.json"}
