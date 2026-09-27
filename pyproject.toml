@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brainalot"
+dynamic = ["version"]
+description = "Local-first manager for thoughts, tasks, calendar events, and agent-assisted capture"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0.2,<7", "filelock>=3.16,<4", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "icalendar>=7.3,<8", "recurring-ical-events>=3.8,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1"]
+packaging = ["pyinstaller>=6.10,<7"]
+voice = ["faster-whisper>=1.1,<2"]
+
+[project.scripts]
+megamozg = "megamozg.cli:main"
+mmm = "megamozg.cli:main"
+brainalot = "megamozg.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "megamozg.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["megamozg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

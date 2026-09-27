@@ -1,0 +1,11 @@
+{
+  "extName": {
+    "message": "Brainalot"
+  },
+  "extDescription": {
+    "message": "Локальный менеджер мыслей, дел и расписания в боковой панели Chrome."
+  },
+  "actionTitle": {
+    "message": "Открыть Brainalot"
+  }
+}

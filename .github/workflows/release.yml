@@ -1,0 +1,54 @@
+name: release
+
+# A tag v0.1.39 builds the Windows installer, the update packages and the Chrome Web Store zip,
+# and publishes them as a GitHub release. Brainalot.exe checks this repository's releases for updates.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Tests
+        run: |
+          python -m pip install -r requirements-lock.txt
+          python -m pip install -r requirements-voice.txt
+          python -m pip install -e . --no-deps
+          python -m pytest
+          node --test extension/tests/*.test.mjs
+      - name: The tag must match the program version
+        shell: python
+        run: |
+          import os, megamozg
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          assert tag == megamozg.__version__, (tag, megamozg.__version__)
+      - name: Build tools
+        run: |
+          python -m pip install pyinstaller==6.22.3 velopack==1.2.158
+          dotnet tool install -g vpk --version 1.2.158
+      # Signing: add the certificate here (vpk pack --signParams or --azureTrustedSignFile) before selling.
+      - name: Download the previous release (for delta updates)
+        continue-on-error: true
+        run: vpk download github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases
+      - name: Build the release
+        run: python scripts/build_release.py
+      - name: Publish
+        run: vpk upload github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases --publish --releaseName "Brainalot ${{ github.ref_name }}" --tag ${{ github.ref_name }}
+      - name: Attach the Chrome Web Store zip and checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} dist/releases/Brainalot-extension-*.zip dist/releases/SHA256SUMS.txt --clobber

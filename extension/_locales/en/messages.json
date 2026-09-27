@@ -1,0 +1,11 @@
+{
+  "extName": {
+    "message": "Brainalot"
+  },
+  "extDescription": {
+    "message": "Local manager for thoughts, tasks and schedule in the Chrome side panel."
+  },
+  "actionTitle": {
+    "message": "Open Brainalot"
+  }
+}

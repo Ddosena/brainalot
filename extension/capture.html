@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title data-i18n="Записать — Brainalot">Записать — Brainalot</title>
+  <link rel="stylesheet" href="panel.css">
+  <link rel="stylesheet" href="design.css">
+  <link rel="stylesheet" href="capture.css">
+  <script type="module" src="capture.js"></script>
+</head>
+<body class="capture-page">
+  <main class="capture-shell">
+    <header class="capture-header"><div><p class="capture-brand">Brainalot</p><h1 data-i18n="Записать">Записать</h1></div><button id="capture-close" class="icon-button" type="button" aria-label="Закрыть окно" title="Закрыть окно" data-i18n-attr="aria-label,title"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5l14 14M19 5 5 19"/></svg></button></header>
+    <p class="capture-intro" data-i18n="Пишите или диктуйте как есть: тип, дату, время и проект Brainalot разберёт сам.">Пишите или диктуйте как есть: тип, дату, время и проект Brainalot разберёт сам.</p>
+    <form id="capture-form">
+      <label for="capture-text" class="sr-only" data-i18n="Текст записи">Текст записи</label><div class="capture-input"><textarea id="capture-text" rows="5" placeholder="Например: завтра в 10 созвон с командой. Можно вставить изображение Ctrl+V." maxlength="50000" autofocus data-i18n-attr="placeholder"></textarea><button id="capture-voice" class="voice-button" type="button" data-state="idle" aria-pressed="false" aria-label="Надиктовать" title="Надиктовать" data-i18n-attr="aria-label,title"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></button></div>
+      <p id="capture-voice-status" class="voice-status" role="status" hidden></p>
+      <section id="capture-understanding" class="understanding" aria-labelledby="capture-understanding-label" hidden><div class="understanding-head"><h2 id="capture-understanding-label" class="understanding-label" data-i18n="Понял так">Понял так</h2><button id="capture-route" class="understanding-toggle" type="button" hidden></button></div><ul id="capture-chips" class="understanding-chips"></ul><p id="capture-plan-title" class="understanding-title"></p><ul id="capture-plan-notes" class="understanding-notes"></ul></section>
+      <div class="attachment-picker"><button id="capture-add-files" class="secondary" type="button" data-i18n="＋ Добавить файлы">＋ Добавить файлы</button><input id="capture-files" class="sr-only" type="file" multiple aria-label="Выбрать файлы" data-i18n-attr="aria-label"><span class="attachment-tip" data-i18n="Документы и изображения · до 10 МиБ каждый">Документы и изображения · до 10 МиБ каждый</span></div><div id="capture-attachments" class="attachment-list" aria-live="polite"></div>
+      <div class="capture-quick-row"><label><span data-i18n="Тип записи">Тип записи</span><select id="capture-kind"><option value="auto" data-i18n="Авто">Авто</option><option value="inbox" data-i18n="Входящие">Входящие</option><option value="task" data-i18n="Дело">Дело</option><option value="purchase" data-i18n="Покупка">Покупка</option><option value="media" data-i18n="Медиа">Медиа</option><option value="idea" data-i18n="Идея">Идея</option><option value="thought" data-i18n="Мысль">Мысль</option><option value="link" data-i18n="Ссылка">Ссылка</option><option value="project" data-i18n="Проект">Проект</option><option value="person" data-i18n="Человек">Человек</option></select></label><label><span data-i18n="Когда">Когда</span><select id="capture-schedule"><option value="auto" data-i18n="Авто">Авто</option></select></label></div>
+      <div id="capture-date-row" class="form-row" hidden><label id="capture-date-label" hidden><span data-i18n="Точная дата">Точная дата</span><input id="capture-date" type="date"></label><label id="capture-media-label" hidden><span data-i18n="Что это">Что это</span><select id="capture-media"><option value="movie" data-i18n="Фильм">Фильм</option><option value="series" data-i18n="Сериал">Сериал</option><option value="book" data-i18n="Книга">Книга</option><option value="game" data-i18n="Игра">Игра</option><option value="podcast" data-i18n="Подкаст">Подкаст</option><option value="article" data-i18n="Статья">Статья</option></select></label></div>
+      <details id="capture-options"><summary data-i18n="Дополнительные детали">Дополнительные детали</summary><div class="capture-options-body"><label id="capture-unscheduled-label" class="quick-flag" hidden><input id="capture-unscheduled" type="checkbox"><span data-i18n="Также в делах без срока">Также в делах без срока</span></label><label><span data-i18n="Проект или человек">Проект или человек</span><select id="capture-context"><option value="auto" data-i18n="Авто">Авто</option><option value="" data-i18n="Без привязки">Без привязки</option></select></label><label><span data-i18n="Тема">Тема</span><input id="capture-topic" type="text" maxlength="100" placeholder="Необязательно" data-i18n-attr="placeholder"></label><label><span data-i18n="Важность">Важность</span><select id="capture-importance"><option value="auto" data-i18n="Авто">Авто</option><option value="normal" data-i18n="Обычная">Обычная</option><option value="low" data-i18n="Низкая">Низкая</option><option value="high" data-i18n="Высокая">Высокая</option><option value="critical" data-i18n="Очень высокая">Очень высокая</option></select></label></div></details>
+      <p id="capture-error" class="capture-error" role="alert" hidden></p>
+      <div class="capture-actions"><button id="save-tab" class="secondary" type="button" data-i18n="Сохранить вкладку">Сохранить вкладку</button><button id="capture-submit" class="primary" type="submit"><span data-i18n="Записать">Записать</span> <span class="shortcut">Ctrl+Enter</span></button></div>
+    </form>
+    <p class="capture-hint" data-i18n="Запись сначала сохраняется в локальной очереди Chrome.">Запись сначала сохраняется в локальной очереди Chrome.</p>
+  </main>
+</body>
+</html>

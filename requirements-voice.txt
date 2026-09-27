@@ -1,0 +1,10 @@
+# Windows release voice runtime. Install alongside requirements-lock.txt before PyInstaller.
+# The speech model is deliberately not included; it downloads after the first microphone click.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+numpy==2.5.3
+av==18.1.0
+onnxruntime==1.30.0
+tokenizers==0.23.2
+huggingface-hub==1.33.0
+hf-xet==1.6.0
