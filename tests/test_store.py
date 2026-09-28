@@ -296,6 +296,37 @@ def test_carousel_weight_and_explicit_feedback_only(tmp_path):
     assert next(n for n in store.list_notes() if n["id"] == high["id"])["status"] == "active"
 
 
+def test_project_ideas_resurface_twenty_times_less_often(tmp_path):
+    current = datetime(2026, 9, 19, 12, tzinfo=timezone.utc)
+    store = Store(tmp_path, clock=lambda: current)
+    project = store.capture("Project", kind="project")
+    person = store.capture("Person", kind="person")
+    rare = store.capture("Project idea", kind="idea", context_id=project["id"])
+    regular = [
+        store.capture("Standalone idea", kind="idea"),
+        store.capture("Person idea", kind="idea", context_id=person["id"]),
+        store.capture("Project thought", kind="thought", context_id=project["id"]),
+        store.capture("Project task", kind="task", context_id=project["id"]),
+        person,
+    ]
+    hidden = store.capture("Hidden project idea", kind="idea", context_id=project["id"])
+    store.update(hidden["id"], {"show_in_carousel": False}, hidden["version"])
+    before_notes, before_history = store.list_notes(), store.history()
+    counts = {n["id"]: 0 for n in [rare, *regular]}
+    for slot in range(2 + 40 * len(regular)):
+        current = datetime(2026, 9, 19, 12, tzinfo=timezone.utc) + timedelta(minutes=slot)
+        dashboard = store.dashboard()
+        assert {n["id"] for n in dashboard["resurface_candidates"]} == set(counts)
+        counts[dashboard["resurface"]["id"]] += 1
+    assert counts == {rare["id"]: 2, **{n["id"]: 40 for n in regular}}
+    assert store.list_notes() == before_notes
+    assert store.history() == before_history
+    # If all other candidates are hidden, the available project idea still appears.
+    for note in regular:
+        store.update(note["id"], {"show_in_carousel": False}, note["version"])
+    assert store.dashboard()["resurface"]["id"] == rare["id"]
+
+
 def test_critical_importance_is_task_only_and_survives_history(tmp_path):
     current = datetime(2026, 9, 19, 12, tzinfo=timezone.utc)
     store = Store(tmp_path, clock=lambda: current)

@@ -48,6 +48,7 @@ KINDS = {"inbox", "task", "purchase", "media", "idea", "thought", "link", "proje
 MEDIA = {"movie", "series", "book", "game", "podcast", "article"}
 IMPORTANCE = {"low", "normal", "high", "critical"}
 IMPORTANCE_WEIGHTS = {"low": 1, "normal": 2, "high": 3, "critical": 4}
+PROJECT_IDEA_RECALL_INTERVAL = 20
 IMPORTANCE_LABELS = {"low": "низкая", "normal": "обычная", "high": "высокая", "critical": "очень высокая"}
 STATUSES = {"inbox", "active", "done", "cancelled", "archived"}
 FIELDS = {"title", "body", "kind", "due", "media_type", "status", "tags", "url", "context_id", "topic", "importance", "show_in_carousel", "show_in_unscheduled", "planning_horizon", "attachments"}
@@ -822,9 +823,16 @@ class Store:
                     continue
                 candidates.append(note)
             candidates.sort(key=lambda n: n["id"])
-            # One minute per card; each pass gives critical/high/normal/low 4/3/2/1 slots.
-            weighted = [n for weight in range(1, max(IMPORTANCE_WEIGHTS.values()) + 1) for n in candidates
-                        if IMPORTANCE_WEIGHTS[n["importance"]] >= weight]
+            # Project ideas enter one of twenty passes, without changing their importance.
+            # Keep all candidates for manual browsing; with only project ideas, use every pass.
+            project_ids = {n["id"] for n in notes if n["kind"] == "project"}
+            project_ideas = {n["id"] for n in candidates
+                             if n["kind"] == "idea" and n.get("context_id") in project_ids}
+            passes = PROJECT_IDEA_RECALL_INTERVAL if project_ideas and len(project_ideas) < len(candidates) else 1
+            weighted = [n for recall_pass in range(passes)
+                        for weight in range(1, max(IMPORTANCE_WEIGHTS.values()) + 1) for n in candidates
+                        if IMPORTANCE_WEIGHTS[n["importance"]] >= weight
+                        and (recall_pass == 0 or n["id"] not in project_ideas)]
             card = None
             if weighted:
                 card = dict(weighted[int(now.timestamp() // 60) % len(weighted)])
