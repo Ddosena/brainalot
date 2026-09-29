@@ -492,14 +492,28 @@ class CalendarFeed:
                 return {"configured": False, "calendar_count": 0, "calendars": [], "events": [], "last_updated": None, "stale": False, "error": None}
             refreshed = []
             for item in config["calendars"]:
+                api_cache, api_meta = None, {}
                 if google_calendar is not None:
-                    api_cache, _meta, api_failed = self._refresh_api(item, first, last, google_calendar,
-                                                                       force=force)
-                    if api_cache is not None:
-                        refreshed.append(("api", item, api_cache, api_failed))
+                    api_cache, api_meta, api_failed = self._refresh_api(
+                        item, first, last, google_calendar, force=force)
+                    if api_cache is not None and not api_failed:
+                        refreshed.append(("api", item, api_cache, False))
                         continue
-                raw, _meta, failed = self._refresh(item, first, last, force=force)
-                refreshed.append(("ical", item, raw, failed))
+                # A failed API read must not pin the panel to an old API week.
+                # Google may still publish the same calendar through iCal.
+                raw, ical_meta, ical_failed = self._refresh(item, first, last, force=force)
+                def last_success(meta):
+                    try:
+                        return datetime.fromisoformat(meta["last_updated"]).timestamp()
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        return float("-inf")
+                if raw is not None and (api_cache is None or
+                                        last_success(ical_meta) >= last_success(api_meta)):
+                    refreshed.append(("ical", item, raw, ical_failed))
+                elif api_cache is not None:
+                    refreshed.append(("api", item, api_cache, True))
+                else:
+                    refreshed.append(("ical", item, raw, ical_failed))
             status = self._public_status(config)
         events, stale = [], False
         for source, item, payload, failed in refreshed:

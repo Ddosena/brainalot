@@ -781,6 +781,8 @@ function renderCalendarWriteStatus() {
   const access = calendar.write_access || {};
   $("calendar-oauth-status").textContent = access.authorized
     ? t("Управление подключено: события можно переносить и удалять.")
+    : access.reauthorization_required
+      ? t("Google больше не принимает подключение. События читаются через iCal; для переноса и удаления подключите Google API заново.")
     : access.client_configured
       ? t("OAuth-клиент сохранён. Нажмите «Подключить Google API» и подтвердите доступ.")
       : t("Управление событиями не подключено.");
@@ -859,7 +861,8 @@ function renderCalendarRows() {
   const tasksHeading = $("today-list").previousElementSibling;
   if (section.nextElementSibling !== tasksHeading) tasksHeading.before(section);
   section.hidden = !events.length && !calendar.error;
-  status.hidden = cachedWarning || (!calendar.error && !calendar.stale);
+  status.hidden = !calendar.write_access?.reauthorization_required &&
+    (cachedWarning || (!calendar.error && !calendar.stale));
   status.textContent = status.hidden ? "" : calendar.error || t("Расписание может быть устаревшим.");
   status.classList.toggle("calendar-stale", !status.hidden);
   for (const {event, phase} of events) {
@@ -963,7 +966,9 @@ async function loadCalendarWeek(force = false) {
       events:calendarOverlay.project(rawCalendarEvents),
       last_updated:config.last_updated || response.last_updated || null,
       stale:Boolean(response.stale),
-      error:response.error || null,
+      error:[response.error, config.write_access?.reauthorization_required
+        ? t("Google отклонил подключение. Переподключите Google API в настройках; пока чтение идёт через iCal.") : null]
+        .filter(Boolean).join(" ") || null,
     };
   } catch (error) {
     if (request !== calendarRequest) return;

@@ -1,4 +1,7 @@
 from datetime import date, datetime, timedelta
+from io import BytesIO
+import json
+from urllib.error import HTTPError
 
 from fastapi.testclient import TestClient
 import pytest
@@ -6,7 +9,7 @@ import pytest
 from megamozg.api import create_app
 from megamozg.calendar import CalendarFeed, ICAL_REFRESH_INTERVAL
 from megamozg.core import Store
-from megamozg.google_calendar_api import GoogleCalendarApi
+from megamozg.google_calendar_api import GoogleCalendarApi, GoogleCalendarReauthorizationRequired
 
 
 FEED = b"""BEGIN:VCALENDAR\r
@@ -259,7 +262,7 @@ def test_authorized_api_reads_paginated_events_and_resolves_new_event_reference(
     assert not feed._cache_path(all_day["calendar_id"]).exists()
 
 
-def test_api_refresh_failure_keeps_its_last_good_copy(tmp_path):
+def test_api_refresh_failure_keeps_its_last_good_copy_when_ical_fails(tmp_path, monkeypatch):
     class DirectApi:
         def __init__(self):
             self.available = True
@@ -280,10 +283,63 @@ def test_api_refresh_failure_keeps_its_last_good_copy(tmp_path):
         '{"last_attempt": "' + previous.isoformat() + '", "last_updated": "'
         + previous.isoformat() + '"}', encoding="utf-8")
     direct.available = False
+    monkeypatch.setattr(feed, "_download", lambda _: (_ for _ in ()).throw(OSError("temporary")))
 
     second = feed.events(date(2026, 9, 21), date(2026, 9, 27), google_calendar=direct)
 
     assert second["stale"] and second["events"] == first["events"]
+
+
+def test_failed_api_with_old_cache_uses_newer_ical_events(tmp_path, monkeypatch):
+    class DirectApi:
+        available = True
+
+        def list_events(self, *_):
+            if not self.available:
+                raise OSError("temporary")
+            return [{"iCalUID": "old@example.com", "summary": "Old event",
+                     "start": {"dateTime": "2026-09-21T10:00:00+03:00"},
+                     "end": {"dateTime": "2026-09-21T11:00:00+03:00"}}]
+
+    feed, direct = CalendarFeed(tmp_path), DirectApi()
+    feed.configure(URL)
+    first = feed.events(date(2026, 9, 21), date(2026, 9, 27), google_calendar=direct)
+    calendar_id = first["events"][0]["calendar_id"]
+    previous = datetime.now().astimezone() - timedelta(minutes=3)
+    feed._api_meta_path(calendar_id).write_text(json.dumps({
+        "last_attempt": previous.isoformat(), "last_updated": previous.isoformat(),
+    }), encoding="utf-8")
+    monkeypatch.setattr(feed, "_download", lambda _: FEED)
+    direct.available = False
+
+    second = feed.events(date(2026, 9, 21), date(2026, 9, 27), google_calendar=direct)
+    assert second["events"] != first["events"]
+    assert any(event["title"] == "Conference" for event in second["events"])
+    assert not second["stale"] and second["error"] is None
+
+
+def test_invalid_grant_requires_reauthorization_without_retrying_token(tmp_path, monkeypatch):
+    from megamozg import google_calendar_api as module
+
+    api = GoogleCalendarApi(tmp_path)
+    api.configure_client({"installed": {"client_id": "test.apps.googleusercontent.com",
+                                        "client_secret": "fixture"}})
+    api.token_path.write_text(json.dumps({"refresh_token": "fixture", "expires_at": 0}), encoding="utf-8")
+    calls = []
+
+    def reject_refresh(request, timeout):
+        calls.append(request.full_url)
+        raise HTTPError(request.full_url, 400, "Bad Request", {},
+                        BytesIO(b'{"error":"invalid_grant"}'))
+
+    monkeypatch.setattr(module, "urlopen", reject_refresh)
+    with pytest.raises(GoogleCalendarReauthorizationRequired):
+        api._access_token()
+    assert api.status() == {"client_configured": True, "authorized": False,
+                            "reauthorization_required": True}
+    with pytest.raises(GoogleCalendarReauthorizationRequired):
+        api._access_token()
+    assert len(calls) == 1
 
 
 def test_api_failure_without_a_cache_uses_fallback_without_repeating_requests(tmp_path, monkeypatch):

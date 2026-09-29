@@ -38,6 +38,10 @@ class GoogleCalendarConflict(ValidationError):
     """Google answered 409: the requested event ID already exists."""
 
 
+class GoogleCalendarReauthorizationRequired(ValidationError):
+    """Google rejected the saved refresh token; another consent is needed."""
+
+
 def event_id_for(external_id: str) -> str:
     """A stable Google event ID (base32hex, 52 chars) for one dictated capture."""
     digest = hashlib.sha256(("mmm-dictation:" + external_id).encode("utf-8")).digest()
@@ -91,8 +95,12 @@ class GoogleCalendarApi:
 
     def status(self) -> dict:
         client, token = self._read(self.client_path), self._read(self.token_path)
-        return {"client_configured": bool(client.get("client_id")),
-                "authorized": bool(token.get("refresh_token") or token.get("access_token"))}
+        expired = bool(token.get("reauthorization_required"))
+        status = {"client_configured": bool(client.get("client_id")),
+                  "authorized": bool(token.get("refresh_token") or token.get("access_token")) and not expired}
+        if expired:
+            status["reauthorization_required"] = True
+        return status
 
     def configure_client(self, credentials: dict) -> dict:
         if not isinstance(credentials, dict):
@@ -145,7 +153,17 @@ class GoogleCalendarApi:
         try:
             with urlopen(request, timeout=15) as response:
                 result = json.loads(response.read(1024 * 1024).decode("utf-8"))
-        except (OSError, ValueError, HTTPError) as exc:
+        except HTTPError as exc:
+            if exc.code == 400:
+                try:
+                    reason = json.loads(exc.read(4096)).get("error")
+                except (OSError, ValueError, AttributeError):
+                    reason = None
+                if reason == "invalid_grant":
+                    raise GoogleCalendarReauthorizationRequired(
+                        "Google больше не принимает подключение. Подключите Google API заново.") from exc
+            raise ValidationError("Google не подтвердил авторизацию") from exc
+        except (OSError, ValueError) as exc:
             raise ValidationError("Google не подтвердил авторизацию") from exc
         if not isinstance(result, dict):
             raise ValidationError("Google вернул некорректный ответ авторизации")
@@ -187,6 +205,9 @@ class GoogleCalendarApi:
 
     def _access_token(self) -> str:
         token, client = self._read(self.token_path), self._read(self.client_path)
+        if token.get("reauthorization_required"):
+            raise GoogleCalendarReauthorizationRequired(
+                "Google больше не принимает подключение. Подключите Google API заново.")
         access = token.get("access_token")
         if isinstance(access, str) and float(token.get("expires_at", 0)) > time.time() + 60:
             return access
@@ -197,7 +218,12 @@ class GoogleCalendarApi:
                            "refresh_token": refresh, "grant_type": "refresh_token"}
         if client.get("client_secret"):
             refresh_request["client_secret"] = client["client_secret"]
-        result = self._form(client["token_uri"], refresh_request)
+        try:
+            result = self._form(client["token_uri"], refresh_request)
+        except GoogleCalendarReauthorizationRequired:
+            token["reauthorization_required"] = True
+            _atomic_json(self.token_path, token)
+            raise
         access = result.get("access_token")
         if not isinstance(access, str):
             raise ValidationError("Не удалось обновить доступ к Google Календарю")
