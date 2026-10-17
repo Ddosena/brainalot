@@ -256,3 +256,18 @@ def test_old_supervised_service_is_not_attached():
         server.shutdown()
         thread.join(timeout=2)
         server.server_close()
+
+
+def test_invalid_selected_data_root_is_reported_before_start(monkeypatch):
+    from types import SimpleNamespace
+
+    messages = []
+    monkeypatch.setattr(app, "_velopack_hooks", lambda: None)
+    def invalid_root():
+        raise RuntimeError("Selected data folder is unavailable")
+    monkeypatch.setattr(app.paths, "default_root", invalid_root)
+    monkeypatch.setattr(app.ctypes, "windll", SimpleNamespace(user32=SimpleNamespace(
+        MessageBoxW=lambda *args: messages.append(args))), raising=False)
+    assert app.main([]) == 1
+    assert len(messages) == 1
+    assert "Selected data folder is unavailable" in messages[0][1]

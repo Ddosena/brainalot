@@ -15,6 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import ConflictError, ValidationError
+from . import features
 
 
 CHECKPOINT_MS = 10_000
@@ -282,6 +283,9 @@ class TimeStore:
             self._settle(db, row, wall, mono, force=True)
             if row["revision"] != expected:
                 raise ConflictError("time state revision changed")
+            task = body.get("task") if action in {"start", "switch_task"} else json.loads(row["task"]) if row["task"] else None
+            if not features.WORK_ENABLED and action in {"start", "switch_task", "resume"} and task and task.get("source") == "work":
+                raise ValidationError(features.WORK_PAUSED_MESSAGE)
             if action == "start":
                 mode = body.get("mode", "stopwatch")
                 row.update(status="running", mode=mode,

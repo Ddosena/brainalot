@@ -4,6 +4,7 @@ import time
 
 from .core import ConflictError, NotFoundError, ValidationError
 from .shared_state import SharedState, encoded, identifier
+from . import features
 
 ACTIONS = {"open-workspace", "stop-workspace", "capture-workspace", "chat-setup", "chat-connect", "active-tab"}
 
@@ -45,6 +46,8 @@ class BrowserBridge(SharedState):
         action, payload = data.get("action"), data.get("payload", {})
         if not isinstance(action, str) or action not in ACTIONS or not isinstance(payload, dict):
             raise ValidationError("Неизвестное действие браузера/неверный payload")
+        if not features.WORK_ENABLED and action != "active-tab":
+            raise ValidationError(features.WORK_PAUSED_MESSAGE)
         with self.db() as db:
             self._expire(db, self.clock())
             row = db.execute("SELECT * FROM browser_commands WHERE id=?", (key,)).fetchone()
@@ -64,6 +67,9 @@ class BrowserBridge(SharedState):
             now = self.clock()
             db.execute("INSERT OR REPLACE INTO browser_clients VALUES(?,?)", (client_id, now))
             self._expire(db, now)
+            if not features.WORK_ENABLED:
+                db.execute("UPDATE browser_commands SET status='error',error=? WHERE status='pending' AND action!='active-tab'",
+                           (features.WORK_PAUSED_MESSAGE,))
             rows = db.execute("SELECT id FROM browser_commands WHERE status='pending' ORDER BY created LIMIT 20").fetchall()
             result = []
             for row in rows:

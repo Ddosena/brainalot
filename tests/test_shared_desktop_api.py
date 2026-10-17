@@ -130,7 +130,8 @@ def test_recall_filters_pause_missing_and_reset(tmp_path):
     assert not prefs.recall()["paused"]
 
 
-def test_browser_at_most_once_and_uncertain_result(tmp_path):
+def test_browser_at_most_once_and_uncertain_result(tmp_path, monkeypatch):
+    monkeypatch.setattr("megamozg.features.WORK_ENABLED", True)
     now = [100000]
     bridge = BrowserBridge(tmp_path, clock=lambda: now[0])
     command = dict(request_id="open", action="open-workspace", payload={"id": "t"})

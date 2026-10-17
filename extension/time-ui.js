@@ -1,5 +1,6 @@
 import { timeClient, sharedApi, elapsedAt, formatTime } from "./time-client.js";
 import { t } from "./i18n.js";
+import { WORK_ENABLED } from "./work-availability.js";
 const icon = '<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="14" r="8"/><path d="M12 6V2m-3 0h6m-3 8v5l3 2M18 7l2-2"/></svg>';
 let currentUI;
 export function taskTimeButton(task) {
@@ -59,7 +60,7 @@ export function mountTimeUI(host) {
   function taskOptions() {
     const query = $(".time-search").value.toLocaleLowerCase();
     const select = $(".time-tasks"); select.replaceChildren(new Option(t("Без задачи"), ""));
-    for (const [source, label] of [["library", t("Библиотека")], ["work", "Work"], ["calendar", t("Календарь")]]) {
+    for (const [source, label] of [["library", t("Библиотека")], ...(WORK_ENABLED ? [["work", "Work"]] : []), ["calendar", t("Календарь")]]) {
       const group = document.createElement("optgroup"); group.label = label;
       tasks.forEach((task, index) => { if (task.source === source && task.title.toLocaleLowerCase().includes(query)) group.append(new Option(task.title, String(index))); });
       if (group.children.length) select.append(group);
@@ -70,7 +71,7 @@ export function mountTimeUI(host) {
   }
   $(".time-search").oninput = taskOptions;
   $(".time-tasks").onchange = () => { selected = $(".time-tasks").value === "" ? null : tasks[Number($(".time-tasks").value)]; void act("switch_task", { task: selected }); };
-  wrap.addEventListener("toggle", async () => { if (!wrap.open) return; try { tasks = (await sharedApi("/api/time/tasks")).tasks; taskOptions(); } catch (err) { error(err); } });
+  wrap.addEventListener("toggle", async () => { if (!wrap.open) return; try { tasks = (await sharedApi("/api/time/tasks")).tasks.filter(task => WORK_ENABLED || task.source !== "work"); taskOptions(); } catch (err) { error(err); } });
   $(".time-retry").onclick = async () => { try { await timeClient.retry(); $(".time-error").hidden = true; $(".time-retry").hidden = true; render(); } catch (err) { error(err); } };
   const today = new Date(); $(".time-day").value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
   $(".time-zone").value = Intl.DateTimeFormat().resolvedOptions().timeZone;

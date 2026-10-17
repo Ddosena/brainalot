@@ -132,6 +132,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _chats_command(root: Path, args) -> dict:
+    from . import features
+    if not features.WORK_ENABLED:
+        raise ValidationError(features.WORK_PAUSED_MESSAGE)
     from . import telegram_chats
     from .chats import ChatStore
     from .work_inbox import WorkInbox

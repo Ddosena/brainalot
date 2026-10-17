@@ -1,12 +1,15 @@
 import { native } from "./desktop-platform.js";
+import { WORK_ENABLED } from "./work-availability.js";
 await import("./background.js");
 const { applyDocument, syncLocale, localeChange } = await import("./i18n.js");
 if (!await syncLocale()) applyDocument();
 const saved = await chrome.storage.local.get(["panel:theme", "panel:design"]);
 document.documentElement.dataset.theme = saved["panel:theme"] || "light";
 document.documentElement.dataset.design = saved["panel:design"] || "stream";
+document.querySelector('[data-view="work"]').hidden = !WORK_ENABLED;
 function show(view) {
   if (view === "home") view = "day";
+  if (view === "work" && !WORK_ENABLED) view = "day";
   const paths = { day: "panel.html", library: "panel.html?library-window=1", work: "work.html", capture: "capture.html" };
   document.getElementById("desktop-content").src = paths[view] || paths.day;
   document.querySelectorAll("[data-view]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === view)));

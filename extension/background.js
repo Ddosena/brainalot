@@ -11,6 +11,7 @@ import { checkAttachmentLimit, localAttachments, uploadAttachments } from "./att
 import { initI18n, localeChange, setLocale, t } from "./i18n.js";
 import { CALENDAR_CHANGED_KEY, checkDictationPayload, DICTATION_LIMIT } from "./dictation.js";
 import { workWindowClosed, openWorkspace, captureWorkspace, WS_KEY } from "./work-tabs.js";
+import { WORK_ENABLED, WORK_PAUSED_MESSAGE, browserActionAllowed, workCommandDisabled } from "./work-availability.js";
 
 const CONFIG_KEY = "connection";
 // Pages compare this code, not the message text, to spot a worker without a newer command.
@@ -117,7 +118,17 @@ async function initialize() {
   if (!(await chrome.alarms.get(RETRY_ALARM))) {
     await chrome.alarms.create(RETRY_ALARM, { periodInMinutes: 1 });
   }
+  if (!WORK_ENABLED && !chrome.desktop) await disableWorkReaders().catch(() => {});
   await badge();
+}
+
+async function disableWorkReaders() {
+  const ids = ["brainalot-vk-reader", "brainalot-tg-reader"];
+  const registered = await chrome.scripting.getRegisteredContentScripts({ ids });
+  if (registered.length) await chrome.scripting.unregisterContentScripts({ ids: registered.map(script => script.id) });
+  for (const tab of await chrome.tabs.query({ url: ["https://vk.com/*", "https://web.telegram.org/*"] })) {
+    await chrome.tabs.sendMessage(tab.id, { type: "brainalot-chat-stop" }).catch(() => {});
+  }
 }
 
 const ready = initialize().catch((error) => { lastError = error.message; });
@@ -147,7 +158,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 chrome.windows.onRemoved.addListener(windowId => { void libraryWindow.onRemoved(windowId).catch(() => {}); });
-chrome.windows.onRemoved.addListener(windowId => { void workWindowClosed(chrome, windowId).catch(() => {}); });
+if (WORK_ENABLED) chrome.windows.onRemoved.addListener(windowId => { void workWindowClosed(chrome, windowId).catch(() => {}); });
 chrome.storage.onChanged.addListener((changes, area) => {
   const next = area === "local" ? localeChange(changes) : null;
   if (next) setLocale(next);
@@ -161,6 +172,7 @@ function notePath(id) {
 
 async function handle(message, sender) {
   await ready;
+  if (workCommandDisabled(message.type)) throw new Error(t(WORK_PAUSED_MESSAGE));
   switch (message.type) {
     case "preferences-resolve": return preferencesSync.resolve(message.keepLocal === true);
     case "status": {
@@ -408,6 +420,12 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id || !sender.tab) return false;
   const source = Object.keys(WEB_CHATS).find(name => WEB_CHATS[name].site.test(sender.url || ""));
   if (!source) return false;
+  if (!WORK_ENABLED) {
+    if (message?.type === "chat-messages") respond({ ok: true, data: { watched: false } });
+    else if (message?.type === "chat-markup") respond({ ok: true, data: {} });
+    else return false;
+    return false;
+  }
   let work;
   if (message?.type === "chat-messages") work = chatMessages(source, message);
   else if (message?.type === "chat-markup" && message.markup && typeof message.markup === "object") {
@@ -432,6 +450,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 void ready.then(syncSharedTime).catch(() => {});
 setInterval(() => void syncSharedTime().catch(() => {}), 5000);
 startBrowserBridge(api, async (action, payload) => {
+  if (!browserActionAllowed(action)) throw new Error(t(WORK_PAUSED_MESSAGE));
   if (action === "open-workspace") return openWorkspace(payload.item, payload.onlyGroup || null, chrome);
   if (action === "capture-workspace") return captureWorkspace(payload.item, chrome);
   if (action === "stop-workspace") {

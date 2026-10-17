@@ -1,4 +1,6 @@
 import { browserCommand } from "./browser-bridge.js";
+import { WORK_ENABLED, WORK_PAUSED_MESSAGE } from "./work-availability.js";
+import { t } from "./i18n.js";
 // A Work task's "workspace" is a set of Chrome tab groups. It opens as its own
 // window; the window is remembered in chrome.storage.session so a second click
 // focuses it instead of opening a copy. When that window closes, the background
@@ -134,6 +136,7 @@ export async function workWindowClosed(chromeApi, windowId) {
 
 /** Side panel button: focus the Work tab if it is open, otherwise open it. */
 export async function openWorkPage(chromeApi = globalThis.chrome) {
+  if (!WORK_ENABLED) throw new Error(t(WORK_PAUSED_MESSAGE));
   const url = chromeApi.runtime.getURL(WORK_PAGE);
   const existing = (await chromeApi.tabs.query({})).find(tab => (tab.url || "").startsWith(url));
   if (existing) {

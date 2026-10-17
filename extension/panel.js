@@ -15,6 +15,7 @@ import { applyDocument, LOCALE_KEY, locale, localeChange, localeTag, saveLocale,
 import { TIMER_CHIME_KEY, normalizeTimerChime, playTimerChime } from "./timer-chime.js";
 import { DEFAULT_IGNITION_SOUND, IGNITION_SOUNDS, normalizeIgnitionSound, playIgnitionSound } from "./comic-fire-sound.js";
 import { openWorkPage } from "./work-tabs.js";
+import { WORK_ENABLED } from "./work-availability.js";
 
 applyDocument();
 const $ = (id) => document.getElementById(id);
@@ -2310,6 +2311,7 @@ $("find-toggle").setAttribute("aria-controls", "library-view");
 $("find-toggle").setAttribute("aria-expanded", "false");
 $("find-toggle").addEventListener("click", openLibrary);
 // Work mode lives in its own tab: the week of projects needs the full width.
+$("work-open").hidden = !WORK_ENABLED;
 $("work-open").addEventListener("click", async () => {
   try { await openWorkPage(); } catch (error) { notice(error.message || t("Не удалось открыть Work-режим."), true); }
 });

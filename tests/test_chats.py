@@ -16,6 +16,12 @@ from megamozg.work_inbox import WorkInbox
 MSK = timezone(timedelta(hours=3))
 
 
+@pytest.fixture(autouse=True)
+def retained_work_module(monkeypatch):
+    # Keep testing the retained implementation while the shipping release pauses it.
+    monkeypatch.setattr("megamozg.features.WORK_ENABLED", True)
+
+
 def clock(start=datetime(2026, 9, 29, 12, 0, tzinfo=MSK)):
     state = {"now": start}
     tick = lambda: state["now"]  # noqa: E731

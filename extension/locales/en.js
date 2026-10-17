@@ -358,6 +358,8 @@ export default {
   "Таймер идёт, но полоса недоступна: {overlayError}": "The timer is running, but the bar is unavailable: {overlayError}",
   "Полоса недоступна: {overlayError}": "The bar is unavailable: {overlayError}",
   "Не удалось открыть Work-режим.": "Could not open Work mode.",
+  "Work временно отключён": "Work is temporarily unavailable",
+  "Work временно отключён. Ваши задачи, доски и изображения сохранены.": "Work is temporarily unavailable. Your tasks, boards, and images are preserved.",
   "Исходное окно Chrome закрыто. Откройте обычное окно Chrome и нажмите кнопку ещё раз.": "The original Chrome window is closed. Open a regular Chrome window and click the button again.",
   "Не удалось вернуть библиотеку в панель.": "Could not return the library to the panel.",
   "{message} Повторите попытку; окно библиотеки остаётся открытым.": "{message} Try again; the library window stays open.",

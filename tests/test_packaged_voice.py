@@ -56,11 +56,12 @@ def test_cleanup_target_cannot_escape_dist_app(tmp_path, monkeypatch):
 
 
 def test_previous_nupkg_is_available_to_pack_then_removed_from_release_assets(tmp_path, monkeypatch):
-    releases = tmp_path / "releases"
-    releases.mkdir()
+    releases = tmp_path / "dist" / "releases"
+    releases.mkdir(parents=True)
     previous = releases / "BrainalotApp-0.1.37-full.nupkg"
     previous.write_bytes(b"previous")
     (releases / "releases.win.json").write_text("old", encoding="utf-8")
+    monkeypatch.setattr(build_release, "ROOT", tmp_path)
     monkeypatch.setattr(build_release, "RELEASES", releases)
     monkeypatch.setattr(build_release.shutil, "which", lambda name: "vpk")
 

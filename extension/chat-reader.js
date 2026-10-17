@@ -14,17 +14,19 @@
   let lastAsk = 0;
   let emptyRuns = 0;
   let markupSent = false;
+  let stopped = false;
   const ASK_EVERY_MS = 15000;
 
   // The parser recognizes nothing on a watched chat: send its structure once, so an agent can
   // repair the parser (see docs/chats-agent-runbook.md). No texts leave the page.
   function sendMarkup() {
-    if (markupSent) return;
+    if (stopped || markupSent) return;
     markupSent = true;
     chrome.runtime.sendMessage({ type: "chat-markup", markup: parser.skeleton(document, location) }).catch(() => {});
   }
 
   async function post(messages, oldest) {
+    if (stopped) return null;
     try {
       const reply = await chrome.runtime.sendMessage({ type: "chat-messages", chat: { peer_id: peer, title: parser.title(document) },
         messages, oldest_loaded: oldest || undefined });
@@ -35,6 +37,7 @@
   }
 
   async function check() {
+    if (stopped) return;
     const next = parser.peer(location);
     if (next !== peer) {
       peer = next;
@@ -46,17 +49,19 @@
     if (!peer || watched !== null || Date.now() - lastAsk < ASK_EVERY_MS) return;
     lastAsk = Date.now();
     const answer = await post([], null);
+    if (stopped) return;
     watched = answer ? answer.watched === true : null;
     if (watched) schedule();
   }
 
   function schedule() {
+    if (stopped) return;
     clearTimeout(timer);
     timer = setTimeout(flush, 1200);
   }
 
   async function flush() {
-    if (!watched || busy) return;
+    if (stopped || !watched || busy) return;
     const loaded = parser.messages(document, location.href, peer);
     if (!loaded.length) {
       if (++emptyRuns >= 3) sendMarkup();
@@ -69,6 +74,7 @@
     busy = true;
     try {
       const answer = await post(fresh.slice(0, 200), oldest);
+      if (stopped) return;
       if (answer?.watched === false) watched = false;
       else if (answer) fresh.slice(0, 200).forEach(m => sent.add(`${m.id}|${m.text}`));
     } finally {
@@ -77,9 +83,17 @@
     if (fresh.length > 200) schedule();
   }
 
-  chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  const onReaderMessage = (message, sender, respond) => {
     if (sender.id !== chrome.runtime.id) return false;
-    if (message?.type === "brainalot-chat-info") {
+    if (message?.type === "brainalot-chat-stop") {
+      stopped = true;
+      clearTimeout(timer);
+      observer.disconnect();
+      removeEventListener("hashchange", check);
+      chrome.runtime.onMessage.removeListener(onReaderMessage);
+      globalThis.__brainalotChatReader = false;
+      respond({ ok: true });
+    } else if (message?.type === "brainalot-chat-info") {
       const here = parser.peer(location);
       respond({ peer_id: here, title: parser.title(document), parsed: parser.messages(document, location.href, here).length });
     } else if (message?.type === "brainalot-chat-skeleton") {
@@ -91,13 +105,15 @@
       respond({ ok: true });
     }
     return false;
-  });
+  };
+  chrome.runtime.onMessage.addListener(onReaderMessage);
 
   addEventListener("hashchange", check);
-  new MutationObserver(() => {
+  const observer = new MutationObserver(() => {
     if (parser.peer(location) !== peer) check();
     else if (watched) schedule();
     else if (watched === null) check();
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
   check();
 })();

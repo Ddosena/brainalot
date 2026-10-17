@@ -10,6 +10,9 @@ import sys,json,base64
 from fastapi.testclient import TestClient
 from megamozg.api import create_app
 from megamozg.core import Store
+from megamozg import features
+# The retained implementation is exercised explicitly; shipping Work stays off.
+features.WORK_ENABLED=True
 root=sys.argv[1]
 client=TestClient(create_app(root),base_url='http://127.0.0.1:8765',headers={'Authorization':'Bearer '+Store(root).token()})
 for line in sys.stdin:

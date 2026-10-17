@@ -249,3 +249,4 @@ select.fire-denied{outline:2px solid var(--error);outline-offset:1px}
 /* Keep the visible markers compact while making their hit areas usable. */
 .complete,.calendar-event-check,.importance-toggle,.importance-clear{min-width:24px;min-height:24px;flex-basis:24px}
 .library-entry{min-height:24px}
+#work-open[hidden] { display: none !important; }

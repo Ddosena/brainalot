@@ -29,7 +29,7 @@ from .shared_state import SharedState
 from .work_store import WorkStore
 from .time_tracking import TimeStore
 from .browser_bridge import BrowserBridge
-from . import paths
+from . import paths, features
 
 
 def create_app(root: str | Path, port: int = 8765) -> FastAPI:
@@ -38,10 +38,10 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     google_calendar = GoogleCalendarApi(root, port=port)
     dictation = DictationService(store, calendar, google_calendar)
     voice = VoiceService(store)
-    chats = ChatStore(root)
-    work_inbox = WorkInbox(root, chats)
+    chats = ChatStore(root) if features.WORK_ENABLED else None
+    work_inbox = WorkInbox(root, chats) if features.WORK_ENABLED else None
     shared = SharedState(root)
-    work = WorkStore(root)
+    work = WorkStore(root) if features.WORK_ENABLED else None
     timer = TimeStore(root)
     browser = BrowserBridge(root)
 
@@ -86,7 +86,10 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
                     return JSONResponse({"detail": "Слишком большой запрос"}, status_code=413)
                 chunks.append(chunk)
             request._body = b"".join(chunks)
-        response = await call_next(request)
+        if not features.WORK_ENABLED and request.url.path.startswith(("/api/work/", "/api/chats/")):
+            response = JSONResponse({"detail": features.WORK_PAUSED_MESSAGE, "code": "work_disabled"}, status_code=503)
+        else:
+            response = await call_next(request)
         if origin:
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Access-Control-Expose-Headers"] = "ETag"
@@ -182,7 +185,7 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     def time_tasks(q: str = ""):
         tasks = [{"source": "library", "id": n["id"], "title": n["title"]} for n in store.list_notes()
                  if n["status"] == "active" and (n["kind"] in {"task", "purchase"} or n.get("show_in_unscheduled"))]
-        state = work.read()["state"]
+        state = work.read()["state"] if work is not None else None
         tasks.extend({"source": "work", "id": n["id"], "title": n.get("title") or "Без названия"}
                      for n in (state or {}).get("items", []) if n.get("status") != "done")
         # Use existing cached calendar data; opening a stopwatch never triggers network/OAuth.

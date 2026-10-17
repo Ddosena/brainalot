@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-work-enabled="false">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,6 +7,12 @@
 <link rel="icon" href="icons/icon-32.png">
 <link rel="stylesheet" href="work.css">
 <link rel="stylesheet" href="time-ui.css">
+<style>
+html[data-work-enabled="false"] body > :not(#work-paused):not(script) { display: none !important; }
+html[data-work-enabled="true"] #work-paused { display: none !important; }
+#work-paused { display: grid; place-content: center; min-height: 100vh; padding: 2rem; text-align: center; font-family: system-ui, sans-serif; }
+#work-paused p { max-width: 34rem; line-height: 1.5; }
+</style>
 </head>
 <body>
 <header class="top">
@@ -45,6 +51,10 @@
 <section class="board-wrap" id="board-wrap"></section>
 <aside class="drawer" id="drawer" inert></aside>
 <div class="toast" id="toast" hidden></div>
-<script type="module" src="work-app.js"></script>
+<main id="work-paused" role="status">
+  <h1 data-i18n="Work временно отключён">Work временно отключён</h1>
+  <p data-i18n="Work временно отключён. Ваши задачи, доски и изображения сохранены.">Work временно отключён. Ваши задачи, доски и изображения сохранены.</p>
+</main>
+<script type="module" src="work-paused.js"></script>
 </body>
 </html>

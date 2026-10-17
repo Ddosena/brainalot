@@ -60,7 +60,41 @@ def default_root() -> Path:
     if not frozen():
         return project_root() / "data"
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    return Path(base) / APP_NAME
+    installed_root = Path(base) / APP_NAME
+    config_file = installed_root / CONFIG_NAME
+    if not config_file.exists():
+        return installed_root
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Brainalot config.json is invalid: {config_file}") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError(f"Brainalot config.json must be an object: {config_file}")
+    if "data_root" not in config:
+        return installed_root
+    value = config["data_root"]
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("Brainalot data_root must be an absolute path to an existing data folder")
+    selected = Path(value).expanduser()
+    if not selected.is_absolute():
+        raise RuntimeError("Brainalot data_root must be an absolute path to an existing data folder")
+    try:
+        selected = selected.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"Brainalot data_root does not exist: {selected}") from exc
+    if selected == installed_root.resolve():
+        raise RuntimeError("Brainalot data_root cannot point to itself")
+    selected_config = selected / CONFIG_NAME
+    if selected_config.exists():
+        try:
+            target_config = json.loads(selected_config.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Brainalot data_root config.json is invalid: {selected_config}") from exc
+        if not isinstance(target_config, dict) or "data_root" in target_config:
+            raise RuntimeError("Brainalot data_root cannot follow another data_root pointer")
+    if not (selected / "state" / "journal.sqlite3").is_file() or not vault_path(selected).is_dir():
+        raise RuntimeError(f"Brainalot data_root lacks an existing vault or journal: {selected}")
+    return selected
 
 
 def read_config(root: Path) -> dict:

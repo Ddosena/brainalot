@@ -287,7 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_desktop_smoke(paths.default_root())
     _velopack_hooks()
     background = "--background" in argv
-    root = paths.prepare_installed_root(paths.default_root())
+    try:
+        root = paths.prepare_installed_root(paths.default_root())
+    except (OSError, RuntimeError, ValueError) as exc:
+        ctypes.windll.user32.MessageBoxW(None, "Brainalot: не удалось открыть выбранные данные.\n" + str(exc),
+                                         "Brainalot", 0x10)
+        return 1
     setup_logging(root)
     if not _single_instance():
         if not background:
