@@ -105,7 +105,7 @@ def copy_legal_files() -> None:
 def _copy_dependency_licenses() -> None:
     """Record installed runtime package versions and preserve their available license files."""
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    declared = project["project"]["dependencies"] + ["velopack"]
+    declared = project["project"]["dependencies"] + project["project"]["optional-dependencies"].get("desktop", []) + ["velopack"]
     declared += [line for line in (ROOT / "requirements-voice.txt").read_text(encoding="utf-8").splitlines()
                  if line.strip() and not line.lstrip().startswith("#")]
     pending = [Requirement(item).name for item in declared]
@@ -187,6 +187,11 @@ def velopack() -> None:
     if not vpk:
         raise SystemExit("vpk not found: dotnet tool install -g vpk (or run with --no-setup)")
     RELEASES.mkdir(parents=True, exist_ok=True)
+    if RELEASES.resolve() != (ROOT.resolve() / "dist" / "releases"):
+        raise ValueError("Release output must stay inside this project's dist/releases")
+    # A local rebuild of the same version must not retain an obsolete delta.
+    for item in RELEASES.glob(f"{PACK_ID}-{__version__}-*.nupkg"):
+        item.unlink()
     # The CI downloads the preceding full NUPKG here before building, so vpk can create a
     # delta. Remove stale feeds and assets; the old NUPKG is build input, not a new asset.
     previous_packages = [item for item in RELEASES.glob("*.nupkg") if f"-{__version__}-" not in item.name]
@@ -197,7 +202,7 @@ def velopack() -> None:
                     "--mainExe", "Brainalot.exe", "--packTitle", "Brainalot", "--packAuthors", "Brainalot",
                     "--icon", str(ROOT / "packaging" / "brand" / "brainalot.ico"),
                     "--instLicense", str(legal_root(ROOT) / "LICENSE"),
-                    "--shortcuts", "StartMenuRoot", "--runtime", "win-x64", "--outputDir", str(RELEASES)], check=True, cwd=ROOT)
+                    "--shortcuts", "StartMenuRoot", "--framework", "webview2", "--runtime", "win-x64", "--outputDir", str(RELEASES)], check=True, cwd=ROOT)
     for item in previous_packages:
         item.unlink(missing_ok=True)
 

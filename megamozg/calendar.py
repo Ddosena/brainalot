@@ -158,6 +158,12 @@ class CalendarFeed:
     def _api_cache(self, calendar_id: str) -> dict:
         return self._read_json(self._api_cache_path(calendar_id))
 
+    def _matching_api_cache(self, calendar_id: str, first: date, last: date) -> dict | None:
+        cache = self._api_cache(calendar_id)
+        return (cache if cache.get("start") == first.isoformat() and cache.get("end") == last.isoformat()
+                and isinstance(cache.get("events"), list) and isinstance(cache.get("references"), dict)
+                else None)
+
     def _last_updated(self, calendar_id: str) -> str | None:
         values = (self._meta(calendar_id).get("last_updated"),
                   self._read_json(self._api_meta_path(calendar_id)).get("last_updated"))
@@ -329,10 +335,8 @@ class CalendarFeed:
                      *, force: bool = False) -> tuple[dict | None, dict, bool]:
         calendar_id = item["id"]
         cache_path, meta_path = self._api_cache_path(calendar_id), self._api_meta_path(calendar_id)
-        cache, meta = self._api_cache(calendar_id), self._read_json(meta_path)
-        matching_cache = (cache if cache.get("start") == first.isoformat() and cache.get("end") == last.isoformat()
-                          and isinstance(cache.get("events"), list) and isinstance(cache.get("references"), dict)
-                          else None)
+        meta = self._read_json(meta_path)
+        matching_cache = self._matching_api_cache(calendar_id, first, last)
         now, last_attempt = datetime.now().astimezone(), meta.get("last_attempt")
         if last_attempt and not force:
             try:
@@ -499,6 +503,12 @@ class CalendarFeed:
                     if api_cache is not None and not api_failed:
                         refreshed.append(("api", item, api_cache, False))
                         continue
+                else:
+                    # Revoked OAuth disables network API access, not the last
+                    # successful snapshot. Keep it as a stale fallback if iCal
+                    # is unavailable, without retrying a rejected refresh token.
+                    api_cache = self._matching_api_cache(item["id"], first, last)
+                    api_meta = self._read_json(self._api_meta_path(item["id"]))
                 # A failed API read must not pin the panel to an old API week.
                 # Google may still publish the same calendar through iCal.
                 raw, ical_meta, ical_failed = self._refresh(item, first, last, force=force)

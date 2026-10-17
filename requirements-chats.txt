@@ -1,0 +1,6 @@
+# Work chats: reading the user's Telegram account (read-only). Install alongside requirements-lock.txt.
+# Not in the installer yet; the Work mode and the CLI say how to install it when it is missing.
+telethon==1.45.0
+pyaes==1.6.1
+rsa==4.9.1
+pyasn1==0.6.4

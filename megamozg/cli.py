@@ -35,6 +35,22 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("history", help="Журнал операций")
     backup = commands.add_parser("backup", help="Согласованный ZIP снимок хранилища")
     backup.add_argument("destination", type=Path)
+    restore = commands.add_parser("restore", help="Восстановить ZIP в новую папку, не заменяя текущую библиотеку")
+    restore.add_argument("archive", type=Path)
+    restore.add_argument("destination", type=Path)
+    timing = commands.add_parser("time", help="Общие время и дневная сводка")
+    timing_sub = timing.add_subparsers(dest="time_command", required=True, parser_class=Parser)
+    timing_sub.add_parser("state")
+    summary = timing_sub.add_parser("summary")
+    summary.add_argument("day")
+    summary.add_argument("--timezone", default="Europe/Moscow")
+    timing_command = timing_sub.add_parser("command")
+    timing_command.add_argument("--file", type=Path, help="JSON команды с request_id/expected_revision")
+    recall = commands.add_parser("recall", help="Общие настройки Вспомнить")
+    recall_sub = recall.add_subparsers(dest="recall_command", required=True, parser_class=Parser)
+    recall_sub.add_parser("get")
+    recall_set = recall_sub.add_parser("set")
+    recall_set.add_argument("--file", type=Path)
 
     capture = commands.add_parser("capture", help="Сохранить мысль; без --text/--text-file текст читается из stdin")
     source = capture.add_mutually_exclusive_group()
@@ -85,7 +101,79 @@ def build_parser() -> argparse.ArgumentParser:
     integrate.add_argument("action", choices=["install", "uninstall", "status"])
     migrate = commands.add_parser("migrate", help="Скопировать библиотеку и журнал из старой папки data")
     migrate.add_argument("source", type=Path, help="Старая папка данных (в ней vault и state)")
+
+    chats = commands.add_parser("chats", help="Рабочие чаты Telegram и ВК: новые сообщения для разбора агентом")
+    chat_commands = chats.add_subparsers(dest="chats_command", required=True, parser_class=Parser)
+    chat_commands.add_parser("telegram-login", help="Войти в Telegram; api_id, api_hash, телефон и код вводит сам пользователь")
+    dialogs = chat_commands.add_parser("telegram-dialogs", help="Чаты аккаунта Telegram, чтобы выбрать рабочий")
+    dialogs.add_argument("--limit", type=int, default=100)
+    add = chat_commands.add_parser("add", help="Подключить чат Telegram: берутся только сообщения после подключения")
+    add.add_argument("source", choices=["telegram"])
+    add.add_argument("chat_id", help="ID из telegram-dialogs")
+    remove = chat_commands.add_parser("remove", help="Перестать собирать чат; собранные сообщения остаются")
+    remove.add_argument("key", help="Например telegram:-100123 или vk:2000000001")
+    chat_commands.add_parser("list", help="Подключённые чаты, неразобранные сообщения, предложения")
+    chat_commands.add_parser("sync", help="Забрать новые сообщения из Telegram")
+    new = chat_commands.add_parser("new", help="Неразобранные сообщения одной пачкой; перед этим sync")
+    new.add_argument("--no-sync", action="store_true", help="Не обращаться к Telegram")
+    new.add_argument("--limit", type=int, default=500)
+    done = chat_commands.add_parser("done", help="Отметить прочитанную пачку разобранной")
+    done.add_argument("--batch", required=True, help="batch из mmm chats new")
+
+    work = commands.add_parser("work", help="Work-режим: снимок для агента и предложения из чатов")
+    work_commands = work.add_subparsers(dest="work_command", required=True, parser_class=Parser)
+    work_commands.add_parser("snapshot", help="Проекты и задачи Work-режима из последнего снимка браузера")
+    propose = work_commands.add_parser("propose", help="Предложить задачи: JSON {\"proposals\": [...]} из файла или stdin")
+    propose.add_argument("--file", type=Path, help="UTF-8 JSON файл, '-' для stdin")
+    propose.add_argument("--agent", default="agent", help="Кто предлагает: codex или claude")
+    listing_proposals = work_commands.add_parser("proposals", help="Предложения и их статус")
+    listing_proposals.add_argument("--status", default="pending", choices=["pending", "accepted", "rejected", "all"])
     return parser
+
+
+def _chats_command(root: Path, args) -> dict:
+    from . import telegram_chats
+    from .chats import ChatStore
+    from .work_inbox import WorkInbox
+
+    store = ChatStore(root)
+    if args.command == "chats":
+        match args.chats_command:
+            case "telegram-login":
+                return telegram_chats.login(root)
+            case "telegram-dialogs":
+                return {"dialogs": telegram_chats.dialogs(root, max(1, min(args.limit, 500)))}
+            case "add":
+                return telegram_chats.add(root, args.chat_id, store)
+            case "remove":
+                return store.remove_chat(args.key)
+            case "list":
+                return {**store.status(), "telegram": {"installed": telegram_chats.installed(),
+                                                        "logged_in": telegram_chats.logged_in(root)}}
+            case "sync":
+                return telegram_chats.sync(root, store)
+            case "new":
+                synced = None
+                if not args.no_sync and any(c["source"] == "telegram" for c in store.chats(enabled_only=True)):
+                    try:
+                        synced = telegram_chats.sync(root, store)
+                    except ValidationError as exc:
+                        synced = {"error": str(exc)}
+                result = store.unprocessed(limit=max(1, min(args.limit, 500)))
+                gaps = [chat["title"] for chat in store.chats(enabled_only=True) if chat["gap"]]
+                return {"sync": synced, **result, "gaps": gaps,
+                        "next": "mmm work snapshot → mmm work propose → mmm chats done --batch" if result["batch"] else None}
+            case "done":
+                return store.mark_batch(args.batch)
+    inbox = WorkInbox(root, store)
+    match args.work_command:
+        case "snapshot":
+            return inbox.snapshot_for_agent()
+        case "propose":
+            return inbox.propose(json.loads(_read_input(None, args.file, "JSON предложений")), agent=args.agent)
+        case "proposals":
+            return {"proposals": inbox.list(args.status)}
+    raise ValidationError("Неизвестная команда")
 
 
 def _read_input(text: str | None, path: Path | None, label: str) -> str:
@@ -134,6 +222,30 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "migrate":
             _output(paths.migrate(args.source.expanduser().resolve(), root))
+            return 0
+        if args.command == "restore":
+            from .backup_restore import restore_backup
+            _output(restore_backup(args.archive, args.destination))
+            return 0
+        if args.command == "time":
+            from .time_tracking import TimeStore
+            timer = TimeStore(root)
+            if args.time_command == "state":
+                result = timer.state()
+            elif args.time_command == "summary":
+                result = timer.summary(args.day, args.timezone)
+            else:
+                result = timer.command(json.loads(_read_input(None, args.file, "JSON команды времени")))
+            _output(result)
+            return 0
+        if args.command == "recall":
+            from .shared_state import SharedState
+            shared = SharedState(root)
+            result = shared.recall() if args.recall_command == "get" else shared.set_recall(json.loads(_read_input(None, args.file, "JSON настроек")))
+            _output(result)
+            return 0
+        if args.command in ("chats", "work"):
+            _output(_chats_command(root, args))
             return 0
 
         store = Store(root)

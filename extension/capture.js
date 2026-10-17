@@ -1,3 +1,4 @@
+import "./desktop-platform.js";
 import { capturePayload, currentWeekDueOptions, normalizeTheme, tabCapture } from "./panel-state.js";
 import { DRAFT_KEY, DRAFT_VERSION, isOutdatedWorker, normalizeDesign, normalizeDraft } from "./capture-window.js";
 import { checkAttachmentLimit, renderAttachmentList, storeAttachment } from "./attachments.js";

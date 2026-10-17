@@ -1,3 +1,6 @@
+import "./desktop-platform.js";
+import { mountTimeUI, taskTimeButton } from "./time-ui.js";
+import { mountRecallControls } from "./recall-controls.js";
 import {addDays, assignmentPatch, calendarEventPhase, calendarEventTime, calendarEventsForDate, chooseResurface, compareCalendarEvents, createRefreshGate, currentWeekDueOptions, dayTasks, editableNoteText, editNotePatch, imageFit, isVisibleTask, mixPose, normalizeTheme, overdueTasks, posterHue, reorderedIds, RESURFACE_HOLD_MS, resurfaceCandidates, stackDragCommits, stackEase, stackPose, stepResurface, thoughtRecords, visibleWeekTasks, weekDates, weekStart} from "./panel-state.js";
 import { isOutdatedWorker, normalizeDesign } from "./capture-window.js";
 import { FOCUS_KEY, FOCUS_OVERLAY_COLOR_KEY, FOCUS_OVERLAY_KEY, NEON_COLORS, normalizeNeonColor, normalizeTimer, timerView } from "./focus-timer.js";
@@ -11,6 +14,7 @@ import { CALENDAR_CHANGED_KEY } from "./dictation.js";
 import { applyDocument, LOCALE_KEY, locale, localeChange, localeTag, saveLocale, setLocale, syncLocale, t } from "./i18n.js";
 import { TIMER_CHIME_KEY, normalizeTimerChime, playTimerChime } from "./timer-chime.js";
 import { DEFAULT_IGNITION_SOUND, IGNITION_SOUNDS, normalizeIgnitionSound, playIgnitionSound } from "./comic-fire-sound.js";
+import { openWorkPage } from "./work-tabs.js";
 
 applyDocument();
 const $ = (id) => document.getElementById(id);
@@ -335,6 +339,7 @@ function renderNote(note, {task = false, movable = false, compact = movable, lib
     done.addEventListener("click", () => mutate(note, {status:"done"}, el));
     heading.append(done);
   }
+  if (["task", "purchase"].includes(note.kind) || note.show_in_unscheduled) heading.append(taskTimeButton({source:"library", id:note.id, title:note.title}));
   const title = node("strong", "note-title", note.title);
   let taskDisclosureTimer = null;
   let content = el;
@@ -889,7 +894,7 @@ function renderCalendarRows() {
       eventClick.stopPropagation();
       if (!check.disabled) mutateCalendarOccurrence(event, "delete");
     });
-    row.append(check, node("span", "calendar-event-time", calendarEventTime(event)), description);
+    row.append(check, node("span", "calendar-event-time", calendarEventTime(event)), description, taskTimeButton({source:"calendar",id:`${event.calendar_id}:${event.occurrence_id || event.id}`,title:event.title || t("Событие без названия")}));
     const importanceToggle = node("button", "importance-toggle");
     importanceToggle.type = "button";
     importanceToggle.hidden = !showImportanceControl;
@@ -1405,7 +1410,8 @@ function renderRotation(direction = 1, instant = false) {
   if (editingNote?.id === currentId && editDialog.open) return;
   const candidates = resurfaceCandidates(dashboard);
   const openDetails = Boolean(front.querySelector(".carousel-more:not([hidden])"));
-  const selected = chooseResurface(candidates, dashboard.resurface, resurfaceId, resurfaceHoldUntil, Date.now(), openDetails);
+  recallControls.sync(dashboard.recall);
+  const selected = dashboard.recall?.paused ? candidates.find(note => note.id === dashboard.recall.selected_id) || null : chooseResurface(candidates, dashboard.resurface, resurfaceId, resurfaceHoldUntil, Date.now(), openDetails);
   resurfaceId = selected?.id || null;
   if (instant) cancelRotationMotion();
   const nextKey = selected ? `${selected.id}:${selected.version}` : "empty";
@@ -2303,6 +2309,10 @@ function returnToDay(restoreFocus = true, persist = true) {
 $("find-toggle").setAttribute("aria-controls", "library-view");
 $("find-toggle").setAttribute("aria-expanded", "false");
 $("find-toggle").addEventListener("click", openLibrary);
+// Work mode lives in its own tab: the week of projects needs the full width.
+$("work-open").addEventListener("click", async () => {
+  try { await openWorkPage(); } catch (error) { notice(error.message || t("Не удалось открыть Work-режим."), true); }
+});
 $("library-entry").addEventListener("click", openLibrary);
 $("library-back").addEventListener("click", () => returnToDay());
 $("library-clear").addEventListener("click", () => { $("library-search").value = ""; renderLibrary(); void persistLibraryState(); $("library-search").focus(); });
@@ -2402,12 +2412,17 @@ async function initializeLibraryView() {
 function stepRotation(direction) {
   if (!dashboard || viewerState) return;
   const candidates = resurfaceCandidates(dashboard);
-  if (candidates.length < 2) return;
+  if (!candidates.length) return;
   const next = stepResurface(candidates, resurfaceId, direction);
   resurfaceId = next.id;
   resurfaceHoldUntil = next.holdUntil;
+  if (dashboard.recall?.paused) { dashboard.recall.selected_id = next.id; void recallControls.select(next.id); }
   renderRotation(direction);
 }
+const timeHost = document.createElement("div");
+document.querySelector(".masthead").after(timeHost);
+mountTimeUI(timeHost);
+const recallControls = mountRecallControls($("rotation-card").querySelector(".section-heading"), {currentId:()=>resurfaceId, refresh:()=>refresh(), notes:()=>allNotes});
 const rotationCard = $("rotation-card");
 rotationCard.tabIndex = 0;
 rotationCard.setAttribute("aria-label", t("Вспомнить. Стрелки влево и вправо перелистывают записи"));
@@ -2442,6 +2457,7 @@ async function releaseStackDrag(motion, velocity, allowCommit = true) {
     const next = stepResurface(motion.candidates, resurfaceId, motion.direction);
     resurfaceId = next.id;
     resurfaceHoldUntil = next.holdUntil;
+    if (dashboard.recall?.paused) { dashboard.recall.selected_id = next.id; void recallControls.select(next.id); }
     const target = motion.candidates.find(note => note.id === next.id) || motion.target;
     await animateRotation(recallContent(target), `${target.id}:${target.version}`, motion.direction, false, motion.candidates, target, motion);
     return;

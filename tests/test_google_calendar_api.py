@@ -1,5 +1,10 @@
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from io import BytesIO
+from threading import Event
+from urllib.error import HTTPError
 
 import pytest
 from fastapi.testclient import TestClient
@@ -175,3 +180,185 @@ def test_desktop_oauth_client_secret_is_optional(tmp_path):
     credentials["installed"].pop("client_secret")
     client = GoogleCalendarApi(tmp_path)
     assert client.configure_client(credentials)["client_configured"] is True
+
+
+def test_callback_without_refresh_token_keeps_existing_grant_unchanged(tmp_path, monkeypatch):
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "old-refresh", "access_token": "old-access",
+                                             "expires_at": time.time() + 3600}), encoding="utf-8")
+    client.start()
+    pending = json.loads(client.pending_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(client, "_form", lambda *_: {"access_token": "new-access", "expires_in": 3600})
+
+    before = client.token_path.read_bytes()
+    with pytest.raises(ValidationError, match="токен обновления"):
+        client.callback(pending["state"], "code")
+
+    assert client.token_path.read_bytes() == before
+    assert client.status()["authorized"] is True
+
+
+def test_first_callback_without_refresh_token_does_not_authorize(tmp_path, monkeypatch):
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.start()
+    pending = json.loads(client.pending_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(client, "_form", lambda *_: {"access_token": "access", "expires_in": 3600})
+
+    with pytest.raises(ValidationError, match="токен обновления"):
+        client.callback(pending["state"], "code")
+
+    assert client.status() == {"client_configured": True, "authorized": False}
+    assert not client.token_path.exists()
+
+
+def test_expired_access_only_token_is_not_reported_authorized(tmp_path):
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"access_token": "access", "expires_at": time.time() - 1}),
+                                 encoding="utf-8")
+    assert client.status() == {"client_configured": True, "authorized": False,
+                               "reauthorization_required": True}
+
+
+def test_concurrent_refresh_uses_one_token_request(tmp_path, monkeypatch):
+    client = GoogleCalendarApi(tmp_path)
+    other = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "refresh", "expires_at": 0}), encoding="utf-8")
+    entered, release = Event(), Event()
+    calls = []
+
+    def refresh(*_):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return {"access_token": "new-access", "expires_in": 3600}
+
+    monkeypatch.setattr(client, "_form", refresh)
+    monkeypatch.setattr(other, "_form", refresh)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client._access_token)
+        assert entered.wait(3)
+        second = pool.submit(other._access_token)
+        time.sleep(0.05)
+        release.set()
+        assert first.result(timeout=3) == second.result(timeout=3) == "new-access"
+    assert len(calls) == 1
+
+
+def test_status_does_not_wait_for_network_refresh(tmp_path, monkeypatch):
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "refresh", "expires_at": 0}), encoding="utf-8")
+    entered, release = Event(), Event()
+
+    def refresh(*_):
+        entered.set()
+        assert release.wait(3)
+        return {"access_token": "new-access", "expires_in": 3600}
+
+    monkeypatch.setattr(client, "_form", refresh)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future = pool.submit(client._access_token)
+        assert entered.wait(3)
+        try:
+            assert pool.submit(client.status).result(timeout=1)["authorized"] is True
+        finally:
+            release.set()
+        assert future.result(timeout=3) == "new-access"
+
+
+@pytest.mark.parametrize("action", ["reconfigure", "disconnect"])
+def test_connection_change_cannot_restore_inflight_refresh_token(tmp_path, monkeypatch, action):
+    client = GoogleCalendarApi(tmp_path)
+    other = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "old-refresh", "expires_at": 0}), encoding="utf-8")
+    entered, release = Event(), Event()
+
+    def refresh(*_):
+        entered.set()
+        assert release.wait(3)
+        return {"access_token": "old-access", "expires_in": 3600}
+
+    monkeypatch.setattr(client, "_form", refresh)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(client._access_token)
+        assert entered.wait(3)
+        change = pool.submit(other.configure_client, CLIENT) if action == "reconfigure" else pool.submit(other.disconnect)
+        time.sleep(0.05)
+        release.set()
+        first.result(timeout=3)
+        change.result(timeout=3)
+    assert client.status()["authorized"] is False
+    assert not client.token_path.exists()
+
+
+def test_get_401_refreshes_once_and_retries_with_new_token(tmp_path, monkeypatch):
+    from megamozg import google_calendar_api as module
+
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "refresh", "access_token": "old-access",
+                                             "expires_at": time.time() + 3600}), encoding="utf-8")
+    monkeypatch.setattr(client, "_form", lambda *_: {"access_token": "new-access", "expires_in": 3600})
+    attempts = []
+
+    class Reply:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return b'{"items":[]}'
+
+    def get(request, timeout):
+        attempts.append(request.get_header("Authorization"))
+        if len(attempts) == 1:
+            raise HTTPError(request.full_url, 401, "Unauthorized", {}, BytesIO(b'{}'))
+        return Reply()
+
+    monkeypatch.setattr(module, "urlopen", get)
+    assert client.request("GET", "/calendar/v3/calendars/primary/events") == {"items": []}
+    assert attempts == ["Bearer old-access", "Bearer new-access"]
+
+
+def test_mutation_401_refreshes_token_without_replaying_write(tmp_path, monkeypatch):
+    from megamozg import google_calendar_api as module
+
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "refresh", "access_token": "old-access",
+                                             "expires_at": time.time() + 3600}), encoding="utf-8")
+    monkeypatch.setattr(client, "_form", lambda *_: {"access_token": "new-access", "expires_in": 3600,
+                                                     "refresh_token": "rotated-refresh"})
+    attempts = []
+
+    def rejected(request, timeout):
+        attempts.append(request.get_header("Authorization"))
+        raise HTTPError(request.full_url, 401, "Unauthorized", {}, BytesIO(b'{}'))
+
+    monkeypatch.setattr(module, "urlopen", rejected)
+    with pytest.raises(ValidationError, match="повторите действие"):
+        client.request("PATCH", "/calendar/v3/calendars/primary/events/id", body={"summary": "fixture"})
+    assert attempts == ["Bearer old-access"]
+    assert client._read(client.token_path)["refresh_token"] == "rotated-refresh"
+
+
+def test_403_quota_error_is_not_reported_as_event_permission(tmp_path, monkeypatch):
+    from megamozg import google_calendar_api as module
+
+    client = GoogleCalendarApi(tmp_path)
+    client.configure_client(CLIENT)
+    client.token_path.write_text(json.dumps({"refresh_token": "refresh", "access_token": "access",
+                                             "expires_at": time.time() + 3600}), encoding="utf-8")
+    calls = []
+
+    def limited(request, timeout):
+        calls.append(1)
+        raise HTTPError(request.full_url, 403, "Forbidden", {}, BytesIO(
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'))
+
+    monkeypatch.setattr(module, "urlopen", limited)
+    with pytest.raises(ValidationError, match="ограничил запросы"):
+        client.request("GET", "/calendar/v3/calendars/primary/events")
+    assert len(calls) == 1

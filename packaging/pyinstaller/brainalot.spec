@@ -27,12 +27,16 @@ for distribution in ("faster-whisper", "ctranslate2", "huggingface-hub", "hf-xet
     datas += copy_metadata(distribution)
 
 hidden = (collect_submodules("uvicorn") + collect_submodules("megamozg") + collect_submodules("faster_whisper")
+          + collect_submodules("webview")
           + ["velopack", "ctranslate2", "onnxruntime", "av", "tokenizers", "httpx",
-             "huggingface_hub._snapshot_download", "huggingface_hub.file_download", "hf_xet"])
+             "huggingface_hub._snapshot_download", "huggingface_hub.file_download", "hf_xet",
+             "clr", "pythonnet", "clr_loader"])
 binaries = collect_dynamic_libs("ctranslate2")
+datas += collect_data_files("webview")
 # Not in the product: the tkinter console (the panel replaces it) and tests.
 excludes = ["tkinter", "_tkinter", "megamozg.manual", "pytest",
-            "_pytest", "pygments", "IPython", "setuptools", "pip"]
+            "_pytest", "pygments", "IPython", "setuptools", "pip", "PyQt5", "PyQt6",
+            "PySide2", "PySide6", "cefpython3", "gi"]
 
 
 def analysis(script):

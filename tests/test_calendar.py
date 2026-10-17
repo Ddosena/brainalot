@@ -318,6 +318,44 @@ def test_failed_api_with_old_cache_uses_newer_ical_events(tmp_path, monkeypatch)
     assert not second["stale"] and second["error"] is None
 
 
+@pytest.mark.parametrize("ical_available", [False, True])
+def test_disconnected_oauth_keeps_api_cache_until_fresher_ical(tmp_path, monkeypatch, ical_available):
+    class DirectApi:
+        def list_events(self, *_):
+            return [{"iCalUID": "saved@example.com", "summary": "Saved API event",
+                     "start": {"dateTime": "2026-09-21T10:00:00+03:00"},
+                     "end": {"dateTime": "2026-09-21T11:00:00+03:00"}}]
+
+    feed = CalendarFeed(tmp_path)
+    feed.configure(URL)
+    first = feed.events(date(2026, 9, 21), date(2026, 9, 27), google_calendar=DirectApi())
+
+    def download(_):
+        if not ical_available:
+            raise OSError("offline")
+        return FEED
+
+    monkeypatch.setattr(CalendarFeed, "_download", lambda self, url: download(url))
+    # The real route passes no Google client after invalid_grant/disconnect.
+    client = TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8765")
+    auth = {"Authorization": "Bearer " + Store(tmp_path).token()}
+    assert not client.get("/api/calendar/oauth/status", headers=auth).json()["authorized"]
+    result = client.get("/api/calendar/events?start=2026-09-21&end=2026-09-27", headers=auth)
+    assert result.status_code == 200
+    second = result.json()
+    if ical_available:
+        assert not second["stale"] and second["error"] is None
+        assert any(event["title"] == "Conference" for event in second["events"])
+    else:
+        assert second["events"] == first["events"]
+        assert second["stale"] and second["error"]
+
+    # A cached week must never masquerade as coverage of a different week.
+    monkeypatch.setattr(CalendarFeed, "_download", lambda *_: (_ for _ in ()).throw(OSError("offline")))
+    outside = client.get("/api/calendar/events?start=2027-01-04&end=2027-01-10&force=1", headers=auth).json()
+    assert not outside["events"] and outside["stale"]
+
+
 def test_invalid_grant_requires_reauthorization_without_retrying_token(tmp_path, monkeypatch):
     from megamozg import google_calendar_api as module
 

@@ -13,6 +13,8 @@ dependencies = ["PyYAML>=6.0.2,<7", "filelock>=3.16,<4", "fastapi>=0.115,<1", "u
 dev = ["pytest>=8,<10", "httpx>=0.28,<1"]
 packaging = ["pyinstaller>=6.10,<7"]
 voice = ["faster-whisper>=1.1,<2"]
+chats = ["telethon>=1.45,<2"]
+desktop = ["pywebview>=5.4,<7"]
 
 [project.scripts]
 megamozg = "megamozg.cli:main"

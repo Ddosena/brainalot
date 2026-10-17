@@ -812,8 +812,14 @@ class Store:
                              and n.get("planning_horizon") == "month"]
             library = [n for n in active if n["kind"] not in {"task", "purchase", "inbox"}]
             schedules = {r["note_id"]: r for r in db.execute("SELECT * FROM schedule")}
+            from .shared_state import SharedState
+            recall = SharedState(self.root).recall()
             candidates = []
             for note in active:
+                if recall["kinds"] is not None and note["kind"] not in recall["kinds"]:
+                    continue
+                if recall["context_ids"] is not None and note.get("context_id") not in recall["context_ids"]:
+                    continue
                 if note["kind"] in {"inbox", "project"} or not note["show_in_carousel"]:
                     continue
                 if note["kind"] in {"task", "purchase"} and note.get("due") == today.isoformat():
@@ -834,8 +840,12 @@ class Store:
                         if IMPORTANCE_WEIGHTS[n["importance"]] >= weight
                         and (recall_pass == 0 or n["id"] not in project_ideas)]
             card = None
-            if weighted:
+            selected = next((n for n in candidates if n["id"] == recall["selected_id"]), None)
+            if recall["paused"]:
+                card = dict(selected) if selected else None
+            elif weighted:
                 card = dict(weighted[int(now.timestamp() // 60) % len(weighted)])
+            if card:
                 importance_label = IMPORTANCE_LABELS[card["importance"]]
                 kind_label = {"inbox": "входящее", "task": "дело", "purchase": "покупка",
                               "media": "медиа", "idea": "идея", "thought": "мысль", "link": "ссылка",
@@ -860,7 +870,11 @@ class Store:
                         inbox=[n for n in active if n["kind"] == "inbox"], library=library,
                         overdue_yesterday=overdue_yesterday, overdue_older=overdue_older,
                         completed_tasks=completed_tasks, stats={"completed_recent": len(recent), **events},
-                        resurface=card, resurface_candidates=candidates, warnings=warnings)
+                        resurface=card, resurface_candidates=candidates,
+                        recall={**recall, "candidate_count": len(candidates),
+                                "selection_missing": recall["paused"] and selected is None,
+                                "empty_reason": ("selection_missing" if recall["paused"] and selected is None
+                                                 else "no_candidates" if not candidates else None)}, warnings=warnings)
 
     def _recent_decisions(self, db, today):
         result = {"done": 0, "deferred": 0, "cancelled": 0}
@@ -938,5 +952,20 @@ class Store:
                     if p.is_file() and p.resolve().is_relative_to(self.vault):
                         archive.write(p, "vault/" + p.relative_to(self.vault).as_posix())
                 archive.write(snapshot, "state/journal.sqlite3")
+                # Independent SQLite stores use their online backup API, never copy live WAL files.
+                for name in ("shared.sqlite3", "time.sqlite3", "chats.sqlite3"):
+                    source = self.root / "state" / name
+                    if source.is_file():
+                        target_path = Path(tmp) / name
+                        with closing(sqlite3.connect(source)) as source_db, closing(sqlite3.connect(target_path)) as target_db:
+                            source_db.backup(target_db)
+                        archive.write(target_path, "state/" + name)
+                # Attachment bytes live outside vault. Authentication/session secrets stay excluded.
+                for directory in ("attachments", "chat-files"):
+                    base = self.root / directory
+                    if base.is_dir():
+                        for path in base.rglob("*"):
+                            if path.is_file() and path.resolve().is_relative_to(base.resolve()):
+                                archive.write(path, directory + "/" + path.relative_to(base).as_posix())
             # API token intentionally regenerated on restore.
         return dest

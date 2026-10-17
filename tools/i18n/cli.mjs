@@ -24,7 +24,7 @@ const EXTENSION = join(ROOT, "extension");
 const CATALOG = join(EXTENSION, "locales", "en.js");
 const RUNTIME_FILES = new Set(["i18n.js"]);
 const SERVER_FILES = ["api.py", "core.py", "calendar.py", "google_calendar_api.py", "attachments.py",
-  "focus_overlay.py", "dictation.py", "dictation_service.py", "voice.py"];
+  "focus_overlay.py", "dictation.py", "dictation_service.py", "voice.py", "chats.py", "work_inbox.py", "telegram_chats.py"];
 export const MANIFEST_MESSAGES = {
   extName: { field: ["name"], en: "Brainalot" },
   extDescription: { field: ["description"], en: "Local manager for thoughts, tasks and schedule in the Chrome side panel." },

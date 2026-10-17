@@ -96,7 +96,8 @@ def prepare_installed_root(root: Path) -> Path:
 
 
 # State files that belong to one running copy or can be rebuilt; everything else in state is moved.
-_STATE_SKIP = {"writer.lock", "calendar.lock", "runtime.json", "logs", "native-host", "models"}
+# The Telegram session opens the whole account: a new installation signs in again instead.
+_STATE_SKIP = {"writer.lock", "calendar.lock", "chats.lock", "runtime.json", "logs", "native-host", "models", "telegram"}
 
 
 def migrate(source: Path, target: Path) -> dict:
@@ -130,10 +131,18 @@ def migrate(source: Path, target: Path) -> dict:
     for item in source_state.iterdir():
         if item.name in _STATE_SKIP or item.name.endswith((".lock", ".tmp", "-journal", "-wal", "-shm")):
             continue
-        if item.name == "journal.sqlite3":
-            # The online backup API gives a consistent copy even if the old service still writes.
-            with closing(sqlite3.connect(item)) as old, closing(sqlite3.connect(target_state / item.name)) as new:
-                old.backup(new)
+        if item.is_file() and item.name.endswith(".sqlite3"):
+            # Every SQLite store may have committed rows still in its live WAL.
+            # Copying just the main file would silently omit those rows.
+            destination = target_state / item.name
+            temporary = target_state / (item.name + ".migration.tmp")
+            temporary.unlink(missing_ok=True)
+            try:
+                with closing(sqlite3.connect(item)) as old, closing(sqlite3.connect(temporary)) as new:
+                    old.backup(new)
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
         elif item.is_dir():
             shutil.copytree(item, target_state / item.name, dirs_exist_ok=True)
         else:

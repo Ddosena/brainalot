@@ -29,3 +29,12 @@ typing_extensions==4.16.0
 tzdata==2026.4
 uvicorn==0.53.0
 x-wr-timezone==2.0.1
+
+# Desktop WebView2 host
+pywebview==6.2.1
+pythonnet==3.2.1
+proxy_tools==0.1.0
+bottle==0.13.4
+clr_loader==0.3.1
+cffi==2.1.1
+pycparser==3.11

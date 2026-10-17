@@ -6,12 +6,13 @@ import hashlib
 import os
 import math
 import re
-from datetime import date
+from datetime import date, timedelta
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 from urllib.parse import quote
 
 from . import API_VERSION, __version__
@@ -21,6 +22,14 @@ from .dictation_service import DictationService
 from .google_calendar_api import GoogleCalendarApi
 from .voice import VoiceService, VoiceUnavailableError
 from . import focus_overlay
+from . import telegram_chats
+from .chats import ChatStore
+from .work_inbox import WorkInbox
+from .shared_state import SharedState
+from .work_store import WorkStore
+from .time_tracking import TimeStore
+from .browser_bridge import BrowserBridge
+from . import paths
 
 
 def create_app(root: str | Path, port: int = 8765) -> FastAPI:
@@ -29,7 +38,23 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     google_calendar = GoogleCalendarApi(root, port=port)
     dictation = DictationService(store, calendar, google_calendar)
     voice = VoiceService(store)
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    chats = ChatStore(root)
+    work_inbox = WorkInbox(root, chats)
+    shared = SharedState(root)
+    work = WorkStore(root)
+    timer = TimeStore(root)
+    browser = BrowserBridge(root)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await run_in_threadpool(timer.start_service)
+        try:
+            yield
+        finally:
+            await run_in_threadpool(timer.stop_service)
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.timer = timer
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -43,7 +68,7 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
             return JSONResponse({}, headers={"Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "Authorization, Content-Type, If-None-Match", "Vary": "Origin"})
-        if request.url.path not in {"/api/health", "/", "/welcome", "/welcome/icon.png"}:
+        if request.url.path not in {"/api/health", "/", "/welcome", "/welcome/icon.png"} and not request.url.path.startswith("/desktop/"):
             auth = request.headers.get("authorization", "")
             if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:].encode("utf-8"), store.token().encode("utf-8")):
                 return JSONResponse({"detail": "Нужен действительный токен"}, status_code=401)
@@ -129,6 +154,124 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     @app.get("/api/dashboard")
     def dashboard(request: Request):
         return conditional_json(request, store.dashboard())
+
+    @app.get("/desktop/{asset:path}")
+    def desktop_asset(asset: str):
+        base = (paths.project_root() / "extension").resolve()
+        target = (base / asset).resolve()
+        allowed = {".html", ".js", ".mjs", ".css", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2", ".ttf", ".ico"}
+        if (not target.is_relative_to(base) or any(part.casefold() in {"tests", "dev", "tools"} for part in Path(asset).parts)
+                or target.suffix.lower() not in allowed or not target.is_file()):
+            raise NotFoundError("Файл desktop не найден")
+        return FileResponse(target, headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"})
+
+    @app.get("/api/time/state")
+    def time_state():
+        return timer.state()
+
+    @app.post("/api/time/command")
+    async def time_command(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "action", "task", "mode", "duration_ms"})
+        return await run_in_threadpool(timer.command, data)
+
+    @app.get("/api/time/summary")
+    def time_summary(day: str, timezone: str = "Europe/Moscow"):
+        return timer.summary(day, timezone)
+
+    @app.get("/api/time/tasks")
+    def time_tasks(q: str = ""):
+        tasks = [{"source": "library", "id": n["id"], "title": n["title"]} for n in store.list_notes()
+                 if n["status"] == "active" and (n["kind"] in {"task", "purchase"} or n.get("show_in_unscheduled"))]
+        state = work.read()["state"]
+        tasks.extend({"source": "work", "id": n["id"], "title": n.get("title") or "Без названия"}
+                     for n in (state or {}).get("items", []) if n.get("status") != "done")
+        # Use existing cached calendar data; opening a stopwatch never triggers network/OAuth.
+        events = {}
+        today = date.today()
+        with calendar.lock:
+            for item in calendar._read_config()["calendars"]:
+                for event in calendar._api_cache(item["id"]).get("events", []):
+                    key = str(event.get("occurrence_id") or event.get("id"))
+                    events[item["id"] + ":" + key] = event
+                cached = calendar._cache_path(item["id"])
+                if cached.is_file():
+                    try:
+                        for event in calendar._parse_events_cached(cached.read_bytes(), item, today-timedelta(days=31), today+timedelta(days=31)):
+                            key = str(event.get("occurrence_id") or event["id"])
+                            events.setdefault(item["id"] + ":" + key, event)
+                    except (ValueError, OSError):
+                        pass
+        tasks.extend({"source": "calendar", "id": key, "title": event.get("title") or "Событие"} for key, event in events.items())
+        return {"tasks": [task for task in tasks if q.casefold() in task["title"].casefold()]}
+
+    @app.get("/api/recall")
+    def recall_settings():
+        return shared.recall()
+
+    @app.post("/api/recall")
+    async def recall_update(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "patch", "reset"})
+        return await run_in_threadpool(shared.set_recall, data)
+
+    @app.get("/api/ui/preferences")
+    def ui_preferences():
+        return shared.preferences()
+
+    @app.post("/api/ui/preferences")
+    async def ui_preferences_update(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "patch"})
+        return await run_in_threadpool(shared.set_preferences, data)
+
+    @app.get("/api/work/state")
+    def work_state(request: Request):
+        return conditional_json(request, work.read())
+
+    @app.post("/api/work/blobs/{blob}/chunks")
+    async def work_chunk(blob: str, request: Request):
+        data = await payload(request, {"index", "total", "content_base64"})
+        return await run_in_threadpool(work.upload_chunk, blob, data)
+
+    @app.post("/api/work/commit")
+    async def work_commit(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "state_blob", "images"})
+        return await run_in_threadpool(work.commit, data)
+
+    @app.get("/api/work/images/{image_id}")
+    def work_image(image_id: str):
+        body, mime = work.image(image_id)
+        return Response(body, media_type=mime, headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; default-src 'none'", "Cache-Control": "private, no-cache"})
+
+    @app.get("/api/work/revisions")
+    def work_revisions():
+        return work.revisions()
+
+    @app.post("/api/work/restore")
+    async def work_restore(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "revision"})
+        return await run_in_threadpool(work.restore, data)
+
+    @app.get("/api/browser/status")
+    def browser_status():
+        return browser.status()
+
+    @app.post("/api/browser/commands")
+    async def browser_command(request: Request):
+        data = await payload(request, {"request_id", "action", "payload"})
+        return await run_in_threadpool(browser.submit, data)
+
+    @app.post("/api/browser/poll")
+    async def browser_poll(request: Request):
+        data = await payload(request, {"client_id"})
+        return await run_in_threadpool(browser.poll, data.get("client_id"))
+
+    @app.get("/api/browser/commands/{command_id}")
+    def browser_command_status(command_id: str):
+        return browser.get(command_id)
+
+    @app.post("/api/browser/commands/{command_id}/result")
+    async def browser_result(command_id: str, request: Request):
+        data = await payload(request, {"client_id", "result", "error"})
+        return await run_in_threadpool(browser.complete, command_id, data)
 
     @app.post("/api/focus/overlay")
     async def focus_overlay_state(request: Request):
@@ -323,6 +466,51 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
         if not isinstance(data.get("expected_version"), str) or not isinstance(data.get("action"), str):
             raise ValidationError("Требуются expected_version и action")
         return await run_in_threadpool(store.feedback, note_id, data["action"], data["expected_version"])
+
+    # --- work chats and the Work mode inbox (see chats.py, work_inbox.py) ---
+
+    @app.get("/api/chats/status")
+    async def chats_status():
+        status = await run_in_threadpool(chats.status)
+        status["telegram"] = {"installed": telegram_chats.installed(), "logged_in": telegram_chats.logged_in(Path(root))}
+        return status
+
+    @app.post("/api/chats/sync")
+    async def chats_sync():
+        return await run_in_threadpool(telegram_chats.sync, Path(root), chats)
+
+    @app.post("/api/chats/web")
+    async def chats_web(request: Request):
+        data = await payload(request, {"source", "chat", "messages", "connect", "oldest_loaded"})
+        return await run_in_threadpool(lambda: chats.ingest_web(data.get("source"), data.get("chat"), data.get("messages"),
+                                                                connect=data.get("connect") is True,
+                                                                oldest_loaded=data.get("oldest_loaded")))
+
+    @app.post("/api/chats/markup")
+    async def chats_markup(request: Request):
+        data = await payload(request, {"source", "markup"})
+        return await run_in_threadpool(chats.save_markup, data.get("markup"), data.get("source"))
+
+    @app.post("/api/chats/remove")
+    async def chats_remove(request: Request):
+        data = await payload(request, {"key"})
+        if not isinstance(data.get("key"), str):
+            raise ValidationError("Требуется key")
+        return await run_in_threadpool(chats.remove_chat, data["key"])
+
+    @app.post("/api/work/snapshot")
+    async def work_snapshot(request: Request):
+        data = await payload(request, {"state"})
+        return await run_in_threadpool(work_inbox.save_snapshot, data.get("state"))
+
+    @app.get("/api/work/proposals")
+    async def work_proposals(status: str = "pending"):
+        return {"proposals": await run_in_threadpool(work_inbox.list, status)}
+
+    @app.post("/api/work/proposals/{proposal_id}")
+    async def work_proposal_resolve(proposal_id: str, request: Request):
+        data = await payload(request, {"action", "item_id"})
+        return await run_in_threadpool(work_inbox.resolve, proposal_id, data.get("action"), data.get("item_id"))
 
     return app
 

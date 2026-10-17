@@ -24,6 +24,7 @@ WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPA
 WM_DESTROY, WM_CLOSE, WM_COMMAND, WM_NULL, WM_APP = 0x0002, 0x0010, 0x0111, 0x0000, 0x8000
 WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_CONTEXTMENU = 0x0202, 0x0203, 0x0205, 0x007B
 WM_TRAY = WM_APP + 1
+OPEN_DESKTOP_MESSAGE = "Brainalot.OpenDesktop"
 NIM_ADD, NIM_MODIFY, NIM_DELETE, NIM_SETVERSION = 0, 1, 2, 4
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO, NIF_SHOWTIP = 0x1, 0x2, 0x4, 0x10, 0x80
 NOTIFYICON_VERSION_4 = 4
@@ -81,6 +82,12 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.DispatchMessageW.restype = LRESULT
 user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
+user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+user32.FindWindowW.restype = wintypes.HWND
+user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                       wintypes.LPARAM, wintypes.UINT, wintypes.UINT,
+                                       ctypes.POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = wintypes.LPARAM
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
@@ -88,13 +95,15 @@ kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 
 class Tray:
-    def __init__(self, items, tooltip: str, icon_path: Path | None):
+    def __init__(self, items, tooltip: str, icon_path: Path | None, on_open=None):
         self.items, self.tooltip, self.icon_path = items, tooltip[:127], icon_path
+        self.on_open = on_open
         self.hwnd = None
         self._actions: dict[int, object] = {}
         self._wndproc = WNDPROC(self._window_proc)  # keep a reference: Windows calls it later
         self._ready = threading.Event()
         self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        self._open_desktop = user32.RegisterWindowMessageW(OPEN_DESKTOP_MESSAGE)
 
     def _icon(self):
         if self.icon_path and Path(self.icon_path).is_file():
@@ -157,10 +166,16 @@ class Tray:
                 _log.exception("tray menu action failed")
 
     def _window_proc(self, hwnd, message, wparam, lparam):
+        if message == self._open_desktop and self._open_desktop:
+            if self.on_open:
+                threading.Thread(target=self.on_open, name="brainalot-show-desktop", daemon=True).start()
+            return 0
         if message == WM_TRAY:
             event = lparam & 0xFFFF
-            if event in (WM_RBUTTONUP, WM_CONTEXTMENU, WM_LBUTTONUP):
+            if event in (WM_RBUTTONUP, WM_CONTEXTMENU):
                 self._menu()
+            elif event == WM_LBUTTONUP and self.on_open:
+                threading.Thread(target=self.on_open, name="brainalot-show-desktop", daemon=True).start()
             return 0
         if message == self._taskbar_created and self._taskbar_created:
             self._add()  # Explorer restarted: the icon must be added again
@@ -193,3 +208,15 @@ class Tray:
             user32.TranslateMessage(ctypes.byref(message))
             user32.DispatchMessageW(ctypes.byref(message))
         self.hwnd = None
+
+
+def signal_open_desktop() -> bool:
+    """Ask the existing per-user instance to show its full window."""
+    hwnd = user32.FindWindowW("BrainalotTray", "Brainalot")
+    if not hwnd:
+        return False
+    message = user32.RegisterWindowMessageW(OPEN_DESKTOP_MESSAGE)
+    if not message:
+        return False
+    result = ctypes.c_size_t()
+    return bool(user32.SendMessageTimeoutW(hwnd, message, 0, 0, 0x0002, 2000, ctypes.byref(result)))

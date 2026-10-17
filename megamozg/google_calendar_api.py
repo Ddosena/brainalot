@@ -21,6 +21,8 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from filelock import FileLock
+
 from .core import ConflictError, ValidationError
 
 
@@ -84,6 +86,7 @@ class GoogleCalendarApi:
         self.client_path = state / "google-calendar-oauth-client.json"
         self.token_path = state / "google-calendar-oauth-token.json"
         self.pending_path = state / "google-calendar-oauth-pending.json"
+        self.lock = FileLock(str(state / "google-calendar-oauth.lock"))
 
     @staticmethod
     def _read(path: Path) -> dict:
@@ -94,10 +97,20 @@ class GoogleCalendarApi:
         return value if isinstance(value, dict) else {}
 
     def status(self) -> dict:
+        # Atomic file replacement makes this read safe while a refresh holds the
+        # OAuth lock for a network request. A transient mixed snapshot is harmless.
         client, token = self._read(self.client_path), self._read(self.token_path)
-        expired = bool(token.get("reauthorization_required"))
+        try:
+            access_valid = (isinstance(token.get("access_token"), str)
+                            and float(token.get("expires_at", 0)) > time.time() + 60)
+        except (TypeError, ValueError, OverflowError):
+            access_valid = False
+        access_only_expired = (isinstance(token.get("access_token"), str)
+                               and not token.get("refresh_token") and not access_valid)
+        expired = bool(token.get("reauthorization_required")) or access_only_expired
         status = {"client_configured": bool(client.get("client_id")),
-                  "authorized": bool(token.get("refresh_token") or token.get("access_token")) and not expired}
+                  "authorized": bool(client.get("client_id"))
+                  and (bool(token.get("refresh_token")) or access_valid) and not expired}
         if expired:
             status["reauthorization_required"] = True
         return status
@@ -121,20 +134,22 @@ class GoogleCalendarApi:
             raise ValidationError("Некорректный адрес авторизации Google")
         if token_parts.scheme != "https" or token_parts.hostname != TOKEN_HOST:
             raise ValidationError("Некорректный адрес токена Google")
-        _atomic_json(self.client_path, {"client_id": client_id, "client_secret": client_secret,
-                                       "auth_uri": auth_uri, "token_uri": token_uri})
-        self.token_path.unlink(missing_ok=True)
-        self.pending_path.unlink(missing_ok=True)
+        with self.lock:
+            _atomic_json(self.client_path, {"client_id": client_id, "client_secret": client_secret,
+                                           "auth_uri": auth_uri, "token_uri": token_uri})
+            self.token_path.unlink(missing_ok=True)
+            self.pending_path.unlink(missing_ok=True)
         return self.status()
 
     def start(self) -> dict:
-        client = self._read(self.client_path)
-        if not client.get("client_id"):
-            raise ValidationError("Сначала загрузите JSON OAuth-клиента Google")
-        state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-        _atomic_json(self.pending_path, {"state": state, "verifier": verifier, "created": time.time(),
-                                         "redirect_uri": self.redirect_uri})
+        with self.lock:
+            client = self._read(self.client_path)
+            if not client.get("client_id"):
+                raise ValidationError("Сначала загрузите JSON OAuth-клиента Google")
+            state, verifier = secrets.token_urlsafe(32), secrets.token_urlsafe(64)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            _atomic_json(self.pending_path, {"state": state, "verifier": verifier, "created": time.time(),
+                                             "redirect_uri": self.redirect_uri})
         query = urlencode({
             "client_id": client["client_id"], "redirect_uri": self.redirect_uri,
             "response_type": "code", "scope": AUTH_SCOPE, "access_type": "offline",
@@ -172,65 +187,84 @@ class GoogleCalendarApi:
     def callback(self, state: str | None, code: str | None, error: str | None = None) -> None:
         if error:
             raise ValidationError("Google отклонил авторизацию")
-        pending, client = self._read(self.pending_path), self._read(self.client_path)
-        try:
-            pending_age = time.time() - float(pending.get("created", 0))
-        except (TypeError, ValueError):
-            pending_age = 601
-        if (not isinstance(state, str) or not isinstance(code, str)
-                or not hmac.compare_digest(state, str(pending.get("state", "")))
-                or pending_age > 600):
-            raise ValidationError("Ссылка авторизации устарела; начните подключение заново")
-        token_request = {
-            "code": code, "client_id": client["client_id"],
-            "redirect_uri": pending.get("redirect_uri") or self.redirect_uri,
-            "grant_type": "authorization_code", "code_verifier": pending["verifier"],
-        }
-        if client.get("client_secret"):
-            token_request["client_secret"] = client["client_secret"]
-        result = self._form(client["token_uri"], token_request)
-        if not isinstance(result.get("access_token"), str):
-            raise ValidationError("Google не вернул токен доступа")
-        token = {"access_token": result["access_token"],
-                 "refresh_token": result.get("refresh_token"),
-                 "expires_at": time.time() + int(result.get("expires_in", 3600)),
-                 "scope": result.get("scope", AUTH_SCOPE)}
-        _atomic_json(self.token_path, token)
-        self.pending_path.unlink(missing_ok=True)
+        with self.lock:
+            pending, client = self._read(self.pending_path), self._read(self.client_path)
+            try:
+                pending_age = time.time() - float(pending.get("created", 0))
+            except (TypeError, ValueError):
+                pending_age = 601
+            if (not isinstance(state, str) or not isinstance(code, str)
+                    or not hmac.compare_digest(state, str(pending.get("state", "")))
+                    or pending_age > 600):
+                raise ValidationError("Ссылка авторизации устарела; начните подключение заново")
+            token_request = {
+                "code": code, "client_id": client["client_id"],
+                "redirect_uri": pending.get("redirect_uri") or self.redirect_uri,
+                "grant_type": "authorization_code", "code_verifier": pending["verifier"],
+            }
+            if client.get("client_secret"):
+                token_request["client_secret"] = client["client_secret"]
+            result = self._form(client["token_uri"], token_request)
+            if not isinstance(result.get("access_token"), str):
+                raise ValidationError("Google не вернул токен доступа")
+            refresh = result.get("refresh_token")
+            if not isinstance(refresh, str) or not refresh:
+                raise ValidationError("Google не вернул токен обновления; начните подключение заново")
+            token = {"access_token": result["access_token"], "refresh_token": refresh,
+                     "expires_at": time.time() + int(result.get("expires_in", 3600)),
+                     "scope": result.get("scope", AUTH_SCOPE)}
+            _atomic_json(self.token_path, token)
+            self.pending_path.unlink(missing_ok=True)
 
     def disconnect(self) -> dict:
-        self.token_path.unlink(missing_ok=True)
-        self.pending_path.unlink(missing_ok=True)
+        with self.lock:
+            self.token_path.unlink(missing_ok=True)
+            self.pending_path.unlink(missing_ok=True)
         return self.status()
 
-    def _access_token(self) -> str:
-        token, client = self._read(self.token_path), self._read(self.client_path)
-        if token.get("reauthorization_required"):
-            raise GoogleCalendarReauthorizationRequired(
-                "Google больше не принимает подключение. Подключите Google API заново.")
-        access = token.get("access_token")
-        if isinstance(access, str) and float(token.get("expires_at", 0)) > time.time() + 60:
-            return access
-        refresh = token.get("refresh_token")
-        if not isinstance(refresh, str):
-            raise ValidationError("Подключите управление Google Календарём")
-        refresh_request = {"client_id": client["client_id"],
-                           "refresh_token": refresh, "grant_type": "refresh_token"}
-        if client.get("client_secret"):
-            refresh_request["client_secret"] = client["client_secret"]
-        try:
-            result = self._form(client["token_uri"], refresh_request)
-        except GoogleCalendarReauthorizationRequired:
-            token["reauthorization_required"] = True
+    def _access_token(self, *, force: bool = False, rejected_access: str | None = None) -> str:
+        with self.lock:
+            token, client = self._read(self.token_path), self._read(self.client_path)
+            if token.get("reauthorization_required"):
+                raise GoogleCalendarReauthorizationRequired(
+                    "Google больше не принимает подключение. Подключите Google API заново.")
+            access = token.get("access_token")
+            try:
+                valid = isinstance(access, str) and float(token.get("expires_at", 0)) > time.time() + 60
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if valid and (not force or (rejected_access is not None and access != rejected_access)):
+                return access
+            refresh = token.get("refresh_token")
+            if not isinstance(refresh, str) or not refresh:
+                if force:
+                    token["reauthorization_required"] = True
+                    _atomic_json(self.token_path, token)
+                    raise GoogleCalendarReauthorizationRequired(
+                        "Google больше не принимает подключение. Подключите Google API заново.")
+                raise ValidationError("Подключите управление Google Календарём")
+            if not client.get("client_id") or not client.get("token_uri"):
+                raise ValidationError("Сначала загрузите JSON OAuth-клиента Google")
+            refresh_request = {"client_id": client["client_id"],
+                               "refresh_token": refresh, "grant_type": "refresh_token"}
+            if client.get("client_secret"):
+                refresh_request["client_secret"] = client["client_secret"]
+            try:
+                result = self._form(client["token_uri"], refresh_request)
+            except GoogleCalendarReauthorizationRequired:
+                token["reauthorization_required"] = True
+                _atomic_json(self.token_path, token)
+                raise
+            access = result.get("access_token")
+            if not isinstance(access, str):
+                raise ValidationError("Не удалось обновить доступ к Google Календарю")
+            token.update({"access_token": access,
+                          "expires_at": time.time() + int(result.get("expires_in", 3600))})
+            rotated = result.get("refresh_token")
+            if isinstance(rotated, str) and rotated:
+                token["refresh_token"] = rotated
             _atomic_json(self.token_path, token)
-            raise
-        access = result.get("access_token")
-        if not isinstance(access, str):
-            raise ValidationError("Не удалось обновить доступ к Google Календарю")
-        token.update({"access_token": access,
-                      "expires_at": time.time() + int(result.get("expires_in", 3600))})
-        _atomic_json(self.token_path, token)
-        return access
+            return access
 
     def request(self, method: str, path: str, *, query: dict | None = None,
                 body: dict | None = None):
@@ -240,25 +274,45 @@ class GoogleCalendarApi:
         if query:
             url += "?" + urlencode(query)
         data = None if body is None else json.dumps(body).encode("utf-8")
-        request = Request(url, data=data, method=method,
-                          headers={"Authorization": "Bearer " + self._access_token(),
-                                   "Accept": "application/json", "Content-Type": "application/json",
-                                   "User-Agent": "Brainalot/0.1"})
-        try:
-            with urlopen(request, timeout=15) as response:
-                raw = response.read(2 * 1024 * 1024)
-        except HTTPError as exc:
-            if exc.code in {401, 403}:
-                raise ValidationError("Google не разрешил изменить это событие") from exc
-            if exc.code == 404:
-                raise ValidationError("Событие уже не найдено в Google Календаре") from exc
-            if exc.code == 409:
-                raise GoogleCalendarConflict("Событие с таким ID уже есть в Google Календаре") from exc
-            if exc.code == 429:
-                raise ValidationError("Google Calendar API временно ограничил запросы") from exc
-            raise ValidationError("Google Calendar API временно недоступен") from exc
-        except OSError as exc:
-            raise ValidationError("Нет связи с Google Calendar API") from exc
+        access = self._access_token()
+        for attempt in range(2):
+            request = Request(url, data=data, method=method,
+                              headers={"Authorization": "Bearer " + access,
+                                       "Accept": "application/json", "Content-Type": "application/json",
+                                       "User-Agent": "Brainalot/0.1"})
+            try:
+                with urlopen(request, timeout=15) as response:
+                    raw = response.read(2 * 1024 * 1024)
+                break
+            except HTTPError as exc:
+                if exc.code == 401:
+                    if attempt == 0:
+                        access = self._access_token(force=True, rejected_access=access)
+                        if method == "GET":
+                            continue
+                    raise ValidationError("Google отклонил доступ к календарю; повторите действие") from exc
+                if exc.code == 403:
+                    try:
+                        payload = json.loads(exc.read(4096))
+                        detail = payload.get("error", {})
+                        reasons = [entry.get("reason") for entry in detail.get("errors", [])
+                                   if isinstance(entry, dict)]
+                    except (OSError, ValueError, AttributeError, TypeError):
+                        reasons = []
+                        detail = {}
+                    if any(reason in {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"}
+                           for reason in reasons) or detail.get("status") == "RESOURCE_EXHAUSTED":
+                        raise ValidationError("Google Calendar API временно ограничил запросы") from exc
+                    raise ValidationError("Google не разрешил доступ к календарю") from exc
+                if exc.code == 404:
+                    raise ValidationError("Событие уже не найдено в Google Календаре") from exc
+                if exc.code == 409:
+                    raise GoogleCalendarConflict("Событие с таким ID уже есть в Google Календаре") from exc
+                if exc.code == 429:
+                    raise ValidationError("Google Calendar API временно ограничил запросы") from exc
+                raise ValidationError("Google Calendar API временно недоступен") from exc
+            except OSError as exc:
+                raise ValidationError("Нет связи с Google Calendar API") from exc
         if not raw:
             return None
         try:
