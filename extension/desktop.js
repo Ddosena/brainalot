@@ -1,7 +1,11 @@
 import { native } from "./desktop-platform.js";
+import { installWindowGestures } from "./desktop-gestures.js";
+import { timeClient, sharedApi } from "./time-client.js";
+import { resolveActiveTask } from "./widget-model.js";
+import { calendarImportanceLevel } from "./importance-state.js";
 import { WORK_ENABLED } from "./work-availability.js";
 await import("./background.js");
-const { applyDocument, syncLocale, localeChange } = await import("./i18n.js");
+const { applyDocument, syncLocale, localeChange, t } = await import("./i18n.js");
 if (!await syncLocale()) applyDocument();
 const saved = await chrome.storage.local.get(["panel:theme", "panel:design"]);
 document.documentElement.dataset.theme = saved["panel:theme"] || "light";
@@ -11,12 +15,31 @@ function show(view) {
   if (view === "home") view = "day";
   if (view === "work" && !WORK_ENABLED) view = "day";
   const paths = { day: "panel.html", library: "panel.html?library-window=1", work: "work.html", capture: "capture.html" };
-  document.getElementById("desktop-content").src = paths[view] || paths.day;
+  const frame = document.getElementById("desktop-content");
+  const next = new URL(paths[view] || paths.day, location.href).href;
+  if (frame.src !== next) frame.src = next;
   document.querySelectorAll("[data-view]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === view)));
 }
 show(new URLSearchParams(location.search).get("view") || "day");
 document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => show(button.dataset.view));
-document.querySelectorAll("[data-mode]").forEach(button => button.onclick = () => native.window_action(button.dataset.mode));
+window.addEventListener("brainalot-view", event => show(event.detail));
+installWindowGestures(native);
+const showError = error => { const el=document.getElementById("desktop-error"); el.textContent=error.message; el.hidden=false; };
+document.getElementById("desktop-compact").onclick = async () => {
+  try {
+    const [state, notes, prefs] = await Promise.all([timeClient.refresh(), sharedApi("/api/notes"), chrome.storage.local.get("panel:calendar-importance")]);
+    const now=new Date(), day=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
+    const calendar=await sharedApi(`/api/calendar/events?start=${day}&end=${day}`).catch(()=>({events:[]}));
+    const hasTask = Boolean(resolveActiveTask(state, notes.notes, calendar.events || [])) ||
+      notes.notes.some(note => note.importance === "critical" && !["done","cancelled","archived"].includes(note.status)) ||
+      (calendar.events||[]).some(event => calendarImportanceLevel(prefs["panel:calendar-importance"],event) === "critical");
+    await native.window_action(hasTask ? "card" : "bar");
+  } catch(error) { showError(error); }
+};
+document.getElementById("desktop-quit").onclick = async () => {
+  try {const result=await native.window_action("quit"); if (!result.ok) throw new Error(t("Не удалось поставить таймер на паузу. Проверьте сервис и повторите выход."));}
+  catch(error) {showError(error);}
+};
 chrome.storage.onChanged.addListener(changes => {
   if (localeChange(changes)) void syncLocale();
   if (changes["panel:theme"]) document.documentElement.dataset.theme = changes["panel:theme"].newValue;

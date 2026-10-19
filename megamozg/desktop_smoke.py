@@ -84,33 +84,6 @@ def _marker(root, name, payload):
     os.replace(temporary, target)
 
 
-def _peer_work(window):
-    _js(window, """(() => {
-      const f = document.getElementById('desktop-content').contentWindow;
-      f.__brainalotPeerWork = {pending:true};
-      f.eval(`import('/desktop/work-store.js').then(async m => {
-        await m.load();
-        const before = m.get();
-        const item = before.items.find(x => x.id === 'peer-task');
-        const image = await m.imgGet('peer-image');
-        if (!item || !image || !JSON.stringify(before).includes('Peer project'))
-          throw new Error('Peer Work task, image or project is missing');
-        const beforeTitle = item.title;
-        m.update(state => { state.items.find(x => x.id === 'peer-task').title = 'Updated in desktop'; });
-        await m.flush();
-        window.__brainalotPeerWork = {pending:false, title:beforeTitle,
-          imageSize:image.size, updated:m.get().items.find(x => x.id === 'peer-task').title};
-      }).catch(error => { window.__brainalotPeerWork = {pending:false,error:String(error)}; });`);
-      return true;
-    })()""")
-    result = _until(lambda: (s if (s := _js(window,
-        "document.getElementById('desktop-content').contentWindow.__brainalotPeerWork"))
-        and not s.get("pending") else None), 20)
-    if result.get("error") or result.get("updated") != "Updated in desktop" or not result.get("imageSize"):
-        raise RuntimeError(f"Peer Work inspection failed: {result}")
-    return result
-
-
 def _persistence_probe(window):
     payload = {"run": str(uuid.uuid4()), "text": "Brainalot WebView2 profile persistence"}
     script = """(() => {
@@ -177,6 +150,8 @@ def run(root: Path) -> int:
             _marker(root, "peer-ready.json", {"port": port})
             _until(lambda: (root / "peer-started.json").is_file(), 60)
             report["peer_started"] = True
+            handshake = json.loads((root / "peer-started.json").read_text(encoding="utf-8"))
+            report["peer_handshake"] = handshake
         import webview
         webview.settings["ALLOW_DOWNLOADS"] = True
         host = DesktopHost(root, port, token, lambda: True)
@@ -196,7 +171,7 @@ def run(root: Path) -> int:
                 _install_collector(host.full)
                 _install_collector(host.widget)
                 pages = {"day": "panel.html", "library": "panel.html?library-window=1",
-                         "capture": "capture.html", "work": "work.html"}
+                         "capture": "capture.html"}
                 for name, page in pages.items():
                     host.open_page(page)
                     def snapshot():
@@ -214,28 +189,34 @@ def run(root: Path) -> int:
                             ...(f?.contentWindow?.__brainalotQaErrors||[])]};})()""")
                     try:
                         expected = {"day": "BRAINALOT", "library": "БИБЛИОТЕКА",
-                                    "capture": "ЗАПИСАТЬ", "work": "Work"}[name]
+                                    "capture": "ЗАПИСАТЬ"}[name]
                         data = _until(lambda: (s if (s := snapshot()).get("ready") == "complete"
                                                and page.split("?")[0] in (s.get("iframe") or "")
                                                and expected in (s.get("text") or "")
-                                               and (not peer or name != "work" or "Peer project" in (s.get("text") or ""))
                                                else None), 25)
                     except Exception:
                         report["last_view"] = {"name": name, "snapshot": snapshot()}
                         raise
                     report["views"][name] = data
                     report["errors"].extend(data.get("errors") or [])
-                    if name in {"day", "work"}:
+                    if name == "day":
                         target = output / f"{name}.png"
                         _screenshot(host.full, target)
                         report["screenshots"][name] = str(target)
-                    if peer and name == "work":
-                        report["peer_work"] = _peer_work(host.full)
+                report["work_disabled"] = not _js(host.full, "!document.querySelector('[data-view=work]').hidden")
+                host.open_page("work.html")
+                _until(lambda: "panel.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 state = _request(port, token, "/api/time/state")
                 if peer:
                     if state["status"] != "running":
                         raise RuntimeError("Chrome peer did not start the timer")
                     report["time_start"] = state["status"]
+                    if handshake.get("task") and state.get("task",{}).get("id") != handshake["task"]["id"]:
+                        raise RuntimeError("Chrome/native current library task mismatch")
+                    preset = _request(port, token, "/api/ui/preferences")["values"].get("time:preset")
+                    report["shared_preset"] = preset
+                    if preset != handshake.get("preset", {"work_ms":2400000,"break_ms":600000}):
+                        raise RuntimeError(f"Native shared preset mismatch: {preset}")
                 else:
                     running = _request(port, token, "/api/time/command", {
                         "request_id": str(uuid.uuid4()), "expected_revision": state["revision"],
@@ -243,12 +224,10 @@ def run(root: Path) -> int:
                     report["time_start"] = running["status"]
                 for mode in ("bar", "card"):
                     host.window_action(mode)
-                    if mode == "bar":
-                        host.widget.load_url(host._url("widget.html?mode=bar"))
                     def snapshot_widget():
                         return _js(host.widget, """(() => ({mode:document.body.dataset.widgetMode,
                           time:document.getElementById('widget-time')?.textContent,
-                          run:document.getElementById('widget-run')?.textContent,
+                          run:document.getElementById('widget-run')?.getAttribute('aria-label'),
                           burning:document.getElementById('widget-burning')?.textContent,
                           current:document.getElementById('widget-current')?.textContent,
                           currentHidden:document.getElementById('widget-current')?.hidden,
@@ -273,11 +252,11 @@ def run(root: Path) -> int:
                 report["time_pause"] = paused["status"]
                 if peer:
                     _marker(root, "peer-paused.json", {"status": paused["status"],
-                                                        "revision": paused["revision"]})
+                                                        "revision": paused["revision"], "task":paused.get("task"), "preset":report.get("shared_preset")})
                     _until(lambda: (root / "peer-verified.json").is_file(), 60)
                     report["peer_verified"] = True
                     notes = _request(port, token, "/api/notes")["notes"]
-                    burning = next(note for note in notes if note["title"] == "Burning peer task")
+                    burning = next(note for note in notes if note["id"] == handshake.get("hot_task",{}).get("id")) if handshake.get("hot_task") else next(note for note in notes if note["title"] == "Burning peer task")
                     switched = _request(port, token, "/api/time/command", {
                         "request_id": str(uuid.uuid4()), "expected_revision": paused["revision"],
                         "action": "switch_task", "task": {"source": "library", "id": burning["id"],
@@ -289,6 +268,38 @@ def run(root: Path) -> int:
                     target = output / "card-same.png"
                     _screenshot(host.widget, target)
                     report["screenshots"]["card_same"] = str(target)
+                # Exercise the shipped compact controls, with the common preset
+                # module and real local API (no OS mouse/keyboard synthesis).
+                _js(host.widget, "document.getElementById('widget-stop').click(); true")
+                _until(lambda: _request(port, token, "/api/time/state")["status"] not in {"running", "paused"})
+                _js(host.widget, "document.getElementById('widget-mode').click(); true")
+                _js(host.widget, "document.getElementById('widget-run').click(); true")
+                restarted = _until(lambda: (s if (s := _request(port, token, "/api/time/state"))["status"] == "running"
+                                            and s["mode"] == "pomodoro" else None))
+                report["native_preset_start"] = restarted
+                # A restart keeps the user's preset even without a peer handshake.
+                effective_preset = _request(port, token, "/api/ui/preferences")["values"].get("time:preset", {})
+                report["effective_preset"] = effective_preset
+                expected_duration = effective_preset.get("work_ms", 1500000)
+                if restarted["duration_ms"] != expected_duration:
+                    raise RuntimeError("Compact Play did not use the common preset")
+                report["lifetime_totals"] = _request(port, token, "/api/time/totals")
+                _js(host.widget, "document.getElementById('widget-run').click(); true")
+                _until(lambda: _request(port, token, "/api/time/state")["status"] == "paused")
+                from .desktop_geometry import native_rect
+                report["native"] = {"full": {"rect": native_rect(host.full),
+                    "topmost": bool(host.full.native.TopMost), "frameless": str(host.full.native.FormBorderStyle)},
+                    "widget": {"rect": native_rect(host.widget), "topmost": bool(host.widget.native.TopMost)}}
+                if not all(report["native"][name]["topmost"] for name in ("full", "widget")):
+                    raise RuntimeError("A desktop surface lost native topmost")
+                if report["native"]["full"]["frameless"] != "None":
+                    raise RuntimeError("The full desktop retained a system frame")
+                before = _request(port, token, "/api/time/state")["revision"]
+                for mode in ("full", "bar", "card", "full", "card"):
+                    host.window_action(mode)
+                report["view_changes_preserve_time"] = before == _request(port, token, "/api/time/state")["revision"]
+                if not report["view_changes_preserve_time"]:
+                    raise RuntimeError("Window view changes mutated the time interval")
             except Exception as exc:
                 report["fatal"] = repr(exc)
             finally:
@@ -301,7 +312,8 @@ def run(root: Path) -> int:
     finally:
         if service:
             service.stop()
-        report["ok"] = (not report.get("fatal") and len(report["views"]) == 4
+        report["ok"] = (not report.get("fatal") and len(report["views"]) == 3
+                        and report.get("work_disabled") is True
                         and len(report["widget"]) == 2
                         and not report["errors"]
                         and report.get("time_start") == "running"

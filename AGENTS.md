@@ -31,6 +31,19 @@ may create a Google Calendar event, so use it only for the user's own dictation.
 
 Development checks:
 
+Current desktop/time contract (0.2.3): Work is disabled; keep its data and code.
+Full, compact card and side tab are always topmost, with no hide-to-tray state.
+Window changes never change time accounting. Closing exits through safe pause.
+All clients use the same TimeStore journal and source/id task references.
+Row mode selection does not start work; the separate Play/Stop control does.
+Pomodoro uses the shared work/break preset; row totals span all sessions, while
+the daily report stays date-scoped. Recall pause and filters live in the existing
+settings gear. Preserve CAS, exact request receipts and explicit ambiguous-response
+recovery. Test on temporary roots/ports/profiles, never personal data or port8765.
+The release builder checks CLI/native messaging in isolation; real desktop QA must
+use the explicit diagnostic entry point, because normal app startup has a global
+per-user singleton and may open an already running personal window.
+
 ```powershell
 .venv\Scripts\python.exe -m pytest
 node --test extension/tests/*.test.mjs

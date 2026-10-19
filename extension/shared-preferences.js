@@ -1,4 +1,4 @@
-export const SHARED_KEYS = ["panel:calendar-importance", "panel:theme", "panel:design", "panel:locale"];
+export const SHARED_KEYS = ["panel:calendar-importance", "panel:theme", "panel:design", "panel:locale", "time:preset"];
 const PENDING = "shared:preferences-pending", CONFLICT = "shared:preferences-conflict";
 export function syncPreferences(api, chromeApi = globalThis.chrome) {
   let state = null, busy = false, conflict = false;

@@ -354,3 +354,27 @@ html[data-design] .library-project-title,html[data-design] .rotation-title{font-
 .appearance-close svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
 .masthead .icon-button[aria-expanded="true"]{background:var(--tint)}
 @media(max-width:420px){.masthead{display:grid;grid-template-columns:minmax(0,1fr);gap:3px}.brand-row{width:100%}.header-actions{width:100%;justify-content:space-between;gap:2px}.appearance-panel{top:calc(100% + 5px)}}
+/* Full-panel density curve is set by panel.js; CSS zoom scales layout and hit boxes. */
+body.adaptive-panel{zoom:var(--panel-scale,1);height:calc(100dvh / var(--panel-scale,1));min-height:0;min-width:0}
+body.adaptive-panel .focus-panel,body.adaptive-panel .appearance-panel{max-width:100%;max-height:calc(82dvh / var(--panel-scale,1));overflow:auto}
+body.adaptive-panel .image-viewer{width:calc(100vw / var(--panel-scale,1));height:calc(100dvh / var(--panel-scale,1))}
+body.adaptive-panel input,body.adaptive-panel select,body.adaptive-panel textarea{max-width:100%}
+body.adaptive-panel .note-heading{min-width:0}
+body.adaptive-panel .task-details,body.adaptive-panel .library-details{min-width:0}
+body.adaptive-panel .task-time-controls{margin-left:auto;order:4}
+body.adaptive-panel .calendar-event-row{flex-wrap:wrap}
+body.adaptive-panel #rotation-card.rotation .stack-stage{--stack-card-h:208px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note:not(.has-stack-image){padding:14px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note .stack-excerpt{-webkit-line-clamp:3;margin-top:7px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note .note-heading:has(.task-time-controls) .task-time-controls{align-self:flex-end;flex:none;margin-bottom:5px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note.has-stack-image .note-image-preview img{object-fit:contain}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note.has-stack-image>.note-image-gallery{min-height:72px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note.has-stack-image>.note-heading{padding:7px 10px}
+body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note.has-stack-image .stack-context{padding:0 10px 8px}
+body.adaptive-panel .time-control{flex:none}
+body.adaptive-panel #focus-save-preset{width:100%;margin-top:7px}
+body.adaptive-panel .note.is-timing .note-title{color:var(--ink)}
+@media(max-width:420px){body.adaptive-panel .note-heading{flex-wrap:wrap;gap:5px}body.adaptive-panel .note-heading>.task-time-controls{order:5;margin-left:auto}body.adaptive-panel .calendar-event-row>.task-time-controls{margin-left:auto}body.adaptive-panel #rotation-card.rotation .stack-stage{--stack-peek:24px;--stack-peek-2:18px}}
+@media(max-height:650px){body.adaptive-panel #rotation-card.rotation .stack-stage{--stack-card-h:178px}body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note .stack-excerpt{-webkit-line-clamp:2}}
+body.adaptive-panel ::selection{background:var(--accent);color:var(--accent-contrast,#fff)}
+body.adaptive-panel input,body.adaptive-panel textarea{caret-color:var(--accent)}

@@ -166,6 +166,11 @@ def test_api_auth_static_cas_chunks_and_real_client_sharing(tmp_path):
         start = dict(request_id="start", expected_revision=before["revision"], action="start")
         running = browser.post("/api/time/command", json=start).json()
         assert desktop.get("/api/time/state").json()["revision"] == running["revision"]
+        total = desktop.get("/api/time/totals")
+        assert total.status_code == 200
+        assert total.json()["state"]["revision"] == running["revision"]
+        assert len(total.json()["rows"]) == 1
+        assert total.json()["rows"][0]["total_ms"] >= 0
         assert desktop.post("/api/time/command", json={"request_id": "pause", "expected_revision": running["revision"], "action": "pause"}).status_code == 200
         assert browser.get("/api/time/state").json()["status"] == "paused"
         assert browser.post("/api/time/command", json=start).json() == running
@@ -262,3 +267,18 @@ def test_cli_time_recall_and_restore_use_same_stores(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["status"] == "idle"
     assert main(["--root", root, "recall", "get"]) == 0
     assert json.loads(capsys.readouterr().out)["revision"] == 0
+
+def test_shared_timer_preset_validation_cas_and_replay(tmp_path):
+    shared = SharedState(tmp_path)
+    command = {"request_id": "preset-40-10", "expected_revision": 0,
+               "patch": {"time:preset": {"work_ms": 2_400_000, "break_ms": 600_000}}}
+    result = shared.set_preferences(command)
+    assert result["values"]["time:preset"] == {"work_ms": 2_400_000, "break_ms": 600_000}
+    assert SharedState(tmp_path).set_preferences(command) == result
+    with pytest.raises(ConflictError):
+        shared.set_preferences({**command, "request_id": "other-client"})
+    for preset in ({"work_ms": True, "break_ms": 600_000}, {"work_ms": 1, "break_ms": 600_000},
+                   {"work_ms": 2_400_000}, {"work_ms": 2_400_000, "break_ms": 600_000, "other": 1}):
+        with pytest.raises(ValidationError):
+            shared.set_preferences({"request_id": "invalid", "expected_revision": 1, "patch": {"time:preset": preset}})
+    assert shared.preferences() == result

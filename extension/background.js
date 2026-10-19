@@ -1,5 +1,5 @@
 import { syncPreferences } from "./shared-preferences.js";
-import { createTimeClient, focusSnapshot } from "./time-client.js";
+import { createTimeClient, focusSnapshot, getTimePreset, timerFields } from "./time-client.js";
 import { startBrowserBridge, browserCommand } from "./browser-bridge.js";
 import { CaptureQueue, DICTATION, queueStatus } from "./queue.js";
 import { requestApi } from "./api.js";
@@ -53,10 +53,10 @@ async function resolveForServer(items) {
 const connection = createConnection(chrome);
 const api = (path, method = "GET", body, options) => connection.api(path, method, body, options);
 
-const time = createTimeClient(api);
+const time = createTimeClient(api, {storage:chrome.storage.local,pendingKey:"time:pending:background",outboxPrefix:"time:command-outbox:"});
 async function syncSharedTime() {
   const state = await time.refresh();
-  await chrome.storage.local.set({ [FOCUS_KEY]: focusSnapshot(state) });
+  await chrome.storage.local.set({ [FOCUS_KEY]: focusSnapshot(state, await getTimePreset()) });
   return state;
 }
 
@@ -235,9 +235,10 @@ async function handle(message, sender) {
     case "timer-action": return queue.serial(async () => {
       await time.refresh();
       const action = message.action === "reset" ? "reset_pomodoro" : message.action;
-      const fields = action === "start" ? {mode:"pomodoro", duration_ms:Number(message.minutes)*60000, task:time.state.task} : {};
+      const preset = await getTimePreset();
+      const fields = action === "start" ? {...timerFields("pomodoro",preset), task:time.state.task} : {};
       const state = await time.command(action, fields);
-      const next = focusSnapshot(state);
+      const next = focusSnapshot(state,preset);
       await chrome.storage.local.set({[FOCUS_KEY]:next});
       const overlayError = await syncFocusOverlay().then(()=>null, error=>error.message);
       return {...next, overlayError};

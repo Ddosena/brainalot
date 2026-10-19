@@ -223,9 +223,11 @@ class TimeStore:
                 "interruption": row["interruption"]}
 
     def state(self):
-        wall, mono = self._now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
             row = self._record(db)
             if row["status"] == "running" and (not self._healthy(row, wall, mono)
                     or row["duration_ms"] and row["mode"] in {"pomodoro", "break"}
@@ -268,21 +270,23 @@ class TimeStore:
         if "duration_ms" in body and action not in {"start", "set_mode"}:
             raise ValidationError("duration_ms is only valid for start or set_mode")
         digest = hashlib.sha256(_json(body).encode("utf-8")).hexdigest()
-        wall, mono = self._now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
             receipt = db.execute("SELECT body_hash,response FROM receipts WHERE request_id=?", (rid,)).fetchone()
             if receipt:
                 if receipt["body_hash"] != digest:
-                    raise ConflictError("request_id was already used for a different command")
+                    raise ConflictError("request_id уже использован для другой команды таймера")
                 return json.loads(receipt["response"])
             if (action in {"start", "resume"} and self._native_clock
                     and self._unbiased_failed and not self._power_registered):
-                raise ValidationError("Windows time and suspend notification are unavailable")
+                raise ValidationError("Windows не даёт время и уведомления о сне; таймер не запущен")
             row = self._record(db)
             self._settle(db, row, wall, mono, force=True)
             if row["revision"] != expected:
-                raise ConflictError("time state revision changed")
+                raise ConflictError("Таймер изменился в другом окне. Показано актуальное состояние")
             task = body.get("task") if action in {"start", "switch_task"} else json.loads(row["task"]) if row["task"] else None
             if not features.WORK_ENABLED and action in {"start", "switch_task", "resume"} and task and task.get("source") == "work":
                 raise ValidationError(features.WORK_PAUSED_MESSAGE)
@@ -294,11 +298,11 @@ class TimeStore:
                            started_at=wall, anchor_at=wall, anchor_mono=mono, interruption=None)
             elif action == "pause":
                 if row["status"] != "running":
-                    raise ValidationError("timer is not running")
+                    raise ValidationError("Таймер уже не идёт")
                 row.update(status="paused", started_at=None, anchor_at=None, anchor_mono=None)
             elif action == "resume":
                 if row["status"] != "paused":
-                    raise ValidationError("timer is not paused")
+                    raise ValidationError("Таймер не на паузе")
                 row.update(status="running", started_at=wall, anchor_at=wall,
                            anchor_mono=mono, interruption=None)
             elif action == "stop":
@@ -324,7 +328,7 @@ class TimeStore:
             else:
                 if row["mode"] != "pomodoro":
                     raise ValidationError("reset_pomodoro requires pomodoro mode")
-                row.update(status="paused", elapsed_ms=0, duration_ms=POMODORO_MS,
+                row.update(status="paused", elapsed_ms=0,
                            started_at=None, anchor_at=None, anchor_mono=None, interruption=None)
             row["revision"] += 1
             self._save(db, row)
@@ -345,9 +349,11 @@ class TimeStore:
             raise ValidationError("invalid IANA timezone") from exc
         start = int(datetime.combine(selected, datetime.min.time(), zone).timestamp() * 1000)
         end = int(datetime.combine(selected + timedelta(days=1), datetime.min.time(), zone).timestamp() * 1000)
-        wall, mono = self._now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
             row = self._record(db)
             if row["status"] == "running" and (not self._healthy(row, wall, mono)
                     or row["duration_ms"] and row["mode"] in {"pomodoro", "break"}
@@ -372,10 +378,44 @@ class TimeStore:
         return {"day": day, "timezone": timezone,
                 "total_ms": sum(item["total_ms"] for item in rows), "rows": rows}
 
-    def checkpoint(self):
-        wall, mono = self._now()
+    def totals(self):
+        """One snapshot of lifetime work by stable source/id, including live tail once.
+
+        Checkpointed time already lives in intervals. Only anchor_at..now is
+        appended here, never the session's elapsed_ms (which overlaps history).
+        """
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
+            row = self._record(db)
+            self._settle(db, row, wall, mono)
+            intervals = db.execute(
+                "SELECT task,SUM(end_ms-start_ms) AS amount FROM intervals "
+                "WHERE mode != 'break' GROUP BY task ORDER BY MAX(id)").fetchall()
+            totals = {}
+            for item in intervals:
+                ref = json.loads(item["task"]) if item["task"] else None
+                key = (ref["source"], ref["id"]) if ref else None
+                entry = totals.setdefault(key, {"task": ref, "total_ms": 0})
+                entry["task"] = ref  # Most recently recorded name for this id.
+                entry["total_ms"] += item["amount"]
+            if row["status"] == "running" and row["mode"] != "break":
+                ref = json.loads(row["task"]) if row["task"] else None
+                key = (ref["source"], ref["id"]) if ref else None
+                entry = totals.setdefault(key, {"task": ref, "total_ms": 0})
+                entry["task"] = ref
+                entry["total_ms"] += self._tail(row, wall, mono)
+            return {"rows": sorted(totals.values(), key=lambda item: -item["total_ms"]),
+                    "server_now": wall, "state": self._state(row, wall, mono)}
+
+    def checkpoint(self):
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
             row = self._record(db)
             self._settle(db, row, wall, mono)
             return self._state(row, wall, mono)
@@ -384,21 +424,21 @@ class TimeStore:
         """Handle a native power event; also called with fake clocks in tests."""
         if kind not in {PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND}:
             return
-        wall, mono = self._now()
-        # Windows normally sends automatic resume before optional user resume.
-        if (kind == PBT_APMRESUMESUSPEND and self._last_auto_resume is not None
-                and 0 <= wall - self._last_auto_resume < 60_000):
-            return
-        if kind == PBT_APMSUSPEND:
-            self._suspend_seen = True
-            self._last_auto_resume = None
-        elif kind == PBT_APMRESUMEAUTOMATIC:
-            self._last_auto_resume = wall
-        if kind != PBT_APMSUSPEND and self._suspend_seen:
-            self._suspend_seen = False
-            return  # The suspend callback already saved and paused the timer.
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            wall, mono = self._now()
+            # Windows normally sends automatic resume before optional user resume.
+            if (kind == PBT_APMRESUMESUSPEND and self._last_auto_resume is not None
+                    and 0 <= wall - self._last_auto_resume < 60_000):
+                return
+            if kind == PBT_APMSUSPEND:
+                self._suspend_seen = True
+                self._last_auto_resume = None
+            elif kind == PBT_APMRESUMEAUTOMATIC:
+                self._last_auto_resume = wall
+            if kind != PBT_APMSUSPEND and self._suspend_seen:
+                self._suspend_seen = False
+                return  # The suspend callback already saved and paused the timer.
             row = self._record(db)
             if row["status"] != "running":
                 return
@@ -468,7 +508,6 @@ class TimeStore:
             return
         # A constructor may be used by a short-lived CLI process. Only the
         # actual service startup is evidence that a former runner has died.
-        wall, mono = self._now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._record(db)
@@ -500,9 +539,11 @@ class TimeStore:
             self._stop.set()
             thread.join(timeout=5)
             self._thread = None
-        wall, mono = self._now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Sample after acquiring the write lock: another client may have
+            # advanced the anchor while this transaction was waiting.
+            wall, mono = self._now()
             row = self._record(db)
             if row["status"] == "running":
                 self._settle(db, row, wall, mono, force=True)

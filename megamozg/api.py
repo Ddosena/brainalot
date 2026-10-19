@@ -181,6 +181,10 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     def time_summary(day: str, timezone: str = "Europe/Moscow"):
         return timer.summary(day, timezone)
 
+    @app.get("/api/time/totals")
+    def time_totals():
+        return timer.totals()
+
     @app.get("/api/time/tasks")
     def time_tasks(q: str = ""):
         tasks = [{"source": "library", "id": n["id"], "title": n["title"]} for n in store.list_notes()

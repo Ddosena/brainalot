@@ -1,5 +1,6 @@
 import "./desktop-platform.js";
 import { mountTimeUI, taskTimeButton } from "./time-ui.js";
+import { getTimePreset, saveTimePreset, subscribeTimePreset, normalizeTimePreset } from "./time-client.js";
 import { mountRecallControls } from "./recall-controls.js";
 import {addDays, assignmentPatch, calendarEventPhase, calendarEventTime, calendarEventsForDate, chooseResurface, compareCalendarEvents, createRefreshGate, currentWeekDueOptions, dayTasks, editableNoteText, editNotePatch, imageFit, isVisibleTask, mixPose, normalizeTheme, overdueTasks, posterHue, reorderedIds, RESURFACE_HOLD_MS, resurfaceCandidates, stackDragCommits, stackEase, stackPose, stepResurface, thoughtRecords, visibleWeekTasks, weekDates, weekStart} from "./panel-state.js";
 import { isOutdatedWorker, normalizeDesign } from "./capture-window.js";
@@ -75,6 +76,7 @@ let calendarRequest = 0;
 let rawCalendarEvents = [];
 const calendarOverlay = createCalendarOverlay();
 let focusState = normalizeTimer(null);
+let currentPreset = normalizeTimePreset(null);
 let timerChime = true;
 let lastFocusStatus = null;
 let focusOverlayVisible = true;
@@ -162,9 +164,10 @@ function renderFocus(syncControls = false) {
   for (const button of $("focus-presets").querySelectorAll("button")) button.disabled = focusPending || view.status === "running" || view.status === "paused";
   $("focus-custom").disabled = focusPending || view.status === "running" || view.status === "paused";
   if (syncControls) {
-    const minutes = view.durationMs / 60000;
+    const minutes = currentPreset.work_ms / 60000;
     selectedFocusMinutes = [20, 25, 30, 50].includes(minutes) ? String(minutes) : "custom";
     $("focus-custom").value = String(minutes);
+    $("focus-break").value = String(currentPreset.break_ms / 60000);
   }
   for (const button of $("focus-presets").querySelectorAll("button")) {
     button.setAttribute("aria-pressed", String(button.dataset.focusMinutes === selectedFocusMinutes));
@@ -537,6 +540,7 @@ function renderRecallNote(note, {passive = false} = {}) {
     if (images.length > 1) gallery.append(node("span", "stack-image-count", `+${images.length - 1}`));
   }
   const heading = node("div", "note-heading");
+  if (!passive && (["task","purchase"].includes(note.kind) || note.show_in_unscheduled)) heading.append(taskTimeButton({source:"library",id:note.id,title:note.title}));
   const disclosure = node(passive ? "div" : "button", "carousel-disclosure");
   if (!passive) disclosure.type = "button";
   disclosure.append(node("div", "note-meta", kinds[note.kind] || note.kind), node("strong", "note-title", note.title));
@@ -2172,9 +2176,23 @@ $("focus-presets").addEventListener("click", event => {
   selectedFocusMinutes = button.dataset.focusMinutes;
   $("focus-custom").value = selectedFocusMinutes;
   focusChoice();
+  void persistFocusPreset();
 });
 $("focus-custom").addEventListener("focus", () => { selectedFocusMinutes = "custom"; focusChoice(); });
 $("focus-custom").addEventListener("input", () => { selectedFocusMinutes = "custom"; focusChoice(); });
+async function persistFocusPreset() {
+  const minutes = Number($("focus-custom").value), rest = Number($("focus-break").value);
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 180 || !Number.isInteger(rest) || rest < 1 || rest > 180) {
+    showFocusError(t("Укажите время от 1 до 180 минут.")); return false;
+  }
+  try { currentPreset = await saveTimePreset({work_ms:minutes*60000,break_ms:rest*60000}); renderFocus(true); return true; }
+  catch(error) { showFocusError(error.message); return false; }
+}
+$("focus-custom").addEventListener("change", () => {void persistFocusPreset();});
+$("focus-break").addEventListener("change", () => {void persistFocusPreset();});
+$("focus-save-preset").onclick = async () => { $("focus-save-preset").disabled = true; try {await persistFocusPreset();} finally {$("focus-save-preset").disabled = false;} };
+subscribeTimePreset(value => {currentPreset=value;renderFocus(true);});
+void getTimePreset().catch(()=>{});
 async function focusAction(action) {
   if (focusPending) return;
   focusPending = true;
@@ -2182,8 +2200,8 @@ async function focusAction(action) {
   renderFocus();
   $("focus-error").hidden = true;
   try {
-    const minutes = selectedFocusMinutes === "custom" ? $("focus-custom").value : selectedFocusMinutes;
-    focusState = await send("timer-action", { action, minutes });
+    if (action === "start" && !await persistFocusPreset()) return;
+    focusState = await send("timer-action", { action });
     renderFocus(action === "start" || action === "reset");
     if (focusState.overlayError && focusOverlayVisible) {
       showFocusError(t("Таймер идёт, но полоса недоступна: {overlayError}", {overlayError: focusState.overlayError}));
@@ -2424,7 +2442,7 @@ function stepRotation(direction) {
 const timeHost = document.createElement("div");
 document.querySelector(".masthead").after(timeHost);
 mountTimeUI(timeHost);
-const recallControls = mountRecallControls($("rotation-card").querySelector(".section-heading"), {currentId:()=>resurfaceId, refresh:()=>refresh(), notes:()=>allNotes});
+const recallControls = mountRecallControls($("recall-settings"), {currentId:()=>resurfaceId, refresh:()=>refresh(), notes:()=>allNotes});
 const rotationCard = $("rotation-card");
 rotationCard.tabIndex = 0;
 rotationCard.setAttribute("aria-label", t("Вспомнить. Стрелки влево и вправо перелистывают записи"));
@@ -2618,3 +2636,13 @@ void chrome.storage.local.get(IGNITION_SOUND_KEY).then(saved => {
 });
 void initializeLibraryView().catch(error => showLibraryWindowError(error.message || t("Не удалось восстановить библиотеку.")));
 void refresh();
+
+// A bounded curve uses both viewport dimensions. Narrow/short windows retain reflow and scroll.
+function applyPanelScale() {
+  const density = Math.sqrt((window.innerWidth / 400) * (window.innerHeight / 900));
+  const scale = Math.max(.88, Math.min(1.18, Math.pow(density, .18)));
+  document.documentElement.style.setProperty("--panel-scale", scale.toFixed(4));
+  document.body.classList.add("adaptive-panel");
+}
+applyPanelScale();
+window.addEventListener("resize", applyPanelScale, {passive:true});

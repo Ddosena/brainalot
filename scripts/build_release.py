@@ -156,7 +156,11 @@ def _native(exe: Path, env: dict, action: str) -> dict:
 
 
 def smoke_test() -> None:
-    """The built programs on throwaway data: CLI, the service, the native host, a clean stop."""
+    """Packaged CLI/service/host on throwaway data; native UI has a separate smoke.
+
+    Do not launch the normal app here: its user-session singleton can signal an
+    already running personal desktop even with a different BRAINALOT_HOME.
+    """
     cli, app = APP / "mmm.exe", APP / "Brainalot.exe"
     with tempfile.TemporaryDirectory(prefix="brainalot-smoke-") as home:
         env = {**os.environ, "BRAINALOT_HOME": home}
@@ -166,16 +170,26 @@ def smoke_test() -> None:
         note = json.loads(run("capture", "--text", "Проверка сборки", "--kind", "idea", "--external-id", "smoke"))
         assert any(item["id"] == note["id"] for item in json.loads(run("list"))["notes"])
         Path(home, "config.json").write_text(json.dumps({"welcome_shown": True}), encoding="utf-8")
-        process = subprocess.Popen([str(app), "--background"], env=env)
+        from megamozg.runtime import pick_port, health
+        port = pick_port(43930, span=10)
+        process = subprocess.Popen([str(cli), "serve", "--port", str(port)], env=env,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
+            deadline = time.monotonic() + 30
+            while not health(port):
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("Isolated packaged CLI service did not start")
+                time.sleep(0.1)
             answer = _native(cli, env, "hello")
             assert answer.get("ok") and answer.get("token") and answer.get("port"), answer
+            assert answer["port"] == port, "Native host did not use the isolated test service"
             with urlopen(f"http://127.0.0.1:{answer['port']}/api/health", timeout=5) as response:
-                health = json.load(response)
-            assert health["version"] == __version__, health
+                health_info = json.load(response)
+            assert health_info["version"] == __version__, health_info
             with urlopen(f"http://127.0.0.1:{answer['port']}/welcome", timeout=5) as response:
                 assert b"Brainalot" in response.read()
-            print(f"   service {health['version']} on port {answer['port']}, native host ok")
+            print(f"   service {health_info['version']} on isolated port {answer['port']}, native host ok")
         finally:
             process.kill()
             process.wait(10)

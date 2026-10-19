@@ -133,9 +133,15 @@ class SharedState:
             current = json.loads(row[0]) if row else {"revision": 0, "values": {}}
             self.check_revision(command, current["revision"])
             patch = command.get("patch")
-            allowed = {"panel:calendar-importance", "panel:theme", "panel:design", "panel:locale"}
+            allowed = {"panel:calendar-importance", "panel:theme", "panel:design", "panel:locale", "time:preset"}
             if not isinstance(patch, dict) or set(patch) - allowed or len(encoded(patch)) > 100000:
                 raise ValidationError("Недопустимые общие настройки интерфейса")
+            if "time:preset" in patch:
+                preset = patch["time:preset"]
+                if (not isinstance(preset, dict) or set(preset) != {"work_ms", "break_ms"}
+                        or any(type(value) is not int or not 60_000 <= value <= 10_800_000
+                               for value in preset.values())):
+                    raise ValidationError("time:preset requires work_ms and break_ms between 60000 and 10800000")
             current["values"].update(patch)
             current["revision"] += 1
             db.execute("INSERT OR REPLACE INTO settings VALUES('ui',?)", (encoded(current),))

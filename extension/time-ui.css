@@ -3,3 +3,27 @@
 .work-time-host{position:relative;z-index:20;width:min(430px,calc(100% - 32px));margin:0 16px;--card:var(--surface);--input:var(--field);--tint:var(--sunken);--ink:var(--text);--error:#b33d28}.work-time-host .time-body{position:absolute;top:100%;left:0;right:0;max-height:75vh;overflow:auto;box-shadow:0 8px 24px #0002}.work-connect-gate{padding:24px;margin:16px;background:var(--surface);color:var(--text);border:1px solid var(--line)}.work-connect-gate button{margin:8px;padding:8px 12px}
 
 .time-body button,.recall-controls button{min-height:32px;background:var(--tint);color:var(--ink);border:1px solid var(--line);border-radius:5px;padding:6px 10px;font:inherit}.time-body button:disabled{opacity:.45;cursor:default}.time-body button:focus-visible,.recall-controls button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.time-body [data-action=start]{background:var(--accent);color:var(--accent-contrast,#fff)}.recall-controls{justify-content:flex-end}.recall-filters[open]{flex-basis:100%;order:3}.recall-filters form{max-height:45vh;overflow:auto;padding:8px}.recall-empty{margin:0}.work-time-host .time-control{font-family:inherit}.work-time-host .time-body{font-size:14px}
+/* Shared row controls: mode chooses only; the separate action starts/stops. */
+.task-time-controls{display:inline-flex;align-items:center;gap:2px;flex:none;max-width:100%;color:var(--accent);vertical-align:middle}
+.task-time-total{font-size:calc(11px / var(--panel-scale,1));line-height:1.2;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--muted);padding-right:3px}
+.task-time-controls .task-time-button{width:30px;height:30px;min-width:30px;min-height:30px;padding:5px}
+.task-time-controls.is-current{background:var(--time-active-bg,#fff1b8);color:var(--time-active-ink,#624400);border-radius:7px}
+.task-time-controls.is-current .task-time-button,.task-time-controls.is-current .task-time-total{color:inherit}
+.task-time-controls.is-current .task-time-action{background:var(--time-active-button,#f5d36f)}
+.note.is-timing,.calendar-event.is-timing{background:color-mix(in srgb,var(--time-active-bg,#fff1b8) 45%,var(--card));border-radius:7px}
+.time-control>summary{flex-wrap:wrap;min-height:36px;gap:6px}
+.time-control>summary>svg{flex:none}
+.time-current-title{flex:1 1 100%;order:3;font-weight:400;font-size:12px;overflow-wrap:anywhere;color:var(--ink)}
+.time-control output{white-space:nowrap}
+.recall-settings{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}
+.recall-settings h3{margin:0;font-size:14px}
+.recall-settings .recall-controls{justify-content:flex-start;display:block;margin-top:9px}
+.recall-settings .recall-filters{padding:8px 0}
+.recall-settings .recall-empty{margin:5px 0}
+.time-control summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+:root[data-theme="dark"]{--time-active-bg:#59461c;--time-active-ink:#ffe5a0;--time-active-button:#775f23}
+@media(prefers-color-scheme:dark){:root:not([data-theme]){--time-active-bg:#59461c;--time-active-ink:#ffe5a0;--time-active-button:#775f23}}
+.time-alerts:has(.time-error:not([hidden])){padding:8px 10px;margin:6px 0;background:var(--error-bg,var(--tint));border:1px solid var(--error-line,var(--line));border-radius:7px;font-size:12px;overflow-wrap:anywhere}
+.time-alerts .time-error{margin:0 0 6px}
+.time-alerts button{min-height:32px;padding:5px 10px;background:var(--tint);color:var(--ink);border:1px solid var(--line);border-radius:5px;font:inherit}
+.time-alerts button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}

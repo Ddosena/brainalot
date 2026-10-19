@@ -210,6 +210,16 @@ class App:
 
     def apply_update(self) -> None:
         if self.update:
+            if self.desktop:
+                from .desktop import pause_on_quit
+                try:
+                    pause_on_quit(self.desktop.port, self.desktop.token)
+                except Exception as exc:
+                    _log.warning("cannot pause time before update: %s", exc)
+                    if self.tray:
+                        self.tray.notify("Brainalot", "Не удалось поставить таймер на паузу. Проверьте сервис и повторите выход.")
+                    return
+                self.desktop.destroy()
             manager, info = self.update
             if self.service:
                 self.service.stop()
@@ -221,7 +231,7 @@ class App:
                  ("Открыть Brainalot", lambda: self.desktop.window_action("full")),
                  ("Плашка", lambda: self.desktop.window_action("bar")),
                  ("Карточка", lambda: self.desktop.window_action("card")),
-                 ("Скрыть окна", lambda: self.desktop.window_action("hide")), None,
+                 None,
                  ("Как начать", lambda: webbrowser.open(self.welcome_url())),
                  ("Открыть папку заметок", lambda: _open(paths.vault_path(self.root))),
                  ("Открыть журнал", lambda: _open(self.root / "state" / "logs"))]
@@ -295,14 +305,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     setup_logging(root)
     if not _single_instance():
-        if not background:
-            from .tray import signal_open_desktop
-            for _ in range(20):
-                if signal_open_desktop():
-                    break
-                time.sleep(0.1)  # first instance may still be creating its tray window
-            else:
-                _log.warning("existing Brainalot instance did not accept the open-window message")
+        from .tray import signal_open_desktop
+        for _ in range(20):
+            if signal_open_desktop():
+                break
+            time.sleep(0.1)  # first instance may still be creating its tray window
+        else:
+            _log.warning("existing Brainalot instance did not accept the open-window message")
         return 0
     info = read_runtime(root)
     token_file = root / "state" / "api-token"

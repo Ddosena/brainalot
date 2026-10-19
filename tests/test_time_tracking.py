@@ -61,9 +61,10 @@ def test_two_clients_cas_replay_and_changed_id(tmp_path):
     body = {"request_id": "same", "expected_revision": 0, "action": "start", "task": TASK}
     first = a.command(body)
     assert b.command(body) == first
-    with pytest.raises(ConflictError):
+    with pytest.raises(ConflictError, match="другой команды таймера"):
         b.command({**body, "task": None})
-    with pytest.raises(ConflictError):
+    # The 409 detail is shown in the panel as is (translated for English).
+    with pytest.raises(ConflictError, match="Таймер изменился в другом окне"):
         cmd(b, "start", 0, "another", task=TASK)
     c.advance(9_000)
     assert b.state()["elapsed_ms"] == 9_000
@@ -219,7 +220,7 @@ def test_windows_clock_and_callback_both_unavailable_block_start(tmp_path, monke
 
     monkeypatch.setattr("megamozg.time_tracking._windows_awake_ms", unavailable)
     t.monotonic = t._awake_ms
-    with pytest.raises(ValidationError, match="Windows time"):
+    with pytest.raises(ValidationError, match="уведомления о сне"):
         cmd(t, "start", 0, "a")
     assert t.state()["status"] == "idle"
 
@@ -249,3 +250,118 @@ def test_reset_pomodoro_keeps_work_history(tmp_path):
     assert s["elapsed_ms"] == 0
     assert s["duration_ms"] == 1_500_000
     assert t.summary(day(c), "UTC")["total_ms"] == 20_000
+
+def test_lifetime_totals_midnight_rename_live_tail_and_break(tmp_path):
+    c = FakeClock(int(datetime(2026, 10, 18, 23, 59, 50, tzinfo=timezone.utc).timestamp() * 1000))
+    t = store(tmp_path, c)
+    s = cmd(t, "start", 0, "life-start", task=TASK)
+    advance_active(t, c, 20_000)
+    c.advance(5_000)
+    snapshot = t.totals()
+    assert snapshot["rows"] == [{"task": TASK, "total_ms": 25_000}]
+    assert t.totals() == snapshot
+    assert t.summary("2026-10-18", "UTC")["total_ms"] == 10_000
+    assert t.summary("2026-10-19", "UTC")["total_ms"] == 15_000
+    renamed = {**TASK, "title": "Renamed"}
+    s = cmd(t, "start", s["revision"], "life-rename", task=renamed, mode="pomodoro", duration_ms=60_000)
+    advance_active(t, c, 60_000)
+    s = t.state()
+    s = cmd(t, "start", s["revision"], "life-break", task=renamed, mode="break", duration_ms=60_000)
+    advance_active(t, c, 60_000)
+    assert t.totals()["rows"] == [{"task": renamed, "total_ms": 85_000}]
+    s = t.state()
+    c.advance(86_400_000)
+    s = cmd(t, "start", s["revision"], "life-next-day", task=renamed)
+    c.advance(6_000)
+    stopped = cmd(t, "stop", s["revision"], "life-stop")
+    assert t.totals()["rows"] == [{"task": renamed, "total_ms": 91_000}]
+    assert t.summary("2026-10-20", "UTC")["total_ms"] == 6_000
+    assert stopped["status"] == "idle"
+
+
+def test_totals_competing_requests_replay_and_source_identity(tmp_path):
+    c = FakeClock()
+    a, b = store(tmp_path, c), store(tmp_path, c)
+    body = {"request_id": "life-concurrent", "expected_revision": 0, "action": "start", "task": TASK}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        answers = list(pool.map(lambda timer: timer.command(body), [a, b]))
+    assert answers[0] == answers[1]
+    c.advance(7_000)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        snapshots = list(pool.map(lambda timer: timer.totals(), [a, b]))
+    assert snapshots[0]["rows"] == snapshots[1]["rows"] == [{"task": TASK, "total_ms": 7_000}]
+    other = {**TASK, "source": "calendar"}
+    s = cmd(a, "start", answers[0]["revision"], "life-other", task=other)
+    c.advance(3_000)
+    cmd(b, "stop", s["revision"], "life-other-stop")
+    assert {row["task"]["source"]: row["total_ms"] for row in a.totals()["rows"]} == {"library": 7_000, "calendar": 3_000}
+
+
+def test_time_save_failure_rolls_back_interval_and_receipt(tmp_path, monkeypatch):
+    c = FakeClock()
+    t = store(tmp_path, c)
+    s = cmd(t, "start", 0, "life-rollback-start", task=TASK)
+    c.advance(8_000)
+    save = t._save
+    def fail(*_args):
+        raise sqlite3.OperationalError("simulated disk full")
+    monkeypatch.setattr(t, "_save", fail)
+    with pytest.raises(sqlite3.OperationalError):
+        cmd(t, "stop", s["revision"], "life-rollback-stop")
+    monkeypatch.setattr(t, "_save", save)
+    result = cmd(t, "stop", s["revision"], "life-rollback-stop")
+    assert result["status"] == "idle"
+    assert t.totals()["rows"] == [{"task": TASK, "total_ms": 8_000}]
+    assert cmd(t, "stop", s["revision"], "life-rollback-stop") == result
+    assert t.totals()["rows"][0]["total_ms"] == 8_000
+
+@pytest.mark.parametrize("operation, expected_status, interruption", [
+    ("state", "running", None), ("totals", "running", None),
+    ("summary", "running", None), ("checkpoint", "running", None),
+    ("command", "idle", None), ("stop_service", "paused", "service_stop"),
+    ("power_suspend", "paused", "system_suspend"),
+])
+def test_clock_is_sampled_after_transaction_wait(tmp_path, operation, expected_status, interruption):
+    """A blocked reader must use a clock newer than the writer's new anchor."""
+    from contextlib import contextmanager
+    from threading import Event
+
+    c = FakeClock()
+    a, b = store(tmp_path, c), store(tmp_path, c)
+    waiting, release = Event(), Event()
+    original = a._connect
+
+    @contextmanager
+    def delayed_connect():
+        waiting.set()
+        assert release.wait(5), "writer did not release transaction gate"
+        with original() as db:
+            yield db
+
+    a._connect = delayed_connect
+    def invoke():
+        if operation == "summary":
+            return a.summary(day(c), "UTC")
+        if operation == "command":
+            return cmd(a, "stop", 1, "waiting-stop")
+        if operation == "power_suspend":
+            return a._power_event(4)
+        return getattr(a, operation)()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(invoke)
+        assert waiting.wait(5)
+        try:
+            c.advance(1_000)
+            started = cmd(b, "start", 0, "concurrent-start", task=TASK)
+            c.advance(2_000)
+        finally:
+            release.set()
+        future.result(timeout=5)
+    state = b.state()
+    assert state["status"] == expected_status
+    assert state["interruption"] == interruption
+    assert state["elapsed_ms"] == 2_000
+    if expected_status == "running":
+        assert state["revision"] == started["revision"]
+    assert b.totals()["rows"][0]["total_ms"] == 2_000
