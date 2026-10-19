@@ -1,8 +1,9 @@
-html{background:var(--line)}
-body.focus-widget{display:block;min-height:0;min-width:0;margin:0;padding:0;max-width:none;box-sizing:border-box;height:100vh;overflow:hidden;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:15px;font-size:12px;user-select:none;touch-action:none}
+html{background:var(--card)}
+body.focus-widget{display:block;min-height:0;min-width:0;margin:0;padding:0;max-width:none;box-sizing:border-box;height:100vh;overflow:hidden;background:var(--card);color:var(--ink);border:1px solid var(--line);font-size:12px;user-select:none;touch-action:none}
 .focus-widget button{display:grid;place-items:center;font:inherit;margin:0;width:26px;height:26px;min-width:26px;min-height:26px;padding:0;background:transparent;color:var(--muted);border:0;border-radius:7px;cursor:pointer}.focus-widget button:hover{background:var(--tint);color:var(--ink)}.focus-widget button:disabled{opacity:.45;cursor:default}.focus-widget button:focus-visible,.focus-widget select:focus-visible,#widget-tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
 .focus-widget :where(button,#widget-tab)>svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
-/* One-row card, owner's choice 2026-10-19 (variant C): time ring, two text lines, controls. */
+/* One-row card, owner's choice 2026-10-19 (variant C): time ring, two text lines, controls.
+   Square corners: Windows 10 does not clip WebView2 to a window region (checked on the owner's screen). */
 .widget-card{display:grid;grid-template-columns:44px minmax(0,1fr) 30px 26px 26px 22px;grid-template-areas:"ring fire run stop mode win";align-items:center;gap:0 6px;height:100%;box-sizing:border-box;padding:5px 6px}
 .widget-ring{grid-area:ring;display:grid;place-items:center;width:44px;height:44px;box-sizing:border-box;border-radius:50%;border:2px solid var(--line);background:var(--tint);font-size:12.5px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.03em;line-height:1}
 .widget-card:has(#widget-burning.is-critical) .widget-ring{border-color:var(--fire-outline);box-shadow:0 0 0 3px color-mix(in srgb,#ff7a1a 28%,transparent)}
@@ -19,7 +20,11 @@ body.focus-widget{display:block;min-height:0;min-width:0;margin:0;padding:0;max-
 #widget-error{grid-area:fire;z-index:2;align-self:stretch;margin:0;padding:3px 6px;border-radius:6px;background:var(--error-bg);color:var(--error);font-size:11px;line-height:1.2;overflow:auto}
 #widget-retry{grid-column:run-start/mode-end;grid-row:1;z-index:2;width:auto;height:auto;min-height:30px;padding:2px 6px;font-size:10.5px;line-height:1.1;white-space:normal;background:var(--card);color:var(--ink);border:1px solid var(--line)}
 .focus-widget [hidden]{display:none!important}
-#widget-tab{display:none;height:100%;box-sizing:border-box;align-items:center;justify-content:center;flex-direction:column;gap:3px;cursor:grab;outline:none}#widget-tab svg{width:19px;height:19px;color:var(--accent)}#widget-tab-time{font-size:14px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums}body[data-widget-mode=bar]{border-radius:0 14px 14px 0}body[data-widget-mode=bar][data-side=right]{border-radius:14px 0 0 14px}body[data-widget-mode=bar] .widget-card{display:none}body[data-widget-mode=bar] #widget-tab{display:flex}
+#widget-tab{display:none;height:100%;box-sizing:border-box;align-items:center;justify-content:center;flex-direction:column;gap:3px;cursor:grab;outline:none}#widget-tab svg{width:19px;height:19px;color:var(--accent)}#widget-tab-time{font-size:14px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums}body[data-widget-mode=bar] .widget-card{display:none}body[data-widget-mode=bar] #widget-tab{display:flex}
 @media(prefers-reduced-motion:reduce){.focus-widget *{transition:none!important;animation:none!important}}
 .focus-widget[data-long-time=true] #widget-time{font-size:10px}.focus-widget[data-long-time=true] #widget-tab-time{font-size:11px}
 .focus-widget #widget-tab[data-pending=true] svg{color:var(--error)}
+/* "What are you doing?" replaces the task text until answered or snoozed. */
+#widget-ask{grid-row:1/3;grid-column:1/-1;display:grid;gap:2px;min-width:0}#widget-ask-title{font-size:12px;font-weight:650;color:var(--fire-outline);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}#widget-ask-choice{min-width:0;width:100%;min-height:22px;margin:0;padding:0 2px;font:inherit;font-size:12px;color:var(--ink);background:var(--tint);border:1px solid var(--line);border-radius:5px;cursor:pointer}#widget-ask-choice option,#widget-ask-choice optgroup{background:var(--card);color:var(--ink)}
+#widget-fire:has(#widget-ask:not([hidden]))>:not(#widget-ask){display:none}#widget-fire:has(#widget-ask:not([hidden]))::before{content:none}
+body[data-ask=true] #widget-tab svg{color:var(--fire-outline)}

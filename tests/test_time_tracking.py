@@ -365,3 +365,110 @@ def test_clock_is_sampled_after_transaction_wait(tmp_path, operation, expected_s
     if expected_status == "running":
         assert state["revision"] == started["revision"]
     assert b.totals()["rows"][0]["total_ms"] == 2_000
+
+
+def _event(key, start, end, title=None):
+    return {"key": key, "title": title or key, "start_ms": start, "end_ms": end}
+
+
+def _local_days(*stamps):
+    return sorted({datetime.fromtimestamp(ms / 1000).date() for ms in stamps})
+
+
+def _row(report, source, key):
+    return next((row for row in report["rows"] if row["task"] and row["task"]["source"] == source
+                 and row["task"]["id"] == key), None)
+
+
+def test_calendar_events_count_past_part_once_and_timer_wins(tmp_path):
+    c = FakeClock()
+    base, hour, minute = c.wall, 3_600_000, 60_000
+    t = store(tmp_path, c)
+    events = [_event("cal:a", base + 2 * hour, base + 3 * hour),
+              _event("cal:b", base + 2 * hour + 30 * minute, base + 3 * hour + 30 * minute),
+              _event("cal:c", base + 5 * hour, base + 6 * hour)]
+    c.advance(2 * hour + 15 * minute)
+    s = cmd(t, "start", 0, "work", task=TASK)
+    advance_active(t, c, 5 * minute)
+    cmd(t, "stop", s["revision"], "stop")
+    c.advance(4 * hour - (2 * hour + 20 * minute))  # now: base + 4h
+    days = _local_days(*(e["start_ms"] for e in events))
+    t.sync_calendar(days, events)
+    t.sync_calendar(days, events)  # idempotent: rows of a day are recomputed, never added twice
+    totals = {(r["task"]["source"], r["task"]["id"]): r["total_ms"] for r in t.totals()["rows"] if r["task"]}
+    assert totals[("calendar", "cal:a")] == 55 * minute  # 10:00-11:00 minus the tracked 10:15-10:20
+    assert totals[("calendar", "cal:b")] == 30 * minute  # overlap with A counted once
+    assert ("calendar", "cal:c") not in totals  # future part never counts
+    assert totals[("library", "stable-1")] == 5 * minute
+    report = t.summary(day(c), "UTC")
+    assert report["total_ms"] == 90 * minute
+    assert _row(report, "calendar", "cal:a")["calendar_ms"] == 55 * minute
+    assert "calendar_ms" not in _row(report, "library", "stable-1")
+
+
+def test_calendar_event_marked_did_not_happen_is_removed_until_restored(tmp_path):
+    c = FakeClock()
+    base, hour = c.wall, 3_600_000
+    t = store(tmp_path, c)
+    events = [_event("cal:a", base + hour, base + 2 * hour)]
+    c.advance(3 * hour)
+    days = _local_days(base + hour)
+    t.sync_calendar(days, events)
+    assert t.set_calendar_skip("cal:a", True) == {"id": "cal:a", "skipped": True}
+    t.sync_calendar(days, events)
+    assert all(r["task"]["id"] != "cal:a" for r in t.totals()["rows"] if r["task"])
+    assert t.calendar_skips() == ["cal:a"]
+    t.set_calendar_skip("cal:a", False)
+    t.sync_calendar(days, events)
+    assert any(r["task"]["id"] == "cal:a" and r["total_ms"] == hour for r in t.totals()["rows"] if r["task"])
+    with pytest.raises(ValidationError):
+        t.set_calendar_skip("cal:a", "yes")
+
+
+def test_calendar_time_yields_to_a_timer_started_during_the_event(tmp_path):
+    c = FakeClock()
+    base, minute = c.wall, 60_000
+    t = store(tmp_path, c)
+    events = [_event("cal:a", base, base + 60 * minute)]
+    days = _local_days(base)
+    c.advance(10 * minute)
+    s = cmd(t, "start", 0, "work", task=TASK)
+    advance_active(t, c, 20 * minute)  # still running at base + 30 min
+    t.sync_calendar(days, events)
+    rows = {r["task"]["id"]: r["total_ms"] for r in t.totals()["rows"] if r["task"]}
+    assert rows["cal:a"] == 10 * minute and rows["stable-1"] == 20 * minute
+
+
+def test_backfill_assigns_untracked_stretch_without_overlap_or_replay(tmp_path):
+    c = FakeClock()
+    base, minute = c.wall, 60_000
+    t = store(tmp_path, c)
+    s = cmd(t, "start", 0, "first", task=TASK)
+    advance_active(t, c, 5 * minute)
+    s = cmd(t, "stop", s["revision"], "stop")
+    c.advance(25 * minute)  # untracked: base + 5 .. base + 30 min
+    other = {"source": "library", "id": "other", "title": "Other"}
+    body = {"request_id": "answer", "expected_revision": s["revision"], "action": "start",
+            "mode": "stopwatch", "task": other, "backfill_from": base}  # asks too early on purpose
+    started = t.command(body)
+    assert started["status"] == "running" and started["task"] == other
+    assert t.command(body) == started  # the same answer delivered twice
+    rows = {r["task"]["id"]: r["total_ms"] for r in t.totals()["rows"] if r["task"]}
+    assert rows == {"stable-1": 5 * minute, "other": 25 * minute}  # clipped to the end of tracked work
+    with pytest.raises(ValidationError, match="уже учитывается"):
+        cmd(t, "start", started["revision"], "again", task=other, backfill_from=c.wall - minute)
+    with pytest.raises(ValidationError):
+        cmd(t, "pause", started["revision"], "bad", backfill_from=c.wall)
+
+
+def test_backfill_is_limited_to_twelve_hours_and_rest_is_a_label(tmp_path):
+    c = FakeClock()
+    hour = 3_600_000
+    t = store(tmp_path, c)
+    c.advance(20 * hour)
+    rest = {"source": "label", "id": "rest", "title": "Отдых"}
+    cmd(t, "start", 0, "rest", task=rest, backfill_from=c.wall - 20 * hour)
+    rows = {r["task"]["id"]: r["total_ms"] for r in t.totals()["rows"] if r["task"]}
+    assert rows["rest"] == 12 * hour
+    with pytest.raises(ValidationError):
+        cmd(t, "switch_task", 1, "bad-label", task={"source": "label", "id": "nap", "title": "Сон"})

@@ -159,16 +159,36 @@ export function mountTimeUI(host) {
   $(".time-retry").onclick = async () => { try { await timeClient.retry(); $(".time-error").hidden = true; $(".time-retry").hidden = true; render(); await refreshTotals(); } catch (err) { error(err); } };
   const today = new Date(); $(".time-day").value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
   $(".time-zone").value = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  $(".time-report").onclick = async () => {
+  // Calendar time is recorded automatically (owner decision 2026-10-19); an
+  // event that did not happen is removed here and can be restored.
+  const showReport = async () => {
     try {
       const report = await sharedApi(`/api/time/summary?day=${$(".time-day").value}&timezone=${encodeURIComponent($(".time-zone").value)}`);
       const list = $(".time-rows"); list.replaceChildren();
+      const skip = async (id, skipped) => {
+        try { await sharedApi("/api/time/calendar-skip", "POST", { request_id: crypto.randomUUID(), id, skipped }); await showReport(); await refreshTotals(); }
+        catch (err) { error(err); }
+      };
+      const line = (title, total, extra = []) => {
+        const row = document.createElement("div"); const name = document.createElement("span"); const value = document.createElement("strong");
+        name.textContent = title; value.textContent = total; row.append(name, value, ...extra); list.append(row); return name;
+      };
+      const button = (text, help, onclick) => { const node = document.createElement("button"); node.className = "time-row-skip";
+        node.textContent = text; node.title = help; node.onclick = onclick; return node; };
       for (const row of [...report.rows, { task: { title: t("Всего") }, total_ms: report.total_ms }]) {
-        const line = document.createElement("div"); const name = document.createElement("span"); const value = document.createElement("strong");
-        name.textContent = row.task?.title || t("Без задачи"); value.textContent = formatTime(row.total_ms); line.append(name, value); list.append(line);
+        const calendar = row.calendar_ms ? [button(t("Не было"), t("Событие не состоялось: убрать его время из учёта"), () => skip(row.task.id, true))] : [];
+        const name = line(row.task?.title || t("Без задачи"), formatTime(row.total_ms), calendar);
+        if (row.calendar_ms) { const note = document.createElement("small"); note.className = "time-row-note";
+          note.textContent = row.calendar_ms === row.total_ms ? t("по календарю") : t("{time} по календарю", { time: formatTime(row.calendar_ms) });
+          name.append(" ", note); }
+      }
+      for (const item of report.skipped || []) {
+        const name = line(item.title, t("не было"), [button(t("Вернуть"), t("Вернуть время события в учёт"), () => skip(item.id, false))]);
+        name.classList.add("time-row-skipped");
       }
     } catch (err) { error(err); }
   };
+  $(".time-report").onclick = showReport;
   const pollError = err => {
     if (!$(".time-error").hidden && !pollNotice && !interruptionNotice) return;
     error(err);pollNotice=true;

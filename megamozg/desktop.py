@@ -1,6 +1,7 @@
 """Native WebView2 host for Brainalot's same-origin desktop pages."""
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
@@ -140,6 +141,24 @@ class DesktopState:
         return True
 
 
+def input_idle_ms():
+    """Milliseconds since the user's last keyboard or mouse input in this
+    Windows session. Only a duration is read; no input is observed or stored."""
+    if os.name != "nt":
+        return 0
+
+    class LastInput(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_uint), ("time", ctypes.c_uint)]
+
+    info = LastInput()
+    info.size = ctypes.sizeof(info)
+    user, kernel = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32")
+    kernel.GetTickCount.restype = ctypes.c_uint32
+    if not user.GetLastInputInfo(ctypes.byref(info)):
+        return 0
+    return (kernel.GetTickCount() - info.time) & 0xFFFFFFFF  # 32-bit tick wrap
+
+
 class DesktopBridge:
     def __init__(self, host):
         # pywebview recursively walks every public non-callable attribute of
@@ -169,6 +188,9 @@ class DesktopBridge:
 
     def set_storage(self, items):
         return self._host.state.set(items)
+
+    def input_idle_ms(self):
+        return input_idle_ms()
 
     def remove_storage(self, keys):
         return self._host.state.remove(keys)
@@ -319,20 +341,12 @@ class DesktopHost:
             window.show()
             window.restore()
 
-    def _shape(self, mode, rect):
-        """Window region matching the page's rounded surface (widget.css radii)."""
-        if mode == "full":
-            return None
-        dpi = select_area(rect, self._areas()).dpi
-        return {"radius": round((14 if mode == "bar" else 15) * dpi / 96),
-                "side": self.side if mode == "bar" else None}
-
     def _restore_geometry(self):
         self._switching = True
         try:
             for mode, window in (("full", self.full), (self.widget_mode, self.widget)):
                 rect, minimum = self._rect(mode)
-                set_native_rect(window, rect, minimum, self._shape(mode, rect))
+                set_native_rect(window, rect, minimum)
         finally:
             self._switching = False
 
@@ -345,7 +359,7 @@ class DesktopHost:
             if self._topology is not None and topology != self._topology:
                 window = self.full if self.mode == "full" else self.widget
                 rect, minimum = self._rect(self.mode)
-                set_native_rect(window, rect, minimum, self._shape(self.mode, rect))
+                set_native_rect(window, rect, minimum)
                 self._remember_geometry(window, "full" if self.mode == "full" else "widget")
             self._topology = topology
             self._topology_timer = threading.Timer(2, self._watch_topology)
@@ -395,9 +409,7 @@ class DesktopHost:
                         self.state.data["side"] = self.side
                     rect = fit_geometry(rect, self._areas(), WIDGET_SIZES.get(self.mode, FULL_SIZE),
                                         side=self.side if self.mode == "bar" else None)
-                # The end of a drag may change DPI or the tab side: reshape then.
-                set_native_rect(window, rect, None,
-                                self._shape(self.mode, rect) if action == "gesture_end" else None)
+                set_native_rect(window, rect)
             if action == "gesture_end":
                 self._drag = None
                 self._remember_geometry(window, "full" if self.mode == "full" else "widget")
@@ -437,7 +449,7 @@ class DesktopHost:
                                                     + "{detail:" + json.dumps(action) + "}))")
                     self.mode = action
                     rect, minimum = self._rect(action, anchor)
-                    set_native_rect(target, rect, minimum, self._shape(action, rect))
+                    set_native_rect(target, rect, minimum)
                     self._show(target)  # show before hiding the old surface
                     (self.widget if action == "full" else self.full).hide()
                     self.state.data.update(last_mode=action, topmost=True, side=self.side)

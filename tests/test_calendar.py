@@ -517,3 +517,31 @@ def test_events_merge_distinguish_ids_and_keep_good_feed_on_partial_failure(tmp_
     partial = feed.events(date(2026, 9, 21), date(2026, 9, 21))
     assert partial["stale"] and partial["error"] and len(partial["events"]) == 2
     assert URL_TWO not in str(partial) and URL not in str(partial)
+
+
+def test_timed_calendar_events_fill_the_day_summary_and_can_be_marked_did_not_happen(tmp_path, monkeypatch):
+    CalendarFeed(tmp_path).configure(URL)
+    monkeypatch.setattr(CalendarFeed, "_download", lambda self, url: FEED)
+    client = TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8765")
+    auth = {"Authorization": "Bearer " + Store(tmp_path).token()}
+    client.get("/api/calendar/events?start=2026-09-21&end=2026-09-27", headers=auth)  # fills the local cache
+    summary = lambda: client.get("/api/time/summary?day=2026-09-21&timezone=Europe/Moscow", headers=auth).json()
+
+    report = summary()
+    lesson = next(row for row in report["rows"] if row["task"]["source"] == "calendar")
+    assert lesson["task"]["title"] == "Student lesson"
+    assert lesson["total_ms"] == lesson["calendar_ms"] == 3_600_000
+    assert report["skipped"] == []
+    # The all-day conference never counts, on any day.
+    conference = client.get("/api/time/summary?day=2026-09-24&timezone=Europe/Moscow", headers=auth).json()
+    assert conference["rows"] == []
+
+    skip = {"request_id": "skip-1", "id": lesson["task"]["id"], "skipped": True}
+    assert client.post("/api/time/calendar-skip", json=skip, headers=auth).json() == {"id": lesson["task"]["id"], "skipped": True}
+    report = summary()
+    assert report["rows"] == [] and report["skipped"] == [{"id": lesson["task"]["id"], "title": "Student lesson"}]
+    client.post("/api/time/calendar-skip", json={**skip, "request_id": "skip-2", "skipped": False}, headers=auth)
+    assert summary()["rows"][0]["calendar_ms"] == 3_600_000
+    # Opening the stopwatch picker still reads the same cache without network.
+    tasks = client.get("/api/time/tasks?q=lesson", headers=auth).json()["tasks"]
+    assert {"source": "calendar", "id": lesson["task"]["id"], "title": "Student lesson"} in tasks

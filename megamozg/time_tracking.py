@@ -24,7 +24,12 @@ MAX_DRIFT_MS = 5_000
 UNREGISTERED_DRIFT_MS = 100
 POMODORO_MS = 1_500_000
 MODES = {"stopwatch", "pomodoro", "break"}
-SOURCES = {"library", "work", "calendar"}
+SOURCES = {"library", "work", "calendar", "label"}
+# Time categories that are not library tasks (owner decision 2026-10-19).
+LABELS = {"rest": "Отдых"}
+# Past parts of timed calendar events, recomputed from the calendar cache.
+CALENDAR_MODE = "calendar"
+BACKFILL_LIMIT_MS = 12 * 3_600_000
 LOGGER = logging.getLogger(__name__)
 PBT_APMSUSPEND = 4
 PBT_APMRESUMESUSPEND = 7
@@ -65,7 +70,34 @@ def _task(value):
                    or len(value[key]) > limit or any(c in value[key] for c in "\r\n\x00")
                    for key, limit in (("id", 2048), ("title", 512)))):
         raise ValidationError("task must be null or a TaskRef with source, id and title")
+    if value["source"] == "label" and value["id"] not in LABELS:
+        raise ValidationError("Неизвестная метка времени")
     return {key: value[key] for key in ("source", "id", "title")}
+
+
+def _free(segment, busy):
+    """Parts of ``segment`` not covered by any (start, end) in ``busy``."""
+    left, right = segment
+    parts = []
+    for start, end in sorted(busy):
+        if end <= left or start >= right:
+            continue
+        if start > left:
+            parts.append((left, start))
+        left = max(left, end)
+        if left >= right:
+            break
+    if left < right:
+        parts.append((left, right))
+    return parts
+
+
+def _day_window(day):
+    """Local-time day [start, end) in ms. Calendar rows never cross it, so every
+    recomputation of a day replaces exactly the rows it created."""
+    start = datetime.combine(day, datetime.min.time()).astimezone()
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time()).astimezone()
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
 class TimeStore:
@@ -146,6 +178,10 @@ class TimeStore:
                     request_id TEXT PRIMARY KEY,
                     body_hash TEXT NOT NULL,
                     response TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS calendar_skips (
+                    task_id TEXT PRIMARY KEY,
+                    at INTEGER NOT NULL
                 );
             """)
             db.execute("""INSERT OR IGNORE INTO timer VALUES
@@ -260,9 +296,12 @@ class TimeStore:
         if (not isinstance(action, str) or action not in
                 {"start", "pause", "resume", "stop", "switch_task", "set_mode", "reset_pomodoro"}):
             raise ValidationError("unknown time action")
-        allowed = {"request_id", "expected_revision", "action", "task", "mode", "duration_ms"}
+        allowed = {"request_id", "expected_revision", "action", "task", "mode", "duration_ms", "backfill_from"}
         if set(body) - allowed:
             raise ValidationError("unknown time command fields")
+        if "backfill_from" in body and (action != "start" or isinstance(body["backfill_from"], bool)
+                                        or not isinstance(body["backfill_from"], int)):
+            raise ValidationError("backfill_from is only valid for start")
         if "task" in body:
             _task(body["task"])
         if "mode" in body and (not isinstance(body["mode"], str) or body["mode"] not in MODES):
@@ -290,6 +329,18 @@ class TimeStore:
             task = body.get("task") if action in {"start", "switch_task"} else json.loads(row["task"]) if row["task"] else None
             if not features.WORK_ENABLED and action in {"start", "switch_task", "resume"} and task and task.get("source") == "work":
                 raise ValidationError(features.WORK_PAUSED_MESSAGE)
+            if action == "start" and "backfill_from" in body:
+                # The answer to "what are you doing?": the untracked active stretch
+                # before now belongs to the chosen task. Never over tracked time.
+                if row["status"] == "running":
+                    raise ValidationError("Время уже учитывается; дозапись не нужна")
+                last = db.execute("SELECT MAX(end_ms) FROM intervals WHERE mode!=?",
+                                  (CALENDAR_MODE,)).fetchone()[0] or 0
+                since = max(body["backfill_from"], last, wall - BACKFILL_LIMIT_MS)
+                if since < wall - 1000:
+                    task_json = _json(_task(body.get("task"))) if body.get("task") is not None else None
+                    db.execute("INSERT INTO intervals(start_ms,end_ms,task,mode) VALUES(?,?,?,?)",
+                               (since, wall, task_json, "stopwatch"))
             if action == "start":
                 mode = body.get("mode", "stopwatch")
                 row.update(status="running", mode=mode,
@@ -360,23 +411,86 @@ class TimeStore:
                     and row["elapsed_ms"] + self._tail(row, wall, mono) >= row["duration_ms"]):
                 self._settle(db, row, wall, mono, force=True)
             intervals = [tuple(item) for item in db.execute(
-                "SELECT start_ms,end_ms,task FROM intervals WHERE start_ms<? AND end_ms>? ORDER BY id",
+                "SELECT start_ms,end_ms,task,mode FROM intervals WHERE start_ms<? AND end_ms>? ORDER BY id",
                 (end, start))]
             if row["status"] == "running" and row["mode"] != "break":
-                intervals.append((row["anchor_at"],
-                                  min(wall, row["anchor_at"] + self._tail(row, wall, mono)), row["task"]))
+                intervals.append((row["anchor_at"], min(wall, row["anchor_at"] + self._tail(row, wall, mono)),
+                                  row["task"], row["mode"]))
         totals = {}
-        for left, right, task in intervals:
+        for left, right, task, mode in intervals:
             amount = max(0, min(right, end) - max(left, start))
             if amount:
                 ref = json.loads(task) if task else None
                 key = (ref["source"], ref["id"]) if ref else None
                 if key not in totals:
-                    totals[key] = {"task": ref, "total_ms": 0}
+                    totals[key] = {"task": ref, "total_ms": 0, "calendar_ms": 0}
                 totals[key]["total_ms"] += amount
-        rows = sorted(totals.values(), key=lambda item: -item["total_ms"])
+                if mode == CALENDAR_MODE:
+                    totals[key]["calendar_ms"] += amount
+        # calendar_ms only where part of the row came from the calendar.
+        rows = sorted(({k: v for k, v in item.items() if k != "calendar_ms" or v} for item in totals.values()),
+                      key=lambda item: -item["total_ms"])
         return {"day": day, "timezone": timezone,
                 "total_ms": sum(item["total_ms"] for item in rows), "rows": rows}
+
+    def sync_calendar(self, days, events):
+        """Record the past part of timed calendar events for whole local ``days``.
+
+        ``days`` must be fully covered by ``events`` (dicts: key, title,
+        start_ms, end_ms), or their earlier rows would be lost. Tracked timer
+        time wins, overlapping events count once (earlier start first) and
+        events marked "did not happen" never count. Idempotent per day.
+        """
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            wall, mono = self._now()
+            row = self._record(db)
+            skips = {item["task_id"] for item in db.execute("SELECT task_id FROM calendar_skips")}
+            written = 0
+            for day in days:
+                start, end = _day_window(day)
+                db.execute("DELETE FROM intervals WHERE mode=? AND start_ms>=? AND start_ms<?",
+                           (CALENDAR_MODE, start, end))
+                busy = [tuple(item) for item in db.execute(
+                    "SELECT start_ms,end_ms FROM intervals WHERE start_ms<? AND end_ms>?", (end, start))]
+                if row["status"] == "running" and row["mode"] != "break" and row["anchor_at"] is not None:
+                    busy.append((row["anchor_at"], max(wall, row["anchor_at"])))
+                for event in sorted(events, key=lambda item: (item["start_ms"], item["key"])):
+                    if event["key"] in skips:
+                        continue
+                    segment = (max(event["start_ms"], start), min(event["end_ms"], end, wall))
+                    if segment[1] - segment[0] < 1000:
+                        continue
+                    task = _json({"source": "calendar", "id": event["key"], "title": event["title"]})
+                    for left, right in _free(segment, busy):
+                        if right - left >= 1000:
+                            db.execute("INSERT INTO intervals(start_ms,end_ms,task,mode) VALUES(?,?,?,?)",
+                                       (left, right, task, CALENDAR_MODE))
+                            written += right - left
+                        busy.append((left, right))
+            return {"days": [day.isoformat() for day in days], "calendar_ms": written}
+
+    def set_calendar_skip(self, task_id, skipped):
+        """Mark a calendar occurrence as "did not happen" (or undo it)."""
+        if not isinstance(task_id, str) or not task_id.strip() or len(task_id) > 2048:
+            raise ValidationError("Некорректный ID события")
+        if not isinstance(skipped, bool):
+            raise ValidationError("skipped must be true or false")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if skipped:
+                wall, _ = self._now()
+                db.execute("INSERT OR REPLACE INTO calendar_skips VALUES(?,?)", (task_id, wall))
+                for item in db.execute("SELECT id,task FROM intervals WHERE mode=?", (CALENDAR_MODE,)).fetchall():
+                    if json.loads(item["task"])["id"] == task_id:
+                        db.execute("DELETE FROM intervals WHERE id=?", (item["id"],))
+            else:
+                db.execute("DELETE FROM calendar_skips WHERE task_id=?", (task_id,))
+            return {"id": task_id, "skipped": skipped}
+
+    def calendar_skips(self):
+        with self._connect() as db:
+            return sorted(item["task_id"] for item in db.execute("SELECT task_id FROM calendar_skips"))
 
     def totals(self):
         """One snapshot of lifetime work by stable source/id, including live tail once.

@@ -6,7 +6,8 @@ import hashlib
 import os
 import math
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import time as _time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -168,22 +169,104 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
             raise NotFoundError("Файл desktop не найден")
         return FileResponse(target, headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"})
 
+    def cached_calendar(first: date, last: date):
+        """Events from the local calendar caches only (never network/OAuth) and
+        the days every configured calendar fully covers."""
+        events, covered = {}, None
+        days = {first + timedelta(days=i) for i in range((last - first).days + 1)}
+        with calendar.lock:
+            for item in calendar._read_config()["calendars"]:
+                have = set()
+                cache = calendar._api_cache(item["id"])
+                for event in cache.get("events", []) if isinstance(cache.get("events"), list) else []:
+                    key = str(event.get("occurrence_id") or event.get("id"))
+                    events[item["id"] + ":" + key] = event
+                try:
+                    low, high = date.fromisoformat(cache["start"]), date.fromisoformat(cache["end"])
+                    have |= {day for day in days if low <= day <= high}
+                except (KeyError, TypeError, ValueError):
+                    pass
+                cached = calendar._cache_path(item["id"])
+                if cached.is_file():
+                    try:
+                        for event in calendar._parse_events_cached(cached.read_bytes(), item, first, last):
+                            key = str(event.get("occurrence_id") or event["id"])
+                            events.setdefault(item["id"] + ":" + key, event)
+                        have |= days
+                    except (ValueError, OSError):
+                        pass
+                covered = have if covered is None else covered & have
+        return events, sorted(covered or ())
+
+    def timed_events(events):
+        result = []
+        for key, event in events.items():
+            if event.get("all_day"):
+                continue
+            try:
+                start = int(datetime.fromisoformat(event["start"]).timestamp() * 1000)
+                end = int(datetime.fromisoformat(event["end"]).timestamp() * 1000)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end > start:
+                result.append({"key": key, "title": event.get("title") or "Событие",
+                               "start_ms": start, "end_ms": end})
+        return result
+
+    def sync_calendar_time(first: date, last: date):
+        events, days = cached_calendar(first, last)
+        if days:
+            timer.sync_calendar(days, timed_events(events))
+        return events
+
+    calendar_sync = {"at": 0.0}
+
     @app.get("/api/time/state")
     def time_state():
         return timer.state()
 
     @app.post("/api/time/command")
     async def time_command(request: Request):
-        data = await payload(request, {"request_id", "expected_revision", "action", "task", "mode", "duration_ms"})
+        data = await payload(request, {"request_id", "expected_revision", "action", "task", "mode", "duration_ms",
+                                       "backfill_from"})
         return await run_in_threadpool(timer.command, data)
 
     @app.get("/api/time/summary")
     def time_summary(day: str, timezone: str = "Europe/Moscow"):
-        return timer.summary(day, timezone)
+        try:
+            selected = date.fromisoformat(day)
+        except ValueError as exc:
+            raise ValidationError("day must be YYYY-MM-DD") from exc
+        # Local days around the requested one: any timezone's day lies within them.
+        events = sync_calendar_time(selected - timedelta(days=1), selected + timedelta(days=1))
+        report = timer.summary(day, timezone)
+        skipped = set(timer.calendar_skips())
+        report["skipped"] = [{"id": item["key"], "title": item["title"]} for item in timed_events(events)
+                             if item["key"] in skipped
+                             and datetime.fromtimestamp(item["start_ms"] / 1000).date() == selected]
+        return report
 
     @app.get("/api/time/totals")
     def time_totals():
+        # Keep today's calendar time fresh for row totals without recomputing on
+        # every poll of every client.
+        if _time.monotonic() - calendar_sync["at"] >= 60:
+            calendar_sync["at"] = _time.monotonic()
+            today = date.today()
+            sync_calendar_time(today - timedelta(days=1), today)
         return timer.totals()
+
+    @app.post("/api/time/calendar-skip")
+    async def time_calendar_skip(request: Request):
+        data = await payload(request, {"request_id", "id", "skipped"})
+        def skip():
+            result = timer.set_calendar_skip(data.get("id"), data.get("skipped"))
+            if not result["skipped"]:
+                today = date.today()
+                sync_calendar_time(today - timedelta(days=31), today)
+            calendar_sync["at"] = 0.0
+            return result
+        return await run_in_threadpool(skip)
 
     @app.get("/api/time/tasks")
     def time_tasks(q: str = ""):
@@ -193,21 +276,8 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
         tasks.extend({"source": "work", "id": n["id"], "title": n.get("title") or "Без названия"}
                      for n in (state or {}).get("items", []) if n.get("status") != "done")
         # Use existing cached calendar data; opening a stopwatch never triggers network/OAuth.
-        events = {}
         today = date.today()
-        with calendar.lock:
-            for item in calendar._read_config()["calendars"]:
-                for event in calendar._api_cache(item["id"]).get("events", []):
-                    key = str(event.get("occurrence_id") or event.get("id"))
-                    events[item["id"] + ":" + key] = event
-                cached = calendar._cache_path(item["id"])
-                if cached.is_file():
-                    try:
-                        for event in calendar._parse_events_cached(cached.read_bytes(), item, today-timedelta(days=31), today+timedelta(days=31)):
-                            key = str(event.get("occurrence_id") or event["id"])
-                            events.setdefault(item["id"] + ":" + key, event)
-                    except (ValueError, OSError):
-                        pass
+        events, _ = cached_calendar(today - timedelta(days=31), today + timedelta(days=31))
         tasks.extend({"source": "calendar", "id": key, "title": event.get("title") or "Событие"} for key, event in events.items())
         return {"tasks": [task for task in tasks if q.casefold() in task["title"].casefold()]}
 

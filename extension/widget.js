@@ -2,7 +2,7 @@ import { native } from "./desktop-platform.js";
 import { timeClient, sharedApi, elapsedAt, formatTime, getTimePreset, timerFields } from "./time-client.js";
 import { applyDocument, syncLocale, localeChange, t } from "./i18n.js";
 import { calendarImportanceLevel } from "./importance-state.js";
-import { compactTasks, taskKey, resolveActiveTask } from "./widget-model.js";
+import { compactTasks, taskKey, resolveActiveTask, untrackedStep, eventKey, currentEvent } from "./widget-model.js";
 import { installWindowGestures } from "./desktop-gestures.js";
 const $ = id => document.getElementById(id);
 applyDocument(); void syncLocale();
@@ -17,6 +17,9 @@ let liveNotes = [], liveEvents = [];
 // Owners of the visible notice: a failed background poll clears on the next healthy
 // poll; an error of the user's own action stays until the next action or retry.
 let pendingNotice = false, pollNotice = false;
+// Untracked active stretch and the question about it; see widget-model.js.
+let gap = null, asking = false, snoozeUntil = 0;
+const askRefs = new Map();
 function error(err, {poll = false} = {}) { pendingNotice = false; pollNotice = poll; $("widget-error").textContent = err.message; $("widget-error").hidden = false; $("widget-retry").hidden = !timeClient.pending; }
 async function action(action, fields = {}) {
   if (busy) return;
@@ -64,6 +67,15 @@ function render() {
   const choice = $("widget-fire-choice");
   if (JSON.stringify([...choice.options].map(o => [o.value,o.text])) !== JSON.stringify(model.tasks.map(task => [taskKey(task),task.title]))) choice.replaceChildren(...model.tasks.map(task => new Option(task.title, taskKey(task))));
   choice.hidden = model.tasks.length < 2; choice.value = model.selected;
+  $("widget-ask").hidden = !asking; document.body.dataset.ask = String(asking);
+  if (asking && gap) {
+    const minutes = Math.max(1, Math.floor((Date.now() - gap.since) / 60_000));
+    $("widget-ask-title").textContent = t("Чем занимаешься?");
+    const first = $("widget-ask-choice").options[0];
+    if (first && first.value === "") first.textContent = t("Выбрать · {minutes} мин", {minutes});
+    $("widget-ask-choice").title = t("{minutes} мин без учёта", {minutes});
+    $("widget-tab").title = t("Чем занимаешься?");
+  }
 }
 $("widget-run").onclick = async () => {
   const state = timeClient.state;
@@ -82,6 +94,49 @@ $("widget-switch").onclick = () => native.window_action("bar");
 $("widget-tab").onkeydown = event => {if (["Enter"," "].includes(event.key)) {event.preventDefault(); void native.window_action("card");}};
 installWindowGestures(native, {tab:true, onClick:() => {if(mode === "bar") void native.window_action("card");}});
 window.addEventListener("brainalot-widget-mode", event => setMode(event.detail));
+async function fillAskChoices() {
+  const choice = $("widget-ask-choice");
+  askRefs.clear();
+  const option = (text, value, ref) => { const item = new Option(text, value); if (ref) askRefs.set(value, ref); return item; };
+  const group = (label, tasks) => { const node = document.createElement("optgroup"); node.label = label;
+    node.append(...tasks.map(task => option(task.title, taskKey(task), task))); return node; };
+  const hot = new Map(burning.map(task => [taskKey(task), task]));
+  const events = liveEvents.filter(event => !event.all_day)
+    .map(event => ({source: "calendar", id: eventKey(event), title: event.title || t("Событие")}));
+  const listed = (await sharedApi("/api/time/tasks").catch(() => ({tasks: []}))).tasks
+    .filter(task => task.source === "library" && !hot.has(taskKey(task)))
+    .sort((a, b) => a.title.localeCompare(b.title));
+  const placeholder = option(t("Выбрать…"), ""); placeholder.disabled = true; placeholder.selected = true;
+  const items = [placeholder, option(t("Отдых"), "label:rest", {source: "label", id: "rest", title: t("Отдых")})];
+  if (hot.size) items.push(group(t("Горящие"), [...hot.values()]));
+  if (events.length) items.push(group(t("Сегодня в календаре"), events));
+  if (listed.length) items.push(group(t("Задачи"), listed));
+  items.push(option(t("Спросить позже"), "later"));
+  choice.replaceChildren(...items);
+}
+$("widget-ask-choice").onchange = async () => {
+  const value = $("widget-ask-choice").value;
+  if (!value) return;
+  if (value === "later") { snoozeUntil = Date.now() + 30 * 60_000; asking = false; render(); return; }
+  const since = gap ? Math.floor(gap.since) : Date.now();
+  await action("start", {...timerFields("stopwatch", await getTimePreset()), task: askRefs.get(value) || null, backfill_from: since});
+  if ($("widget-error").hidden) { gap = null; asking = false; }
+  render();
+};
+// Runs even while this window is hidden (timers are then only throttled).
+async function watchUntracked() {
+  if (typeof native.input_idle_ms !== "function") return;
+  try {
+    if (document.hidden) await timeClient.refresh();
+    const now = Date.now();
+    const tracked = timeClient.state?.status === "running" || Boolean(currentEvent(liveEvents, now));
+    const step = untrackedStep(gap, {tracked, idleMs: Number(await native.input_idle_ms()) || 0, now});
+    gap = step.gap;
+    const ask = step.ask && now >= snoozeUntil && !timeClient.pending;
+    if (ask && !asking) await fillAskChoices();
+    if (ask !== asking) { asking = ask; render(); }
+  } catch { /* the next sample retries; the question never blocks the timer */ }
+}
 $("widget-fire-choice").onchange = () => { selectedFire = $("widget-fire-choice").value; void chrome.storage.local.set({"desktop:selected-fire":selectedFire}); render(); };
 chrome.storage.onChanged.addListener(changes => {
   if (localeChange(changes)) void syncLocale().then(render);
@@ -113,3 +168,4 @@ timeClient.subscribe(render);
 setMode((await native.bootstrap()).widget_mode);
 document.addEventListener("visibilitychange", () => {if (!document.hidden) void refresh();});
 void refresh(); setInterval(refresh,5000); setInterval(() => {if (!document.hidden) render();},1000);
+setInterval(watchUntracked, 15_000);
