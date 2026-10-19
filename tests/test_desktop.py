@@ -219,8 +219,8 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     assert host.mode == "bar" and host.widget.width == 82 and host.widget.height == 62
     assert host.widget.x == 1920-82
     host.window_action("card")
-    assert host.mode == "card" and host.widget.height == 154
-    assert host.widget.x == 1920-388
+    assert host.mode == "card" and (host.widget.width, host.widget.height) == (340, 56)
+    assert host.widget.x == 1920-340
     host.window_action("topmost", False)
     assert host.widget.on_top is True and host.full.on_top is True
     host.open_page("work.html")
@@ -231,6 +231,52 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     host.window_action("hide")
     assert host.mode == "bar"
     host.destroy()
+
+
+def test_compact_views_get_rounded_window_shape(tmp_path, monkeypatch):
+    shapes = []
+    original = desktop.set_native_rect
+    monkeypatch.setattr(desktop, "set_native_rect",
+                        lambda window, rect, minimum=None, shape=None: (shapes.append(shape), original(window, rect, minimum)))
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040, "main", 144)])
+    host.create_windows(Webview())
+    host.window_action("card")
+    assert shapes[-1] == {"radius": 22, "side": None}  # 15 CSS px at 150 %
+    host.window_action("bar")
+    assert shapes[-1] == {"radius": 21, "side": "right"}  # square on the stuck screen edge
+    host.window_action("full")
+    assert shapes[-1] is None
+    host.destroy()
+
+
+def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeypatch):
+    state = desktop.DesktopState(tmp_path)
+    state.data["geometry"]["card"] = {"x": 100, "y": 200, "width": 388, "height": 154, "units": "physical", "dpi": 96}
+    state.save()
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
+    rect, minimum = host._rect("card")
+    assert rect == {"x": 100, "y": 200, "width": 340, "height": 56} and minimum == (340, 56)
+
+
+def test_window_region_rounds_corners_and_keeps_tab_edge_square():
+    import ctypes
+    from megamozg import desktop_geometry
+    if not hasattr(ctypes, "WinDLL"):
+        pytest.skip("Windows only")
+    gdi = ctypes.WinDLL("gdi32")
+    gdi.PtInRegion.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+    card = desktop_geometry.window_region(340, 56, 15)
+    tab = desktop_geometry.window_region(82, 62, 14, "right")
+    try:
+        assert not gdi.PtInRegion(card, 0, 0) and not gdi.PtInRegion(card, 339, 55)
+        assert gdi.PtInRegion(card, 170, 0) and gdi.PtInRegion(card, 15, 15)
+        assert not gdi.PtInRegion(tab, 0, 0)  # rounded inner side
+        assert gdi.PtInRegion(tab, 81, 0) and gdi.PtInRegion(tab, 81, 61)  # square screen edge
+    finally:
+        gdi.DeleteObject(card); gdi.DeleteObject(tab)
 
 
 def test_geometry_is_independent_debounced_and_flushed(tmp_path, monkeypatch):

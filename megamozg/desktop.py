@@ -15,9 +15,9 @@ import uuid
 import webbrowser
 
 _log = logging.getLogger("brainalot.desktop")
-WIDGET_SIZES = {"bar": (82, 62), "card": (388, 154)}
+WIDGET_SIZES = {"bar": (82, 62), "card": (340, 56)}  # card: one-row bar, owner's choice 2026-10-19
 FULL_SIZE = (1120, 760)
-MINIMUM_SIZES = {"full": (700, 480), "card": (340, 144), "bar": (82, 62)}
+MINIMUM_SIZES = {"full": (700, 480), "card": (340, 56), "bar": (82, 62)}
 STORAGE_FILE = "desktop-ui.json"
 
 
@@ -225,7 +225,8 @@ class DesktopHost:
             # are only clamped (multiplying an absolute origin breaks mixed DPI).
             saved["width"] = round(saved.get("width", default[0]) * scale)
             saved["height"] = round(saved.get("height", default[1]) * scale)
-        if mode == "bar":
+        if mode in WIDGET_SIZES:
+            # Compact views have a fixed size; only their position is remembered.
             saved.update(width=size[0], height=size[1])
         if anchor:
             saved["x"] = area.x if self.side == "left" else area.x+area.width-saved.get("width", size[0])
@@ -318,12 +319,20 @@ class DesktopHost:
             window.show()
             window.restore()
 
+    def _shape(self, mode, rect):
+        """Window region matching the page's rounded surface (widget.css radii)."""
+        if mode == "full":
+            return None
+        dpi = select_area(rect, self._areas()).dpi
+        return {"radius": round((14 if mode == "bar" else 15) * dpi / 96),
+                "side": self.side if mode == "bar" else None}
+
     def _restore_geometry(self):
         self._switching = True
         try:
             for mode, window in (("full", self.full), (self.widget_mode, self.widget)):
                 rect, minimum = self._rect(mode)
-                set_native_rect(window, rect, minimum)
+                set_native_rect(window, rect, minimum, self._shape(mode, rect))
         finally:
             self._switching = False
 
@@ -336,7 +345,7 @@ class DesktopHost:
             if self._topology is not None and topology != self._topology:
                 window = self.full if self.mode == "full" else self.widget
                 rect, minimum = self._rect(self.mode)
-                set_native_rect(window, rect, minimum)
+                set_native_rect(window, rect, minimum, self._shape(self.mode, rect))
                 self._remember_geometry(window, "full" if self.mode == "full" else "widget")
             self._topology = topology
             self._topology_timer = threading.Timer(2, self._watch_topology)
@@ -386,7 +395,9 @@ class DesktopHost:
                         self.state.data["side"] = self.side
                     rect = fit_geometry(rect, self._areas(), WIDGET_SIZES.get(self.mode, FULL_SIZE),
                                         side=self.side if self.mode == "bar" else None)
-                set_native_rect(window, rect)
+                # The end of a drag may change DPI or the tab side: reshape then.
+                set_native_rect(window, rect, None,
+                                self._shape(self.mode, rect) if action == "gesture_end" else None)
             if action == "gesture_end":
                 self._drag = None
                 self._remember_geometry(window, "full" if self.mode == "full" else "widget")
@@ -426,7 +437,7 @@ class DesktopHost:
                                                     + "{detail:" + json.dumps(action) + "}))")
                     self.mode = action
                     rect, minimum = self._rect(action, anchor)
-                    set_native_rect(target, rect, minimum)
+                    set_native_rect(target, rect, minimum, self._shape(action, rect))
                     self._show(target)  # show before hiding the old surface
                     (self.widget if action == "full" else self.full).hide()
                     self.state.data.update(last_mode=action, topmost=True, side=self.side)

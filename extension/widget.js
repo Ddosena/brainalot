@@ -1,7 +1,6 @@
 import { native } from "./desktop-platform.js";
 import { timeClient, sharedApi, elapsedAt, formatTime, getTimePreset, timerFields } from "./time-client.js";
 import { applyDocument, syncLocale, localeChange, t } from "./i18n.js";
-import { createFireLayer } from "./fire-layer.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { compactTasks, taskKey, resolveActiveTask } from "./widget-model.js";
 import { installWindowGestures } from "./desktop-gestures.js";
@@ -12,16 +11,17 @@ let mode = bootstrap.widget_mode === "card" ? "card" : "bar";
 function setMode(value) { mode = value === "card" ? "card" : "bar"; document.body.dataset.widgetMode = mode; render(); }
 document.body.dataset.side = bootstrap.side || "right";
 document.body.dataset.widgetMode = mode;
-const fire = createFireLayer($("widget-fire"));
 let burning = [], selectedFire = (await chrome.storage.local.get("desktop:selected-fire"))["desktop:selected-fire"] || "";
 let selectedMode = null, refreshing = false, busy = false, catalogReady = false;
 let liveNotes = [], liveEvents = [];
-let pendingNotice = false;
-function error(err) { pendingNotice = false; $("widget-error").textContent = err.message; $("widget-error").hidden = false; $("widget-retry").hidden = !timeClient.pending; }
+// Owners of the visible notice: a failed background poll clears on the next healthy
+// poll; an error of the user's own action stays until the next action or retry.
+let pendingNotice = false, pollNotice = false;
+function error(err, {poll = false} = {}) { pendingNotice = false; pollNotice = poll; $("widget-error").textContent = err.message; $("widget-error").hidden = false; $("widget-retry").hidden = !timeClient.pending; }
 async function action(action, fields = {}) {
   if (busy) return;
   busy = true; render();
-  try { await timeClient.command(action, fields); $("widget-error").hidden = true; $("widget-retry").hidden = true; }
+  try { await timeClient.command(action, fields); $("widget-error").hidden = true; $("widget-retry").hidden = true; pollNotice = false; }
   catch (err) { error(err); }
   finally { busy = false; render(); }
 }
@@ -50,10 +50,13 @@ function render() {
   $("widget-run-icon").setAttribute("d", state?.status === "running" ? "M7 5h4v14H7zM14 5h4v14h-4z" : "m9 5 10 7-10 7z");
   $("widget-run").disabled = busy || !state || Boolean(timeClient.pending);
   $("widget-stop").disabled = busy || !["running","paused"].includes(state?.status) || Boolean(timeClient.pending);
-  $("widget-mode").textContent = (selectedMode || state?.mode) === "stopwatch" ? t("Секундомер") : state?.mode === "break" && !selectedMode ? t("Перерыв") : "Pomodoro";
+  const modeKind = (selectedMode || state?.mode) === "stopwatch" ? "stopwatch" : state?.mode === "break" && !selectedMode ? "break" : "pomodoro";
+  const modeName = modeKind === "stopwatch" ? t("Секундомер") : modeKind === "break" ? t("Перерыв") : "Pomodoro";
+  const modeLabel = t("Режим: {mode}. Переключить", {mode: modeName});
+  $("widget-mode").textContent = modeName; $("widget-mode").dataset.kind = modeKind;
+  $("widget-mode").title = modeLabel; $("widget-mode").setAttribute("aria-label", modeLabel);
   const title = model.hot?.title || model.current?.title || t("Нет горящих заданий");
   $("widget-burning").textContent = title; $("widget-burning").title = title;
-  if (model.hot) $("widget-burning").dataset.fireKey = taskKey(model.hot); else delete $("widget-burning").dataset.fireKey;
   $("widget-burning").classList.toggle("is-critical", Boolean(model.hot));
   $("widget-current").hidden = !model.hot || model.same || !model.current;
   $("widget-current").textContent = model.current ? `${t("Сейчас")}: ${model.current.title}` : "";
@@ -61,7 +64,6 @@ function render() {
   const choice = $("widget-fire-choice");
   if (JSON.stringify([...choice.options].map(o => [o.value,o.text])) !== JSON.stringify(model.tasks.map(task => [taskKey(task),task.title]))) choice.replaceChildren(...model.tasks.map(task => new Option(task.title, taskKey(task))));
   choice.hidden = model.tasks.length < 2; choice.value = model.selected;
-  fire.schedule();
 }
 $("widget-run").onclick = async () => {
   const state = timeClient.state;
@@ -74,7 +76,7 @@ $("widget-run").onclick = async () => {
 };
 $("widget-stop").onclick = () => action("stop");
 $("widget-mode").onclick = () => { selectedMode = (selectedMode || timeClient.state?.mode) === "stopwatch" ? "pomodoro" : "stopwatch"; render(); };
-$("widget-retry").onclick = async () => { try {await timeClient.retry(); $("widget-error").hidden = true; $("widget-retry").hidden = true; render();} catch(err) {error(err);} };
+$("widget-retry").onclick = async () => { try {await timeClient.retry(); $("widget-error").hidden = true; $("widget-retry").hidden = true; pollNotice = false; render();} catch(err) {error(err);} };
 $("widget-open").onclick = () => native.window_action("full");
 $("widget-switch").onclick = () => native.window_action("bar");
 $("widget-tab").onkeydown = event => {if (["Enter"," "].includes(event.key)) {event.preventDefault(); void native.window_action("card");}};
@@ -100,9 +102,11 @@ async function refresh() {
     liveEvents = calendar.events || [];
     for (const event of calendar.events || []) if (calendarImportanceLevel(prefs["panel:calendar-importance"], event) === "critical") burning.push({source:"calendar", id:`${event.calendar_id}:${event.occurrence_id || event.id}`, title:event.title});
     catalogReady = true;
-    const before = selectedFire; render();
+    const before = selectedFire;
+    if (pollNotice) { $("widget-error").hidden = true; $("widget-error").textContent = ""; pollNotice = false; }
+    render();
     if (selectedFire !== before) void chrome.storage.local.set({"desktop:selected-fire":selectedFire});
-  } catch (err) { error(err); }
+  } catch (err) { error(err, {poll: true}); }
   finally { refreshing = false; }
 }
 timeClient.subscribe(render);

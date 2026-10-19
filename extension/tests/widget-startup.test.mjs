@@ -88,6 +88,14 @@ test('recovered pending command has retry after reload and clears only its notic
   assert.equal(nodes.get('widget-error').textContent,'Actual network failure');
   timeClient.pending=null;
   await intervals[0]();
+  // A failed background poll belongs to polling: the next healthy poll clears it.
+  assert.equal(nodes.get('widget-error').hidden,true);
+  assert.equal(nodes.get('widget-error').textContent,'');
+  // An error of the user's own action survives healthy polls.
+  timeClient.command=async()=>{throw new Error('Save rejected');};
+  await nodes.get('widget-run').onclick();
+  assert.equal(nodes.get('widget-error').textContent,'Save rejected');
+  await intervals[0]();
   assert.equal(nodes.get('widget-error').hidden,false);
-  assert.equal(nodes.get('widget-error').textContent,'Actual network failure');
+  assert.equal(nodes.get('widget-error').textContent,'Save rejected');
 });

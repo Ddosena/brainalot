@@ -12,6 +12,7 @@ import os
 from contextlib import contextmanager
 
 _USER32 = None
+_GDI32 = None
 
 
 def _user32():
@@ -21,6 +22,37 @@ def _user32():
     if _USER32 is None:
         _USER32 = ctypes.WinDLL("user32")
     return _USER32
+
+
+def _gdi32():
+    global _GDI32
+    if _GDI32 is None:
+        gdi = ctypes.WinDLL("gdi32")
+        gdi.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+        gdi.CreateRoundRectRgn.restype = wintypes.HRGN
+        gdi.CreateRectRgn.argtypes = [ctypes.c_int] * 4
+        gdi.CreateRectRgn.restype = wintypes.HRGN
+        gdi.CombineRgn.argtypes = [wintypes.HRGN, wintypes.HRGN, wintypes.HRGN, ctypes.c_int]
+        gdi.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        _GDI32 = gdi
+    return _GDI32
+
+
+def window_region(width, height, radius, side=None):
+    """Rounded window shape in physical pixels (Windows 10 has no DWM corners).
+
+    A side tab keeps square corners on the screen edge it sticks to. The
+    caller passes the region to SetWindowRgn, which then owns it.
+    """
+    gdi = _gdi32()
+    region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, 2 * radius, 2 * radius)
+    if side in {"left", "right"}:
+        half = (width + 1) // 2
+        x = 0 if side == "left" else width - half
+        square = gdi.CreateRectRgn(x, 0, x + half, height)
+        gdi.CombineRgn(region, region, square, 2)  # RGN_OR
+        gdi.DeleteObject(square)
+    return region
 
 
 def enable_thread_dpi():
@@ -166,7 +198,10 @@ def native_rect(window):
     return {"x": int(window.x), "y": int(window.y), "width": int(window.width), "height": int(window.height)}
 
 
-def set_native_rect(window, rect, minimum=None):
+def set_native_rect(window, rect, minimum=None, shape=None):
+    """Move/resize without activation. ``shape`` ({"radius", "side"}) also clips
+    the window to the rounded surface the page draws, so no square corner of
+    the WebView background shows around it."""
     native = getattr(window, "native", None)
     if native is not None and hasattr(native, "Invoke"):
         from System import Action
@@ -174,12 +209,22 @@ def set_native_rect(window, rect, minimum=None):
         user = _user32()
         user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                       ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
         def update():
             if minimum:
                 native.MinimumSize = Size(*minimum)
+            hwnd = int(native.Handle.ToInt64())
             # HWND_TOPMOST + NOACTIVATE. Updating geometry never steals focus.
-            user.SetWindowPos(int(native.Handle.ToInt64()), -1, rect["x"], rect["y"],
-                              rect["width"], rect["height"], 0x0010)
+            user.SetWindowPos(hwnd, -1, rect["x"], rect["y"], rect["width"], rect["height"], 0x0010)
+            if shape:
+                # The actual size: WinForms may still clamp to MinimumSize.
+                actual = wintypes.RECT()
+                user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+                user.GetWindowRect(hwnd, ctypes.byref(actual))
+                region = window_region(actual.right-actual.left, actual.bottom-actual.top,
+                                       shape["radius"], shape.get("side"))
+                if not user.SetWindowRgn(hwnd, region, True):
+                    _gdi32().DeleteObject(region)
         native.Invoke(Action(update))
     else:
         window.resize(rect["width"], rect["height"])
