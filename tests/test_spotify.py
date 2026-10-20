@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -231,6 +232,60 @@ def test_transport_rejects_bad_sequence_and_reaps_child(monkeypatch):
         bridge.close()
 
 
+def run_harness(command, payload, phase_path, *, startup_seconds=45, protocol_seconds=10):
+    """Budget cold Windows/WinRT startup separately from the fake RPC loop.
+
+    The child declares readiness after type loading and selector checks, before
+    it reads stdin. Phase evidence survives even when startup itself stalls.
+    This changes only the test host budget; production RPC deadlines stay fixed.
+    """
+    started = time.monotonic()
+    with subprocess.Popen(command, encoding="utf-8", stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+        stage = "startup"
+        try:
+            while process.poll() is None:
+                phases = phase_path.read_text(encoding="utf-8") if phase_path.exists() else ""
+                if "ready" in phases.splitlines():
+                    break
+                if time.monotonic() - started >= startup_seconds:
+                    raise subprocess.TimeoutExpired(command, startup_seconds)
+                time.sleep(0.02)
+            stage = "protocol" if process.poll() is None else "early-exit"
+            stdout, stderr = process.communicate(payload, timeout=protocol_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            phases = phase_path.read_text(encoding="utf-8") if phase_path.exists() else "<not started>"
+            pytest.fail(
+                f"PowerShell fake-session harness {stage} timeout after "
+                f"{time.monotonic() - started:.2f}s; phases={phases[-3000:]!r}; "
+                f"stdout={stdout[-4000:]!r}; stderr={stderr[-4000:]!r}",
+                pytrace=False,
+            )
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def test_harness_startup_timeout_reports_phase_and_reaps_process(tmp_path):
+    phase = tmp_path / "phase.txt"
+    # A child that never declares readiness must exhaust only the startup budget.
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    with pytest.raises(pytest.fail.Exception, match="startup timeout"):
+        run_harness(command, "", phase, startup_seconds=0.05)
+
+
+def test_harness_protocol_timeout_reports_partial_output(tmp_path):
+    phase = tmp_path / "phase.txt"
+    source = ("import pathlib,sys,time; "
+              "pathlib.Path(sys.argv[1]).write_text('ready\\n', encoding='utf-8'); "
+              "print('partial-response',flush=True); "
+              "print('protocol-phase',file=sys.stderr,flush=True); time.sleep(30)")
+    with pytest.raises(pytest.fail.Exception, match="protocol timeout.*partial-response.*protocol-phase"):
+        run_harness([sys.executable, "-u", "-c", source, str(phase)], "", phase,
+                    protocol_seconds=0.05)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell WinRT helper")
 def test_real_powershell_helper_routes_fake_session_commands(tmp_path):
     # Execute the shipping routing loop with an entirely fake session. The
@@ -238,10 +293,18 @@ def test_real_powershell_helper_routes_fake_session_commands(tmp_path):
     # the loop executes, so no live manager or media command can be reached.
     helper = Path(__file__).parents[1] / "megamozg" / "spotify_bridge.ps1"
     harness = tmp_path / "spotify-fake.ps1"
+    phase = tmp_path / "spotify-fake.phases"
     harness.write_text(r'''
+$script:PhasePath = $args[1]
+function Trace-HarnessPhase([string]$Phase) {
+    [IO.File]::AppendAllText($script:PhasePath, $Phase + [Environment]::NewLine)
+}
+Trace-HarnessPhase 'started'
 $source = [IO.File]::ReadAllText($args[0])
 $split = $source.IndexOf('while ($null -ne ($line = [Console]::ReadLine()))')
+if ($split -lt 0) { throw 'Shipping helper routing loop not found' }
 Invoke-Expression $source.Substring(0, $split)
+Trace-HarnessPhase 'winrt-initialized'
 $script:Calls = New-Object 'System.Collections.Generic.List[string]'
 $script:Fake = [PSCustomObject]@{SourceAppUserModelId='Spotify.exe'}
 $script:Controls = [PSCustomObject]@{IsPreviousEnabled=$true;IsNextEnabled=$true;IsPlayPauseToggleEnabled=$true;IsShuffleEnabled=$true;IsRepeatEnabled=$true}
@@ -262,12 +325,16 @@ $script:Manager | Add-Member ScriptMethod GetSessions { return $script:Selection
 if ((Get-SpotifySession).SourceAppUserModelId -ne 'Spotify.exe') { throw 'Wrong media source selected' }
 $script:Selection = @($script:Browser)
 if ($null -ne (Get-SpotifySession)) { throw 'Browser session was not excluded' }
+Trace-HarnessPhase 'selector-checked'
 function Get-SpotifySession {
+    Trace-HarnessPhase "request:$($request.id)"
     $script:Controls.IsRepeatEnabled = $request.id -ne 9
     return $script:Fake
 }
 function Await-WinRT($Operation, [Type]$ResultType) { return $Operation }
+Trace-HarnessPhase 'ready'
 Invoke-Expression $source.Substring($split)
+Trace-HarnessPhase 'routing-complete'
 [Console]::WriteLine((@{calls=@($script:Calls)} | ConvertTo-Json -Compress))
 ''', encoding="utf-8-sig")
     requests = [("snapshot", None), ("previous", None), ("play_pause", None), ("next", None),
@@ -275,11 +342,10 @@ Invoke-Expression $source.Substring($split)
                 ("repeat", "track"), ("shuffle", "invalid"), ("unknown", None)]
     payload = "".join(json.dumps({"id": i, "action": action, "value": value}) + "\n"
                       for i, (action, value) in enumerate(requests))
-    result = subprocess.run(
+    result = run_harness(
         [str(Path(__import__('os').environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'),
-         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(harness), str(helper)],
-        input=payload, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(harness), str(helper), str(phase)],
+        payload, phase,
     )
     assert result.returncode == 0, result.stderr
     lines = [json.loads(line) for line in result.stdout.splitlines()]
