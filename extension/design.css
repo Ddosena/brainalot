@@ -358,6 +358,8 @@ html[data-design] .library-project-title,html[data-design] .rotation-title{font-
 body.adaptive-panel{zoom:var(--panel-scale,1);height:calc(100dvh / var(--panel-scale,1));min-height:0;min-width:0}
 body.adaptive-panel .focus-panel,body.adaptive-panel .appearance-panel{max-width:100%;max-height:calc(82dvh / var(--panel-scale,1));overflow:auto}
 body.adaptive-panel .image-viewer{width:calc(100vw / var(--panel-scale,1));height:calc(100dvh / var(--panel-scale,1))}
+body.adaptive-panel{overflow-x:hidden;overflow-wrap:anywhere}
+body.adaptive-panel :is(input,select,textarea){max-width:100%;min-width:0}
 body.adaptive-panel input,body.adaptive-panel select,body.adaptive-panel textarea{max-width:100%}
 body.adaptive-panel .note-heading{min-width:0}
 body.adaptive-panel .task-details,body.adaptive-panel .library-details{min-width:0}

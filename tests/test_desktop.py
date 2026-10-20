@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -216,11 +217,11 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     host.create_windows(Webview())
     assert host.full.on_top and host.widget.on_top
     host.window_action("bar")
-    assert host.mode == "bar" and host.widget.width == 82 and host.widget.height == 62
-    assert host.widget.x == 1920-82
+    assert host.mode == "bar" and host.widget.width == 84 and host.widget.height == 48
+    assert host.widget.x == 1920-84
     host.window_action("card")
-    assert host.mode == "card" and (host.widget.width, host.widget.height) == (340, 56)
-    assert host.widget.x == 1920-340
+    assert host.mode == "card" and (host.widget.width, host.widget.height) == (360, 64)
+    assert host.widget.x == 1920-360
     host.window_action("topmost", False)
     assert host.widget.on_top is True and host.full.on_top is True
     host.open_page("work.html")
@@ -240,7 +241,7 @@ def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeyp
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     rect, minimum = host._rect("card")
-    assert rect == {"x": 100, "y": 200, "width": 340, "height": 56} and minimum == (340, 56)
+    assert rect == {"x": 100, "y": 200, "width": 360, "height": 64} and minimum == (360, 64)
 
 
 def test_geometry_is_independent_debounced_and_flushed(tmp_path, monkeypatch):
@@ -286,6 +287,117 @@ def test_drag_threshold_and_side_snap_do_not_command_time(tmp_path, monkeypatch)
     assert host.window_action("gesture_end")["dragged"] is True
     assert host.widget.x == -1600 and host.side == "left"
     host.destroy()
+
+
+@pytest.mark.parametrize("side,position", [("left", (0, 300)), ("right", (916, 300)),
+                                         ("top", (420, 0)), ("bottom", (420, 752))])
+def test_four_edge_snap_and_inward_card_preserve_position(tmp_path, monkeypatch, side, position):
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1000, 800)])
+    host.create_windows(Webview()); host.window_action("bar")
+    host.widget.move(*position)
+    cursor = [(100, 100)]
+    monkeypatch.setattr(desktop, "cursor_position", lambda: cursor[0])
+    host.window_action("gesture_begin")
+    cursor[0] = (107, 100)
+    host.window_action("gesture_end")
+    assert host.side == side
+    anchor = desktop.native_rect(host.widget)
+    host.window_action("card")
+    card = desktop.native_rect(host.widget)
+    assert 0 <= card["x"] <= 1000-card["width"] and 0 <= card["y"] <= 800-card["height"]
+    if side in {"top", "bottom"}: assert card["x"] == anchor["x"]
+    if side in {"left", "right"}: assert card["y"] == anchor["y"]
+    if side == "bottom": assert card["y"]+card["height"] == 800
+    if side == "right": assert card["x"]+card["width"] == 1000
+    host.destroy()
+    assert desktop.DesktopHost(tmp_path, 8780, "test", lambda: True).side == side
+
+
+@pytest.mark.parametrize("side,y,above", [("top", 0, False), ("bottom", 736, True),
+                                       ("right", 650, True), ("left", 100, False)])
+def test_popup_geometry_does_not_persist_temporary_height(tmp_path, monkeypatch, side, y, above):
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1000, 800)])
+    host.create_windows(Webview()); host.window_action("card")
+    host.side = side
+    host.widget.move(200, y)
+    base = desktop.native_rect(host.widget)
+    opened = host.window_action("widget_popup", {"open": True, "height": 360})
+    assert opened == {"ok": True, "height": 360, "popup_above": above}
+    host._remember_geometry(host.widget, "widget")
+    assert host.state.data["geometry"]["card"]["height"] == 64
+    assert host.state.data["geometry"]["card"]["y"] == y
+    rect = desktop.native_rect(host.widget)
+    assert rect["y"]+rect["height"] == y+64 if above else rect["y"] == y
+    host.window_action("widget_popup", {"open": False})
+    assert desktop.native_rect(host.widget) == base
+    host.destroy()
+
+
+def test_popup_limits_to_workarea_and_mode_switch_restores_base(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(-1400, -200, 1400, 900, dpi=144)])
+    host.create_windows(Webview()); host.window_action("card")
+    host.side = "bottom"; host.widget.move(-700, 604)
+    result = host.window_action("widget_popup", {"open": True, "height": 5000})
+    assert result == {"ok": True, "popup_above": True, "height": 600}
+    assert desktop.native_rect(host.widget)["y"] == -200
+    host.window_action("bar")
+    assert host._popup_base is None
+    assert host.state.data["geometry"]["card"]["height"] == 96
+    assert host.state.data["geometry"]["card"]["y"] == 604
+    assert (host.widget.width, host.widget.height) == (126, 72)
+    host.destroy()
+
+
+def test_full_window_minimum_and_bootstrap_system_double_click(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
+    host.create_windows(Webview())
+    host.state.data["geometry"]["full"] = {"width": 1, "height": 1}
+    assert host._rect("full")[0]["width"] == 300
+    assert host._rect("full")[0]["height"] == 360
+    settings = desktop.DesktopBridge(host).bootstrap()["double_click"]
+    assert settings["interval_ms"] > 0 and settings["width"] > 0 and settings["height"] > 0
+    host.destroy()
+
+
+def test_compact_cpu_surface_routes_buttons_keyboard_and_passive_double_clicks(monkeypatch):
+    """Exercise application routing without creating or synthesizing OS input."""
+    surface = desktop.CompactSurface.__new__(desktop.CompactSurface)
+    calls, scripts = [], []
+    surface.host = SimpleNamespace(mode="card", _areas=lambda:[desktop.WorkArea(0,0,1920,1080,dpi=144)])
+    def action(name):
+        calls.append(name)
+        if name in {"card","bar","full"}: surface.host.mode = name
+        return {"ok":True,"dragged":False}
+    surface.host.window_action = action
+    surface.window = SimpleNamespace(x=10,y=10,width=540,height=96)
+    surface.last_click = None; surface.focus_id = None; surface.closed = False
+    surface._js = lambda script: scripts.append(script)
+    surface._schedule = lambda *_args: None
+    surface.boxes = [{"id":control,"x":index*30,"y":0,"w":28,"h":28}
+                     for index,control in enumerate(("widget-task","widget-run","widget-more"))]
+    surface._input = queue.Queue()
+    def up(at, **fields):
+        surface._input.put(("up",{"button":0,"id":None,"up_id":None,"moved":False,"x":10,"y":10,"at":at,**fields}))
+    up(0); up(.2, x=12)  # Windows 4px double-click width at 150% DPI permits 3px.
+    up(1,button=2); up(1.2,button=2)
+    up(2,id="widget-run",up_id="widget-run")
+    up(3,id="widget-more",up_id="widget-more",moved=True)
+    surface._input.put(("key",{"key":"Tab","shift":False}))
+    surface._input.put(("key",{"key":"Tab","shift":False}))
+    surface._input.put(("key",{"key":"Return","shift":False}))
+    surface._input.put(("close",None))
+    monkeypatch.setattr(desktop,"double_click_settings",lambda:{"interval_ms":500,"width":4,"height":4})
+    surface._inputs()
+    assert calls.count("bar") == 1 and calls.count("full") == 1
+    assert len([script for script in scripts if '"widget-run")?.click()' in script]) == 2
+    assert not any('"widget-more")?.click()' in script for script in scripts)
+    assert surface.focus_id == "widget-run"
+    surface.boxes = [{"id":"widget-tab","x":0,"y":0,"w":84,"h":48}]
+    assert surface._hit(10,10) is None  # A tab is passive for the mouse: single click must not expand.
 
 
 def test_quit_failure_keeps_current_visible_state(tmp_path, monkeypatch):

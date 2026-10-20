@@ -347,7 +347,7 @@ def test_disconnected_oauth_keeps_api_cache_until_fresher_ical(tmp_path, monkeyp
         assert not second["stale"] and second["error"] is None
         assert any(event["title"] == "Conference" for event in second["events"])
     else:
-        assert second["events"] == first["events"]
+        assert second["events"] == [{**event, "time_skipped": False} for event in first["events"]]
         assert second["stale"] and second["error"]
 
     # A cached week must never masquerade as coverage of a different week.
@@ -538,9 +538,15 @@ def test_timed_calendar_events_fill_the_day_summary_and_can_be_marked_did_not_ha
 
     skip = {"request_id": "skip-1", "id": lesson["task"]["id"], "skipped": True}
     assert client.post("/api/time/calendar-skip", json=skip, headers=auth).json() == {"id": lesson["task"]["id"], "skipped": True}
+    def calendar_lesson():
+        response = client.get("/api/calendar/events?start=2026-09-21&end=2026-09-21", headers=auth)
+        assert response.status_code == 200
+        return next(event for event in response.json()["events"] if event["title"] == "Student lesson")
+    assert calendar_lesson()["time_skipped"] is True
     report = summary()
     assert report["rows"] == [] and report["skipped"] == [{"id": lesson["task"]["id"], "title": "Student lesson"}]
     client.post("/api/time/calendar-skip", json={**skip, "request_id": "skip-2", "skipped": False}, headers=auth)
+    assert calendar_lesson()["time_skipped"] is False
     assert summary()["rows"][0]["calendar_ms"] == 3_600_000
     # Opening the stopwatch picker still reads the same cache without network.
     tasks = client.get("/api/time/tasks?q=lesson", headers=auth).json()["tasks"]

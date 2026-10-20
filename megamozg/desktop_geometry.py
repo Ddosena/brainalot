@@ -14,6 +14,14 @@ from contextlib import contextmanager
 _USER32 = None
 
 
+class _MonitorInfo(ctypes.Structure):
+    # A stable type is essential: multiple renderer/bridge threads enumerate
+    # monitors concurrently and share our private function's argtypes.
+    _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                ("work", wintypes.RECT), ("flags", wintypes.DWORD),
+                ("device", wintypes.WCHAR * 32)]
+
+
 def _user32():
     """Private user32 handle. Its argtypes must not leak into the shared
     ctypes.windll.user32: pywebview's own move() passes None for sizes."""
@@ -69,10 +77,6 @@ class WorkArea:
 
 def work_areas(fallback=()):
     if os.name == "nt":
-        class Info(ctypes.Structure):
-            _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
-                        ("work", wintypes.RECT), ("flags", wintypes.DWORD),
-                        ("device", wintypes.WCHAR * 32)]
         user = _user32()
         old = None
         try:
@@ -86,7 +90,7 @@ def work_areas(fallback=()):
         callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE,
                                            wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
         def collect(monitor, *_):
-            info = Info()
+            info = _MonitorInfo()
             info.size = ctypes.sizeof(info)
             if user.GetMonitorInfoW(monitor, ctypes.byref(info)):
                 dpi = 96
@@ -106,7 +110,7 @@ def work_areas(fallback=()):
                                        info.device, dpi))
             return True
         try:
-            user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Info)]
+            user.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MonitorInfo)]
             user.EnumDisplayMonitors(None, None, callback_type(collect), 0)
         finally:
             if old:
@@ -149,9 +153,48 @@ def fit_geometry(rect, areas, default, minimum=(1, 1), side=None):
         x = area.x
     elif side == "right":
         x = area.x+area.width-width
+    elif side == "top":
+        y = area.y
+    elif side == "bottom":
+        y = area.y+area.height-height
     return {"x": max(area.x, min(x, area.x+area.width-width)),
             "y": max(area.y, min(y, area.y+area.height-height)),
             "width": width, "height": height}
+
+
+def nearest_edge(rect, area):
+    """Distance to the four work-area edges, preserving stable tie order."""
+    distances = {"left": max(0, rect["x"]-area.x),
+                "right": max(0, area.x+area.width-rect["x"]-rect["width"]),
+                "top": max(0, rect["y"]-area.y),
+                "bottom": max(0, area.y+area.height-rect["y"]-rect["height"])}
+    return min(distances, key=distances.get)
+
+
+def popup_geometry(base, area, height, side):
+    """Grow vertically inward, keeping the original card at its screen position."""
+    height = min(area.height, max(base["height"], int(height)))
+    below = area.y+area.height-base["y"]
+    above = base["y"]+base["height"]-area.y
+    popup_above = side == "bottom" or (side != "top" and height > below and above > below)
+    available = above if popup_above else below
+    height = min(height, max(base["height"], available))
+    return {**base, "height": height,
+            "y": base["y"]+base["height"]-height if popup_above else base["y"]}, popup_above
+
+
+def double_click_settings(dpi=96):
+    """Windows preferences, in CSS/logical pixels for the current WebView."""
+    if os.name != "nt":
+        return {"interval_ms": 500, "width": 4, "height": 4}
+    user = _user32()
+    with physical_context():
+        try:
+            metric = lambda code: user.GetSystemMetricsForDpi(code, 96)
+            width, height = metric(36), metric(37)
+        except AttributeError:
+            width, height = (round(user.GetSystemMetrics(code)*96/max(96, dpi)) for code in (36, 37))
+        return {"interval_ms": int(user.GetDoubleClickTime()), "width": max(2, width), "height": max(2, height)}
 
 
 def native_rect(window):

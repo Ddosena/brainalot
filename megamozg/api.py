@@ -452,7 +452,15 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
         except ValueError as exc:
             raise ValidationError("Даты календаря должны быть YYYY-MM-DD") from exc
         direct_api = google_calendar if google_calendar.status()["authorized"] else None
-        return calendar.events(first, last, force=force, google_calendar=direct_api)
+        result = calendar.events(first, last, force=force, google_calendar=direct_api)
+        # Keep the activity prompt consistent with "did not happen" in the time
+        # summary. Enrich the response, never the calendar's cached source data.
+        skipped = set(timer.calendar_skips())
+        return {**result, "events": [
+            {**event, "time_skipped":
+             f"{event['calendar_id']}:{event.get('occurrence_id') or event['id']}" in skipped}
+            for event in result["events"]
+        ]}
 
     @app.patch("/api/calendar/events/{event_id}")
     async def move_calendar_event(event_id: str, request: Request):

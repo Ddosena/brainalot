@@ -2637,10 +2637,12 @@ void chrome.storage.local.get(IGNITION_SOUND_KEY).then(saved => {
 void initializeLibraryView().catch(error => showLibraryWindowError(error.message || t("Не удалось восстановить библиотеку.")));
 void refresh();
 
-// A bounded curve uses both viewport dimensions. Narrow/short windows retain reflow and scroll.
+// Width determines type density; height only adds a small bounded correction.
+// The 88% floor keeps narrow desktop/Chrome panels readable and scrollable.
 function applyPanelScale() {
-  const density = Math.sqrt((window.innerWidth / 400) * (window.innerHeight / 900));
-  const scale = Math.max(.88, Math.min(1.18, Math.pow(density, .18)));
+  const widthScale = Math.pow(window.innerWidth / 440, .24);
+  const heightScale = Math.max(.97, Math.min(1.03, Math.pow(window.innerHeight / 800, .04)));
+  const scale = Math.max(.88, Math.min(1.18, widthScale * heightScale));
   document.documentElement.style.setProperty("--panel-scale", scale.toFixed(4));
   document.body.classList.add("adaptive-panel");
 }

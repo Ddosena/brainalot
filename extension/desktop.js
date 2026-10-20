@@ -1,7 +1,7 @@
 import { native } from "./desktop-platform.js";
 import { installWindowGestures } from "./desktop-gestures.js";
-import { timeClient, sharedApi } from "./time-client.js";
-import { resolveActiveTask } from "./widget-model.js";
+import { timeClient, sharedApi, elapsedAt } from "./time-client.js";
+import { resolveActiveTask, timerProgress } from "./widget-model.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { WORK_ENABLED } from "./work-availability.js";
 await import("./background.js");
@@ -23,7 +23,20 @@ function show(view) {
 show(new URLSearchParams(location.search).get("view") || "day");
 document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => show(button.dataset.view));
 window.addEventListener("brainalot-view", event => show(event.detail));
-installWindowGestures(native);
+const bootstrap = await native.bootstrap();
+installWindowGestures(native, {doubleClick: bootstrap.double_click,
+  onDoubleClick: () => void native.window_action("card")});
+function renderProgress() {
+  const progress = timerProgress(timeClient.state, elapsedAt(timeClient.state));
+  const bar = document.getElementById("desktop-progress");
+  bar.hidden = progress === null;
+  bar.querySelector("span").style.width = `${progress ?? 0}%`;
+}
+timeClient.subscribe(renderProgress);
+renderProgress();
+setInterval(() => { if (!document.hidden) renderProgress(); }, 1000);
+setInterval(() => { if (!document.hidden) void timeClient.refresh().catch(() => {}); }, 5000);
+void timeClient.refresh().catch(() => {});
 const showError = error => { const el=document.getElementById("desktop-error"); el.textContent=error.message; el.hidden=false; };
 document.getElementById("desktop-compact").onclick = async () => {
   try {

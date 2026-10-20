@@ -218,9 +218,15 @@ def run(root: Path) -> int:
                     if preset != handshake.get("preset", {"work_ms":2400000,"break_ms":600000}):
                         raise RuntimeError(f"Native shared preset mismatch: {preset}")
                 else:
+                    # The compact Play control deliberately waits for a selected
+                    # real task. Seed through the public API, including on restart.
+                    smoke_task = _request(port, token, "/api/captures", {
+                        "text": "Desktop smoke task", "title": "Desktop smoke task", "kind": "task",
+                        "source": "desktop-smoke", "external_id": "desktop-smoke-current-task"})
                     running = _request(port, token, "/api/time/command", {
                         "request_id": str(uuid.uuid4()), "expected_revision": state["revision"],
-                        "action": "start", "mode": "stopwatch", "task": None})
+                        "action": "start", "mode": "stopwatch", "task": {
+                            "source": "library", "id": smoke_task["id"], "title": smoke_task["title"]}})
                     report["time_start"] = running["status"]
                 for mode in ("bar", "card"):
                     host.window_action(mode)
@@ -237,8 +243,8 @@ def run(root: Path) -> int:
                     data = _until(lambda: (s if (s := snapshot_widget()).get("mode") == mode
                                            and s.get("run") == "Пауза"
                                            and (not peer or mode != "card" or
-                                                (s.get("burning") == "Burning peer task"
-                                                 and "Peer task" in (s.get("current") or "")
+                                                (s.get("burning") == handshake["task"]["title"]
+                                                 and handshake["hot_task"]["title"] in (s.get("current") or "")
                                                  and not s.get("currentHidden")))
                                            else None))
                     report["widget"][mode] = data
@@ -263,8 +269,12 @@ def run(root: Path) -> int:
                                                            "title": burning["title"]}})
                     if switched["task"]["id"] != burning["id"]:
                         raise RuntimeError("Native timer task switch did not persist")
-                    report["widget_same_task"] = _until(lambda: (s if (s := snapshot_widget()).get("currentHidden")
-                        and s.get("burning") == "Burning peer task" else None), 15)
+                    other_hot = sorted((note for note in notes if note["id"] != burning["id"]
+                        and note.get("kind") in {"task", "purchase"} and note.get("importance") == "critical"
+                        and note.get("status") not in {"done", "cancelled", "archived"}), key=lambda note: note["id"])
+                    report["widget_same_task"] = _until(lambda: (s if (s := snapshot_widget()).get("burning") == burning["title"]
+                        and (not s.get("currentHidden") and other_hot[0]["title"] in (s.get("current") or "")
+                             if other_hot else s.get("currentHidden")) else None), 15)
                     target = output / "card-same.png"
                     _screenshot(host.widget, target)
                     report["screenshots"]["card_same"] = str(target)
@@ -272,7 +282,18 @@ def run(root: Path) -> int:
                 # module and real local API (no OS mouse/keyboard synthesis).
                 _js(host.widget, "document.getElementById('widget-stop').click(); true")
                 _until(lambda: _request(port, token, "/api/time/state")["status"] not in {"running", "paused"})
+                # A completed time interval does not silently choose the next task.
+                # Exercise the real custom picker before its explicit Play.
+                restart_task = burning if peer else smoke_task
+                _js(host.widget, "document.getElementById('widget-task').click(); true")
+                selector = json.dumps('[data-task="library:' + restart_task["id"] + '"]')
+                _until(lambda: _js(host.widget, f"!!document.querySelector({selector})"))
+                _js(host.widget, f"document.querySelector({selector}).click(); true")
+                _until(lambda: _js(host.widget, "document.getElementById('widget-popup').hidden && "
+                    "!document.getElementById('widget-run').disabled && "
+                    "document.getElementById('widget-burning').textContent === " + json.dumps(restart_task["title"])))
                 _js(host.widget, "document.getElementById('widget-mode').click(); true")
+                _until(lambda: _js(host.widget, "document.getElementById('widget-mode').textContent.includes('Pomodoro')"))
                 _js(host.widget, "document.getElementById('widget-run').click(); true")
                 restarted = _until(lambda: (s if (s := _request(port, token, "/api/time/state"))["status"] == "running"
                                             and s["mode"] == "pomodoro" else None))

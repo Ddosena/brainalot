@@ -219,6 +219,25 @@ def velopack() -> None:
                     "--shortcuts", "StartMenuRoot", "--framework", "webview2", "--runtime", "win-x64", "--outputDir", str(RELEASES)], check=True, cwd=ROOT)
     for item in previous_packages:
         item.unlink(missing_ok=True)
+    prune_release_feeds()
+
+
+def prune_release_feeds() -> None:
+    """Do not publish update-feed links to build inputs removed after packing."""
+    feed_path = RELEASES / "releases.win.json"
+    feed = json.loads(feed_path.read_text(encoding="utf-8"))
+    def present(name: str) -> bool:
+        return isinstance(name, str) and Path(name).name == name and (RELEASES / name).is_file()
+    feed["Assets"] = [item for item in feed["Assets"] if present(item.get("FileName"))]
+    if not any(item.get("Version") == __version__ and item.get("Type") == "Full"
+               for item in feed["Assets"]):
+        raise RuntimeError("Update feed is missing the current full package")
+    feed_path.write_text(json.dumps(feed, separators=(",", ":")) + "\n", encoding="utf-8")
+    legacy = RELEASES / "RELEASES"
+    if legacy.exists():
+        rows = [line for line in legacy.read_text(encoding="utf-8").splitlines()
+                if len(line.split()) == 3 and present(line.split()[1])]
+        legacy.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
 def extension_zip() -> Path:

@@ -34,5 +34,11 @@ export function eventKey(event) {
   return `${event.calendar_id}:${event.occurrence_id || event.id}`;
 }
 export function currentEvent(events, now) {
-  return events.find(event => !event.all_day && Date.parse(event.start) <= now && now < Date.parse(event.end)) || null;
+  return events.find(event => !event.all_day && !event.time_skipped && Date.parse(event.start) <= now && now < Date.parse(event.end)) || null;
+}
+// Stopwatch has no denominator; never invent a percentage for it. The service
+// owns elapsed/duration and the clients only interpolate its current snapshot.
+export function timerProgress(state, elapsed) {
+  if (!state || state.mode === "stopwatch" || !(state.duration_ms > 0)) return null;
+  return Math.max(0, Math.min(100, elapsed / state.duration_ms * 100));
 }

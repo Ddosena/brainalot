@@ -8,6 +8,26 @@ import pytest
 from scripts import build_release
 
 
+def test_release_feed_does_not_advertise_removed_previous_build_inputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_release, "RELEASES", tmp_path)
+    current = f"BrainalotApp-{build_release.__version__}-full.nupkg"
+    (tmp_path / current).write_bytes(b"current package")
+    old = "BrainalotApp-0.0.1-full.nupkg"
+    assets = [
+        {"Version": "0.0.1", "Type": "Full", "FileName": old},
+        {"Version": build_release.__version__, "Type": "Full", "FileName": current},
+    ]
+    feed = tmp_path / "releases.win.json"
+    feed.write_text(json.dumps({"Assets": assets}), encoding="utf-8")
+    (tmp_path / "RELEASES").write_text(f"oldhash {old} 10\nnewhash {current} 15\n", encoding="utf-8")
+    build_release.prune_release_feeds()
+    assert json.loads(feed.read_text(encoding="utf-8"))["Assets"] == assets[1:]
+    assert (tmp_path / "RELEASES").read_text(encoding="utf-8") == f"newhash {current} 15\n"
+    (tmp_path / current).unlink()
+    with pytest.raises(RuntimeError, match="current full package"):
+        build_release.prune_release_feeds()
+
+
 def test_legal_files_and_runtime_inventory_are_in_the_packaged_directory(tmp_path, monkeypatch):
     for name in ("faster-whisper", "velopack", "hf-xet"):
         try:
@@ -69,7 +89,10 @@ def test_previous_nupkg_is_available_to_pack_then_removed_from_release_assets(tm
         assert previous.is_file()  # vpk can use it as the delta base
         assert not (releases / "releases.win.json").exists()
         (releases / f"BrainalotApp-{build_release.__version__}-full.nupkg").write_bytes(b"new")
-        (releases / "releases.win.json").write_text("new", encoding="utf-8")
+        (releases / "releases.win.json").write_text(json.dumps({"Assets": [
+            {"Version": build_release.__version__, "Type": "Full",
+             "FileName": f"BrainalotApp-{build_release.__version__}-full.nupkg"}
+        ]}), encoding="utf-8")
 
     monkeypatch.setattr(build_release.subprocess, "run", fake_pack)
     build_release.velopack()

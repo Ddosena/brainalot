@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {activeTask, compactTasks, resolveActiveTask, untrackedStep, currentEvent, ASK_AFTER_MS, AWAY_MS} from '../widget-model.js';
+import {activeTask, compactTasks, resolveActiveTask, untrackedStep, currentEvent, timerProgress, ASK_AFTER_MS, AWAY_MS} from '../widget-model.js';
 const a={source:'library',id:'a',title:'Hot'}, b={source:'calendar',id:'b',title:'Current'};
 test('compact tasks keep selection, deduplicate and deterministically recover',()=>{
   const model=compactTasks([a,b,a],'library:a',{status:'paused',task:b});
@@ -43,4 +43,15 @@ test('a running timed calendar event counts as tracked time, all-day events do n
   assert.equal(currentEvent(events,Date.parse('2026-10-19T15:30:00+03:00'))?.id,'e');
   assert.equal(currentEvent(events,Date.parse('2026-10-19T16:00:00+03:00')),null);
   assert.equal(currentEvent(events,Date.parse('2026-10-19T12:00:00+03:00')),null);
+  assert.equal(currentEvent(events.map(event=>({...event,time_skipped:true})),Date.parse('2026-10-19T15:30:00+03:00')),null,'did-not-happen must not suppress the untracked question');
+});
+
+test('timer and break progress are real bounded elapsed fractions; stopwatch has none',()=>{
+  for (const mode of ['pomodoro','break']) {
+    assert.equal(timerProgress({mode,duration_ms:1000},250),25);
+    assert.equal(timerProgress({mode,duration_ms:1000},1500),100);
+    assert.equal(timerProgress({mode,duration_ms:1000},-20),0);
+  }
+  assert.equal(timerProgress({mode:'stopwatch',duration_ms:1000},500),null);
+  assert.equal(timerProgress(null,500),null);
 });
