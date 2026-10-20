@@ -268,6 +268,34 @@ def test_plain_phrases_become_notes_with_parsed_fields(service):
     assert movie["source"] == "dictation"
 
 
+def test_quick_voice_keeps_spoken_project_phrase_but_parses_today_and_deduplicates(service):
+    project = service.store.capture("Synthetic project", kind="project", title="Курс по скульпту Нетологии")
+    text = "проработать скульпт для курса по скульпту Нетологии сегодня"
+    assert service.preview(text)["plan"]["title"] == "Проработать скульпт"
+    overrides = {"kind": "task", "route": "note", "keep_context_in_title": True}
+    preview = service.preview(text, overrides=overrides)["plan"]
+    assert preview["title"] == "Проработать скульпт для курса по скульпту Нетологии"
+    assert preview["due"] == "2026-09-24"
+    assert preview["context_id"] == project["id"]
+    first = service.apply(text, overrides=overrides, external_id="home-voice-example",
+                          captured_at=NOW.isoformat(), source="voice-home")
+    again = service.apply(text, overrides=overrides, external_id="home-voice-example",
+                          captured_at=NOW.isoformat(), source="voice-home")
+    assert first["note"]["id"] == again["note"]["id"]
+    assert first["note"]["title"] == preview["title"]
+    assert first["note"]["due"] == preview["due"]
+    assert first["note"]["id"] in {n["id"] for n in service.store.dashboard()["today"]}
+    assert len(service.store.list_notes()) == 2
+
+
+def test_quick_voice_context_title_option_is_typed_and_explicit_title_wins(service):
+    with pytest.raises(ValidationError):
+        service.preview("сделать задачу сегодня", overrides={"keep_context_in_title": "true"})
+    plan = service.preview("сделать задачу сегодня",
+                           overrides={"keep_context_in_title": True, "title": "Исправленное название"})["plan"]
+    assert plan["title"] == "Исправленное название"
+
+
 def test_overrides_correct_kind_title_and_route(service, monkeypatch):
     connect(service, monkeypatch)
     note = service.apply("сегодня с 15 до 16 вынести мусор", external_id="o-1",

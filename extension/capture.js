@@ -1,4 +1,4 @@
-import "./desktop-platform.js";
+import { isDesktop } from "./desktop-platform.js";
 import { capturePayload, currentWeekDueOptions, normalizeTheme, tabCapture } from "./panel-state.js";
 import { DRAFT_KEY, DRAFT_VERSION, isOutdatedWorker, normalizeDesign, normalizeDraft } from "./capture-window.js";
 import { checkAttachmentLimit, renderAttachmentList, storeAttachment } from "./attachments.js";
@@ -25,6 +25,10 @@ let previewTimer = null;
 let previewSeq = 0;
 let lastPreview = null;
 let voicePreparing = null;
+let voicePreparation = 0;
+let disposed = false;
+let completion = null;
+let nativeVisible = true;
 
 function send(type, extra = {}) {
   return chrome.runtime.sendMessage({ type, ...extra }).then(reply => {
@@ -90,6 +94,9 @@ function persist() {
   const saved = draft;
   // Dispatch immediately so the service worker can finish writing even if Chrome closes this page.
   const writing = send("save-draft", { draft: saved });
+  // Event handlers cannot await every keystroke; still surface storage errors
+  // and mark the rejected promise handled. Submit/Close await the same promise.
+  void writing.catch(failure => error(failure.message || t("Не удалось восстановить черновик.")));
   lastPersist = writing;
   pendingWrites.add(writing);
   void writing.finally(() => pendingWrites.delete(writing)).catch(() => {});
@@ -134,6 +141,7 @@ function renderUnderstanding(state) {
 }
 function schedulePreview(delay = PREVIEW_DELAY_MS) {
   clearTimeout(previewTimer);
+  ++previewSeq; // An earlier response is stale as soon as the text changes.
   previewTimer = setTimeout(() => { void runPreview(); }, delay);
 }
 async function runPreview() {
@@ -187,30 +195,78 @@ async function saveDictation(text) {
   }
 }
 async function finish() {
-  try { await send("finish-capture"); } catch { window.close(); }
+  let failure;
+  // Native navigation is idempotent. Retry a transient bridge/state-save error
+  // once; window.close() cannot close the embedded capture document.
+  for (let attempt = 0; attempt < (isDesktop ? 2 : 1); attempt++) {
+    try { await send("finish-capture"); return; } catch (error) { failure = error; }
+  }
+  if (isDesktop) throw failure;
+  window.close(); // Compatibility with an older Chrome service worker.
+}
+function committed(type) {
+  completion = { type, draft: { ...draft, attachments: [...draft.attachments] }, finalized: false,
+    nextRequestId: type === "tab" ? crypto.randomUUID() : null };
+  cancelVoice();
+  clearTimeout(previewTimer);
+  ++previewSeq;
+}
+async function finishCommitted() {
+  if (!completion.finalized) {
+    if (completion.type === "tab" && (completion.draft.text.trim() || completion.draft.attachments.length)) {
+      // The tab capture is committed; preserve the independent thought under a
+      // single new ID even if its first draft write was not acknowledged.
+      draft.requestId = completion.nextRequestId;
+      await persist();
+    } else {
+      draft = normalizeDraft(await send("clear-draft", { draft: {
+        ...completion.draft, revision: completion.draft.revision + 1,
+      } }));
+    }
+    completion.finalized = true;
+  }
+  await finish();
+}
+function recover(failure, fallback) {
+  error(completion ? t("Запись уже сохранена. Повторите закрытие окна.") : failure.message || fallback);
+  setBusy(false);
 }
 async function closeWindow() {
   if (busy) return;
+  cancelVoice();
   setBusy(true);
+  if (completion) {
+    try { await finishCommitted(); } catch (failure) { recover(failure); }
+    return;
+  }
   await Promise.allSettled([...pendingImports]);
   if (importFailure) { error(importFailure.message || t("Файл не сохранился. Проверьте его и попробуйте снова.")); setBusy(false); return; }
   const writes = await Promise.allSettled([...pendingWrites, lastPersist]);
   const failure = writes.find(result => result.status === "rejected");
   if (failure) { error(t("Черновик не сохранился. Проверьте расширение и закройте окно ещё раз.")); setBusy(false); return; }
-  window.close();
+  try { await finish(); } catch (failure) { recover(failure, t("Не удалось закрыть окно. Повторите попытку.")); }
 }
 function setBusy(value) {
   busy = value;
   $("capture-form").inert = value;
   $("capture-submit").disabled = $("save-tab").disabled = $("capture-close").disabled = value;
+  if (completion) {
+    // After enqueue acknowledgement only finalization/navigation may be retried.
+    // Editing the old textarea under a cleared/new request ID would duplicate it.
+    for (const field of $("capture-form").elements) if (field !== $("capture-submit")) field.disabled = true;
+    $("capture-submit").querySelector("span").textContent = t("Закрыть");
+  }
 }
 async function submit() {
   if (busy) return;
   setBusy(true);
   clearError();
   try {
+    if (completion) { await finishCommitted(); return; }
     // Ctrl+Enter while speaking: the words land in the text first.
+    const voiceRequest = voicePreparation;
     await voice.settle();
+    if (disposed || voiceRequest !== voicePreparation) throw new Error(t("Запись прервалась."));
     await importTail;
     if (importFailure) throw importFailure;
     const text = $("capture-text").value;
@@ -218,11 +274,10 @@ async function submit() {
     await persist();
     if (usesDictation(text)) await saveDictation(text);
     else await send("capture", { requestId: draft.requestId, payload: plainPayload(text) });
-    draft = normalizeDraft(await send("clear-draft", { draft: { ...draft, revision: draft.revision + 1 } }));
-    await finish();
+    committed("entry");
+    await finishCommitted();
   } catch (failure) {
-    error(failure.message || t("Не удалось сохранить. Проверьте данные и попробуйте снова."));
-    setBusy(false);
+    recover(failure, t("Не удалось сохранить. Проверьте данные и попробуйте снова."));
   }
 }
 async function saveTab() {
@@ -230,20 +285,16 @@ async function saveTab() {
   setBusy(true);
   clearError();
   try {
+    if (completion) { await finishCommitted(); return; }
     await importTail;
     if (importFailure) throw importFailure;
     await persist();
     const tab = await send("active-tab");
     await send("capture", { requestId: draft.requestId, payload: tabCapture(tab) });
-    // Saving a tab is independent of a typed thought; retain that draft for reopening.
-    if (draft.text.trim() || draft.attachments.length) {
-      draft.requestId = crypto.randomUUID();
-      await persist();
-    } else draft = normalizeDraft(await send("clear-draft", { draft: { ...draft, revision: draft.revision + 1 } }));
-    await finish();
+    committed("tab");
+    await finishCommitted();
   } catch (failure) {
-    error(failure.message || t("Не удалось сохранить вкладку."));
-    setBusy(false);
+    recover(failure, t("Не удалось сохранить вкладку."));
   }
 }
 function previousContext(id) {
@@ -254,6 +305,10 @@ function previousContext(id) {
 async function initialize() {
   const saved = await chrome.storage.local.get([DRAFT_KEY, THEME_KEY, DESIGN_KEY]);
   applyAppearance(saved);
+  // The desktop host has no browser tab to capture. Its adapter returns to the
+  // day through finish-capture instead of closing the application window.
+  $("save-tab").hidden = isDesktop;
+  document.querySelector(".capture-hint").hidden = isDesktop;
   draft = normalizeDraft(saved[DRAFT_KEY]);
   if (draft.completed) draft = normalizeDraft({ version: DRAFT_VERSION, revision: draft.revision });
   draft.requestId ||= crypto.randomUUID();
@@ -320,7 +375,7 @@ function importFiles(files) {
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 /** The model downloads once in the background; until then a click explains the wait. Resolves true when ready. */
-async function prepareVoice(status) {
+async function prepareVoice(status, request) {
   const button = $("capture-voice");
   button.dataset.state = "preparing";
   voice.report(t("Загружаю модель распознавания речи. Это нужно один раз и может занять несколько минут."));
@@ -328,39 +383,50 @@ async function prepareVoice(status) {
     let current = status.state === "preparing" ? status : await send("voice-prepare");
     while (current.state === "preparing") {
       await wait(1500);
+      if (request !== voicePreparation || disposed) return false;
       current = await send("voice-status");
     }
+    if (request !== voicePreparation || disposed) return false;
     if (current.state === "ready") {
       voice.report(t("Голосовой ввод готов: нажмите микрофон и говорите."));
       return true;
     }
     voice.report(current.error ? translateServerMessage(current.error) : t("Не удалось подготовить распознавание речи."), true);
   } catch (failure) {
-    voice.report(failure.message, true);
+    if (request === voicePreparation && !disposed) voice.report(failure.message, true);
   } finally {
-    button.dataset.state = "idle";
+    if (request === voicePreparation && !disposed) button.dataset.state = "idle";
   }
 }
 async function voiceReady() {
-  if (voicePreparing) return false;
+  if (voicePreparing || busy || disposed || !nativeVisible) return false;
+  const request = voicePreparation;
   let status;
   try {
     status = await send("voice-status");
   } catch (failure) {
+    if (request !== voicePreparation || disposed) return false;
     voice.report(isOutdatedWorker(failure) ? t("Обновите расширение на chrome://extensions, чтобы включить голосовой ввод.")
       : failure.status === 404 ? t("Перезапустите локальный сервис Brainalot: запущенная версия не знает голосового ввода.")
         : failure.message, true);
     return false;
   }
+  if (request !== voicePreparation || busy || disposed || !nativeVisible) return false;
   if (status.state === "ready") return true;
   if (status.state === "missing") {
     voice.report(t("Голосовой ввод не установлен: запустите Install-Voice.cmd в папке Brainalot и перезапустите сервис."), true);
     return false;
   }
   // The click meant «dictate»: once the model is ready, start listening if the window is still in use.
-  voicePreparing = prepareVoice(status).finally(() => { voicePreparing = null; })
-    .then(ready => { if (ready && document.hasFocus()) $("capture-voice").click(); });
+  const pending = prepareVoice(status, request).finally(() => { if (voicePreparing === pending) voicePreparing = null; })
+    .then(ready => { if (ready && request === voicePreparation && !busy && !disposed && nativeVisible && document.hasFocus()) $("capture-voice").click(); });
+  voicePreparing = pending;
   return false;
+}
+function cancelVoice() {
+  ++voicePreparation;
+  voicePreparing = null;
+  voice.cancel();
 }
 const voice = attachDictation({
   button: $("capture-voice"), textarea: $("capture-text"), status: $("capture-voice-status"),
@@ -369,6 +435,11 @@ const voice = attachDictation({
   language: locale() === "ru" ? "ru" : "auto",
   beforeStart: voiceReady,
   onResult: result => { if (result.text) { draft.voice = true; void persist(); } },
+});
+window.addEventListener("pagehide", () => { disposed = true; cancelVoice(); }, { once: true });
+document.addEventListener("brainalot:visibility", event => {
+  nativeVisible = event.detail?.visible !== false;
+  if (!nativeVisible) cancelVoice();
 });
 
 $("capture-add-files").addEventListener("click", () => $("capture-files").click());
@@ -401,7 +472,7 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape") {
     event.preventDefault();
     // The first Escape stops the microphone; the next one closes the window.
-    if (["starting", "recording"].includes(voice.recorder.state)) voice.cancel();
+    if (["starting", "recording"].includes(voice.recorder.state)) cancelVoice();
     else void closeWindow();
   }
   if (event.key === "Enter" && event.ctrlKey) { event.preventDefault(); void submit(); }

@@ -225,6 +225,42 @@ def clear_native_frame(window):
     return policy_set and cleared and refreshed
 
 
+def round_native_window(window, radius=20):
+    """Clip an interactive native window without replacing its WebView.
+
+    Used with disabled DWM non-client rendering; a region alone leaves the
+    default pywebview frame. Reapply on size/DPI/handle changes on the UI thread.
+    """
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None or not hasattr(native, "Invoke"):
+        return False
+    from System import Action
+    from System.Drawing import Region
+    from System.Drawing.Drawing2D import GraphicsPath
+    def update():
+        hwnd = int(native.Handle.ToInt64())
+        user = _user32()
+        user.GetDpiForWindow.argtypes = [wintypes.HWND]
+        dpi = user.GetDpiForWindow(hwnd) or 96
+        width,height = int(native.Width),int(native.Height)
+        diameter = min(width,height,max(2,round(radius*2*dpi/96)))
+        signature = (hwnd,width,height,diameter)
+        if width <= 0 or height <= 0 or getattr(window,"_brainalot_round_signature",None) == signature:
+            return
+        window._brainalot_round_signature = signature
+        path = GraphicsPath()
+        for x,y,angle in ((0,0,180),(width-diameter,0,270),
+                          (width-diameter,height-diameter,0),(0,height-diameter,90)):
+            path.AddArc(x,y,diameter,diameter,angle,90)
+        path.CloseFigure()
+        old = native.Region
+        native.Region = Region(path)
+        path.Dispose()
+        if old: old.Dispose()
+    native.Invoke(Action(update))
+    return True
+
+
 def native_rect(window):
     native = getattr(window, "native", None)
     if native is not None and hasattr(native, "Handle"):

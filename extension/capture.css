@@ -1,4 +1,4 @@
-body.capture-page{min-width:320px;max-width:none;padding:0;min-height:100vh;background:var(--bg)}
+body.capture-page{min-width:0;max-width:none;padding:0;min-height:100vh;background:var(--bg)}
 .capture-shell{width:min(100%,560px);min-height:100vh;margin:auto;padding:22px 26px 28px;background:var(--card)}
 .capture-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .capture-header h1{font-size:25px;line-height:1.15;letter-spacing:-.025em}
@@ -44,6 +44,7 @@ body.capture-page{min-width:320px;max-width:none;padding:0;min-height:100vh;back
 .capture-page .capture-actions{justify-content:space-between;gap:10px;margin-top:16px}
 .capture-page .primary,.capture-page .secondary{min-height:37px;font-size:12px}
 .capture-page .primary{font-weight:700}
+.capture-page #capture-submit{margin-left:auto}
 .shortcut{font-weight:400;font-size:10px;opacity:.84;margin-left:5px}
 .capture-error{margin:9px 0 0}
 [data-design="cabinet"] .capture-shell{border-left:1px solid var(--line);border-right:1px solid var(--line);box-shadow:0 6px 20px var(--soft-shadow)}

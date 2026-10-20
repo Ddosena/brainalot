@@ -33,11 +33,13 @@ export function rms(samples) {
   return samples.length ? Math.sqrt(sum / samples.length) : 0;
 }
 
-export function microphoneError(error) {
+export function microphoneError(error, { desktop = globalThis.chrome?.desktop === true } = {}) {
   switch (error?.name) {
     case "NotAllowedError":
     case "SecurityError":
-      return t("Нет доступа к микрофону. Разрешите микрофон для Brainalot в настройках Chrome и попробуйте снова.");
+      return desktop
+        ? t("Нет доступа к микрофону. Разрешите микрофон для Brainalot и проверьте доступ для настольных приложений в настройках Windows.")
+        : t("Нет доступа к микрофону. Разрешите микрофон для Brainalot в настройках Chrome и попробуйте снова.");
     case "NotFoundError":
     case "OverconstrainedError":
       return t("Микрофон не найден. Подключите его и попробуйте снова.");
@@ -64,13 +66,14 @@ export function createVoiceRecorder(options = {}) {
     now = () => Date.now(),
     onLevel = () => {},
     onState = () => {},
+    onError = () => {},
     onAutoStop,
     ...limits
   } = options;
   const settings = { ...RECORDER_DEFAULTS, ...limits };
   let state = "idle", stream = null, recorder = null, context = null, analyser = null, buffer = null;
   let timer = null, chunks = [], mimeType = "", startedAt = 0, lastSpeech = 0, heardSpeech = false;
-  let stopping = null;
+  let stopping = null, generation = 0;
 
   const setState = next => { state = next; onState(next); };
   const release = () => {
@@ -107,36 +110,57 @@ export function createVoiceRecorder(options = {}) {
   async function start() {
     if (state !== "idle") throw new Error(t("Запись уже идёт."));
     if (!MediaRecorderClass) throw new Error(t("Этот браузер не умеет записывать звук."));
+    const run = ++generation;
     setState("starting");
+    let acquired;
     try {
-      stream = await getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
+      acquired = await getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true,
         autoGainControl: true } });
     } catch (error) {
-      if (state === "starting") setState("idle");
+      if (run !== generation) return;
+      setState("idle");
       throw new Error(microphoneError(error));
     }
-    if (state !== "starting") {
+    if (run !== generation) {
       // cancel() ran while Chrome was asking for the microphone: give it back at once.
-      for (const track of stream?.getTracks?.() || []) track.stop();
-      stream = null;
+      for (const track of acquired?.getTracks?.() || []) track.stop();
       return;
     }
-    mimeType = pickMimeType(MediaRecorderClass);
-    recorder = new MediaRecorderClass(stream, mimeType ? { mimeType, audioBitsPerSecond: 32_000 } : undefined);
-    chunks = [];
-    recorder.addEventListener("dataavailable", event => { if (event.data?.size) chunks.push(event.data); });
-    if (AudioContextClass) {
-      context = new AudioContextClass();
-      analyser = context.createAnalyser();
-      analyser.fftSize = 2048;
-      buffer = new Float32Array(analyser.fftSize);
-      context.createMediaStreamSource(stream).connect(analyser);
+    stream = acquired;
+    try {
+      mimeType = pickMimeType(MediaRecorderClass);
+      recorder = new MediaRecorderClass(stream, mimeType ? { mimeType, audioBitsPerSecond: 32_000 } : undefined);
+      chunks = [];
+      const recordedChunks = chunks;
+      recorder.addEventListener("dataavailable", event => { if (event.data?.size) recordedChunks.push(event.data); });
+      recorder.addEventListener("error", () => {
+        // A disconnected device can fail before the user presses Stop. The stop()
+        // owner handles errors while stopping; this handles an active recording.
+        if (run !== generation || state !== "recording") return;
+        release(); recorder = null; setState("idle");
+        onError(new Error(t("Запись прервалась.")));
+      });
+      if (AudioContextClass) {
+        context = new AudioContextClass();
+        analyser = context.createAnalyser();
+        analyser.fftSize = 2048;
+        buffer = new Float32Array(analyser.fftSize);
+        context.createMediaStreamSource(stream).connect(analyser);
+        if (context.state === "suspended") await context.resume();
+      }
+      if (run !== generation) return;
+      startedAt = lastSpeech = now();
+      heardSpeech = false;
+      recorder.start(settings.timesliceMs);
+      timer = every(tick, settings.levelIntervalMs);
+      setState("recording");
+    } catch (error) {
+      if (run !== generation) return;
+      release();
+      recorder = null;
+      setState("idle");
+      throw error;
     }
-    startedAt = lastSpeech = now();
-    heardSpeech = false;
-    recorder.start(settings.timesliceMs);
-    timer = every(tick, settings.levelIntervalMs);
-    setState("recording");
   }
 
   /** Stop recording; resolves {blob, durationMs, heardSpeech}. Safe to call twice. */
@@ -145,33 +169,34 @@ export function createVoiceRecorder(options = {}) {
     if (state !== "recording") return Promise.reject(new Error(t("Запись не идёт.")));
     setState("stopping");
     const current = recorder;
+    const run = generation, recordedChunks = chunks, started = startedAt, speech = heardSpeech;
     let settle;
     const pending = new Promise((resolve, reject) => { settle = { resolve, reject }; });
     // Assign before recorder.stop(): its "stop" event may fire synchronously.
     stopping = pending;
     current.addEventListener("stop", () => {
-      const blob = new Blob(chunks, { type: current.mimeType || mimeType || "audio/webm" });
-      const result = { blob, durationMs: now() - startedAt, heardSpeech };
-      release();
-      stopping = null;
-      setState("idle");
+      const blob = new Blob(recordedChunks, { type: current.mimeType || mimeType || "audio/webm" });
+      const result = { blob, durationMs: now() - started, heardSpeech: speech };
+      if (run === generation) { release(); stopping = null; recorder = null; setState("idle"); }
       settle.resolve(result);
     }, { once: true });
     current.addEventListener("error", () => {
-      release();
-      stopping = null;
-      setState("idle");
+      if (run === generation) { release(); stopping = null; recorder = null; setState("idle"); }
       settle.reject(new Error(t("Запись прервалась.")));
     }, { once: true });
-    current.stop();
+    try { current.stop(); } catch (error) {
+      release(); stopping = null; recorder = null; setState("idle"); settle.reject(error);
+    }
     return pending;
   }
 
   function cancel() {
+    ++generation;
     if (recorder && recorder.state !== "inactive") {
       try { recorder.stop(); } catch { /* already stopped */ }
     }
     release();
+    recorder = null;
     stopping = null;
     if (state !== "idle") setState("idle");
   }
@@ -180,11 +205,14 @@ export function createVoiceRecorder(options = {}) {
 }
 
 /** Send recorded audio to the local service; resolves {text, language, duration, preview?}. */
-export async function transcribeAudio(blob, { token, fetcher = fetch, language = "ru", preview = false,
+export async function transcribeAudio(blob, { token, fetcher = fetch, language = "ru", preview = false, signal,
   timeoutMs = 180_000 } = {}) {
   if (!token) throw new Error(t("Укажите токен подключения в настройках."));
   if (!blob?.size) throw new Error(t("Запись пустая. Попробуйте ещё раз."));
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abort, { once: true });
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const query = new URLSearchParams({ language });
   if (preview) query.set("preview", "true");
@@ -207,6 +235,7 @@ export async function transcribeAudio(blob, { token, fetcher = fetch, language =
     throw error;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -245,58 +274,91 @@ export function attachDictation({ button, textarea, status, getToken, preview = 
     button.setAttribute("aria-pressed", String(state === "recording"));
     button.setAttribute("aria-label", state === "recording" ? t("Остановить запись голоса") : t("Надиктовать"));
   };
-  let finishing = null;
+  let finishing = null, starting = null, generation = 0, transcription = null;
   const recorder = createVoiceRecorder({
     ...recorderOptions,
     onState: show,
+    onError: error => { report(error.message, true); onError(error); },
     onLevel: level => button.style?.setProperty?.("--voice-level", Math.min(1, level * 8).toFixed(2)),
     onAutoStop: () => { void finish(); },
   });
 
   async function finish() {
     if (finishing) return finishing;
-    finishing = (async () => {
+    const run = generation;
+    const pending = (async () => {
       try {
         const { blob, heardSpeech } = await recorder.stop();
-        if (!heardSpeech) { report(t("Не слышно речи. Говорите ближе к микрофону."), true); return; }
+        if (run !== generation) return;
+        if (!heardSpeech) {
+          const error = new Error(t("Не слышно речи. Говорите ближе к микрофону."));
+          report(error.message, true);
+          return { error };
+        }
         show("transcribing");
         report(t("Распознаю…"));
-        const result = await transcribe(blob, { token: await getToken(), preview, language });
+        const controller = new AbortController();
+        transcription = controller;
+        const token = await getToken();
+        if (run !== generation) return;
+        const result = await transcribe(blob, { token, preview, language, signal: controller.signal });
+        if (run !== generation) return;
         if (result.text) insertText(textarea, result.text);
         report(result.text ? "" : t("Не удалось разобрать слова. Попробуйте ещё раз."), !result.text);
         onResult(result);
+        return result.text ? { result } : { error: new Error(t("Не удалось разобрать слова. Попробуйте ещё раз.")) };
       } catch (error) {
+        if (run !== generation) return;
         report(error.message, true);
         onError(error);
+        return { error };
       } finally {
-        show(recorder.state);
-        finishing = null;
+        if (run === generation) { show(recorder.state); finishing = null; transcription = null; }
       }
     })();
+    finishing = pending;
     return finishing;
   }
 
   let checking = false;
-  button.addEventListener("click", async () => {
+  async function start() {
     if (finishing || checking) return;
-    if (recorder.state === "recording") { await finish(); return; }
+    if (recorder.state === "recording") return finish();
     if (recorder.state !== "idle") return;
+    const run = generation;
     try {
       checking = true;
       try {
-        if (!(await beforeStart())) return;
+        if (!(await beforeStart()) || run !== generation) return;
       } finally {
         checking = false;
       }
       report(t("Говорите… Можно думать и делать паузы. Чтобы закончить, нажмите микрофон ещё раз."));
       await recorder.start();
     } catch (error) {
+      if (run !== generation) return;
       recorder.cancel();
       report(error.message, true);
       onError(error);
+      return { error };
     }
+  }
+  button.addEventListener("click", () => {
+    if (starting) return;
+    const pending = start();
+    starting = pending;
+    void pending.finally(() => { if (starting === pending) starting = null; });
   });
   show("idle");
-  const settle = () => finishing || (recorder.state === "recording" ? finish() : Promise.resolve());
-  return { recorder, finish, settle, report, cancel: () => { recorder.cancel(); report(""); } };
+  const settle = async () => {
+    const begun = starting ? await starting : null;
+    if (begun?.error) throw begun.error;
+    const outcome = await (finishing || (recorder.state === "recording" ? finish() : Promise.resolve()));
+    if (outcome?.error) throw outcome.error;
+    return outcome?.result;
+  };
+  return { recorder, finish, settle, report, cancel: () => {
+    ++generation; transcription?.abort(); transcription = null; finishing = null; starting = null;
+    recorder.cancel(); report(""); show("idle");
+  } };
 }

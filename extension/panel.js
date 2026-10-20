@@ -17,6 +17,7 @@ import { TIMER_CHIME_KEY, normalizeTimerChime, playTimerChime } from "./timer-ch
 import { DEFAULT_IGNITION_SOUND, IGNITION_SOUNDS, normalizeIgnitionSound, playIgnitionSound } from "./comic-fire-sound.js";
 import { openWorkPage } from "./work-tabs.js";
 import { WORK_ENABLED } from "./work-availability.js";
+import { mountQuickVoice } from "./quick-voice.js";
 
 applyDocument();
 const $ = (id) => document.getElementById(id);
@@ -1912,6 +1913,16 @@ $("edit-form").addEventListener("submit", async event => {
 });
 $("capture-open").addEventListener("click", async () => {
   try { await send("open-capture"); } catch (error) { notice(error.message, true); }
+});
+mountQuickVoice($("home-quick-voice"), {
+  onSaved: () => refresh(),
+  onEdit: async saved => {
+    // The toast may refer to a historical idempotent receipt. Use the live note
+    // version before the existing editor performs its ordinary CAS update.
+    const latest = (await send("notes")).notes.find(note => note.id === saved.id);
+    if (!latest) throw new Error(t("Задача больше недоступна. Обновите список."));
+    openEditor(latest);
+  },
 });
 function closeAppearancePanel(restoreFocus = false) {
   if ($("appearance-panel").hidden) return;

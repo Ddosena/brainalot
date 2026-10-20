@@ -13,7 +13,7 @@ import time
 from urllib.error import HTTPError
 from .desktop_geometry import (WorkArea, work_areas, fit_geometry, select_area, native_rect,
                                set_native_rect, cursor_position, enable_thread_dpi, enable_process_dpi,
-                               nearest_edge, popup_geometry, double_click_settings, clear_native_frame)
+                               nearest_edge, popup_geometry, double_click_settings, clear_native_frame, round_native_window)
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 import uuid
@@ -620,6 +620,7 @@ class DesktopHost:
         self._lock = threading.RLock()
         self._eval_lock = threading.RLock()
         self._navigation_guards = []
+        self._full_resize_handlers = []
         self._geometry_timer = None
         self._topology_timer = None
         self._drag = None
@@ -694,7 +695,7 @@ class DesktopHost:
         bridge = DesktopBridge(self)
         self.full = webview.create_window("Brainalot", self._url("desktop.html"), js_api=bridge,
                                          hidden=True, frameless=True, easy_drag=False,
-                                         on_top=True, min_size=MINIMUM_SIZES["full"],
+                                         on_top=True, shadow=False, min_size=MINIMUM_SIZES["full"],
                                          x=80, y=80,
                                          width=FULL_SIZE[0], height=FULL_SIZE[1])
         self.widget = webview.create_window("Brainalot", self._url(f"widget.html?mode={self.widget_mode}"),
@@ -726,6 +727,13 @@ class DesktopHost:
     def _guard_navigation(self, window):
         if getattr(window, "_brainalot_guarded", False):
             return
+        if window is self.full:
+            clear_native_frame(window)
+            round_native_window(window)
+            def resized(*_): round_native_window(window)
+            window.native.Resize += resized
+            if hasattr(window.native,"DpiChanged"): window.native.DpiChanged += resized
+            self._full_resize_handlers.append(resized)
         control = window.native.webview
         def check(_sender, args):
             parsed = urlsplit(str(args.Uri))
@@ -769,9 +777,28 @@ class DesktopHost:
 
     def _show(self, window):
         if window:
-            if window is self.widget: clear_native_frame(window)
+            clear_native_frame(window)
+            if window is self.full: round_native_window(window)
             window.show()
             window.restore()
+
+    def _notify_full_visibility(self, visible):
+        if not self.full or not self.full.events.loaded.is_set():
+            return
+        # WinForms.Hide does not update Page Visibility in WebView2. Notify our
+        # own documents synchronously before hiding so microphones are released.
+        self.full.evaluate_js("""(() => {
+          const visit = doc => {
+            doc.dispatchEvent(new doc.defaultView.CustomEvent('brainalot:visibility',
+              {detail:{visible:VISIBLE}}));
+            for (const frame of doc.querySelectorAll('iframe')) {
+              try { const child=frame.contentDocument;
+                if (child && child.location.origin===location.origin) visit(child);
+              } catch { /* Foreign documents do not receive app lifecycle. */ }
+            }
+          };
+          visit(document); return true;
+        })()""".replace("VISIBLE", "true" if visible else "false"))
 
     def _restore_geometry(self):
         self._switching = True
@@ -940,6 +967,8 @@ class DesktopHost:
                 if action == "hide": action = "bar"
                 self._widget_popup({"open": False})
                 previous = self.mode
+                if action != "full":
+                    self._notify_full_visibility(False)
                 current = self.full if previous == "full" else self.widget
                 self._remember_geometry(current, "full" if previous == "full" else "widget")
                 anchor = native_rect(self.widget) if previous in WIDGET_SIZES and action in WIDGET_SIZES else None
@@ -963,6 +992,8 @@ class DesktopHost:
                     set_native_rect(target, rect, minimum)
                     self._sync_compact_surface()
                     self._show(target)  # show before hiding the old surface
+                    if action == "full":
+                        self._notify_full_visibility(True)
                     (self.widget if action == "full" else self.full).hide()
                     self.state.data.update(last_mode=action, topmost=True, side=self.side)
                     self.state.save()

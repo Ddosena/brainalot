@@ -23,6 +23,12 @@ test('paused completed/deleted tasks do not hold a card; live title follows stab
   assert.equal(resolveActiveTask({...paused,status:'running'},[]).id,a.id);
 });
 
+test('rest remains selectable and resumable while paused without a library note',()=>{
+  const rest={source:'label',id:'rest',title:'Отдых'};
+  assert.deepEqual(resolveActiveTask({status:'running',task:rest},[]),rest);
+  assert.deepEqual(resolveActiveTask({status:'paused',task:rest},[]),rest);
+});
+
 test('asks after ten active untracked minutes, restarts after being away, never while tracked',()=>{
   const minute=60_000,start=1_000_000;
   let step=untrackedStep(null,{tracked:false,idleMs:20_000,now:start});

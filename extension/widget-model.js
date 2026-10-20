@@ -6,6 +6,7 @@ export function activeTask(state) {
 export function resolveActiveTask(state, notes, calendar = []) {
   const task = activeTask(state);
   if (!task) return null;
+  if (task.source === "label" && task.id === "rest") return task;
   const live = task.source === "library" ? notes.find(note => note.id === task.id) :
     calendar.find(event => `${event.calendar_id}:${event.occurrence_id || event.id}` === task.id);
   const available = live && !["done", "cancelled", "archived"].includes(live.status);

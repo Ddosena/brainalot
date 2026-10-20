@@ -31,7 +31,7 @@ from .google_calendar_api import event_id_for
 
 
 OVERRIDE_FIELDS = {"kind", "title", "due", "planning_horizon", "media_type", "importance", "context_id",
-                   "tags", "route", "event"}
+                   "tags", "route", "event", "keep_context_in_title"}
 TASK_KINDS = {"task", "purchase"}
 _EXTERNAL_ID = re.compile(r"[\w:.-]{1,160}")
 
@@ -91,7 +91,9 @@ def merge_overrides(parsed: dict, overrides: dict | None) -> dict:
         raise ValidationError("Неизвестные поля исправления диктовки")
     if "route" in overrides and overrides["route"] not in {"note", "calendar"}:
         raise ValidationError("Маршрут диктовки: note или calendar")
-    changes = {key: value for key, value in overrides.items() if key != "event"}
+    if "keep_context_in_title" in overrides and type(overrides["keep_context_in_title"]) is not bool:
+        raise ValidationError("Некорректное содержимое диктовки")
+    changes = {key: value for key, value in overrides.items() if key not in {"event", "keep_context_in_title"}}
     event = parsed.get("event")
     explicit = "event" in overrides
     if explicit:
@@ -225,6 +227,14 @@ class DictationService:
         """
         parsed = self.parse(text, time_zone=time_zone, now=now, contexts=contexts)
         plan = merge_overrides(parsed, overrides)
+        if overrides and overrides.get("keep_context_in_title") and "title" not in overrides:
+            # Quick voice tasks retain the spoken project phrase in their title.
+            # Reuse the same grammar without entity consumption for the title
+            # alone; the first parse still owns the date and project association.
+            title = self.parse(text, time_zone=time_zone, now=now, contexts=[])["title"]
+            plan["title"] = title
+            if plan.get("event"):
+                plan["event"] = {**plan["event"], "title": title}
         warnings = list(parsed["warnings"])
         target, reason = None, None
         if plan["route"] == "calendar":

@@ -470,20 +470,24 @@ class Store:
                 copy[key] = [dict(item) if isinstance(item, dict) else item for item in value]
         return copy
 
-    def _read_note(self, relative: str) -> tuple[dict | None, str | None]:
+    def _read_note(self, relative: str, *, cached_note: dict | None = None) -> tuple[dict | None, str | None]:
         try:
             content = self._content(relative)
             if content is None:
                 return None, None
+            version = digest(content)
+            if cached_note is not None and cached_note["version"] == version:
+                return cached_note, None
             meta, body = decode_note(content)
-            return {**meta, "body": body, "path": relative, "version": digest(content)}, None
+            return {**meta, "body": body, "path": relative, "version": version}, None
         except (ValueError, yaml.YAMLError, OSError, TypeError) as exc:
             return None, relative + ": " + str(exc)
 
-    def _scan(self):
+    def _scan(self, *, validate_cached=False):
         notes, warnings, seen, present = [], [], {}, set()
         entries = []
         changed = []
+        validation_cache = {}
         # A file changed within the last seconds may change again inside the same timestamp tick
         # with the same size; like git's "racily clean" entries, such files are always read again.
         racy_after = time.time_ns() - 2_000_000_000
@@ -495,18 +499,27 @@ class Store:
             except OSError:
                 key = None
             cached = self._index.get(relative)
-            if key is not None and cached is not None and cached[:2] == key and key[0] < racy_after:
+            if not validate_cached and key is not None and cached is not None and cached[:2] == key and key[0] < racy_after:
                 entries.append((relative, key, (cached[2], cached[3])))
             else:
                 entries.append((relative, key, None))
                 changed.append(relative)
+                if validate_cached and cached is not None:
+                    validation_cache[relative] = cached[2]
+        def read(relative):
+            # Conditional HTTP reads cannot trust timestamps: external editors
+            # may restore mtime after a same-size change. Hash the actual text,
+            # retaining the expensive parsed YAML only when its version matches.
+            if relative in validation_cache:
+                return self._read_note(relative, cached_note=validation_cache[relative])
+            return self._read_note(relative)
         # Windows file opens dominate cold scans. Bounded parallel reads overlap that latency;
         # parsing and cache publication stay in scan order so duplicate-ID warnings stay stable.
         if len(changed) >= 32:
             with ThreadPoolExecutor(max_workers=8) as pool:
-                loaded = dict(zip(changed, pool.map(self._read_note, changed)))
+                loaded = dict(zip(changed, pool.map(read, changed)))
         else:
-            loaded = {relative: self._read_note(relative) for relative in changed}
+            loaded = {relative: read(relative) for relative in changed}
         for relative, key, cached_result in entries:
             if cached_result is None:
                 note, error = loaded[relative]
@@ -745,13 +758,13 @@ class Store:
             operation_id = self._operation(db, note_id, "delete", changes)
             return {"id": note_id, "deleted": True, "operation_id": operation_id}
 
-    def list_notes(self):
+    def list_notes(self, *, validate_cached=False):
         with self.lock, self._db() as db:
             self._recover(db)
-            notes, _ = self._scan()
+            notes, _ = self._scan(validate_cached=validate_cached)
             return sorted(notes, key=lambda n: (n["created"], n["id"]), reverse=True)
 
-    def dashboard(self):
+    def dashboard(self, *, validate_cached=False):
         with self.lock, self._db() as db:
             self._recover(db)
             now = self.clock()
@@ -772,7 +785,7 @@ class Store:
                 SELECT note_id FROM operations
                 WHERE kind = 'auto_rollover' AND status != 'applied'
             """)}
-            notes, scan_warnings = self._scan()
+            notes, scan_warnings = self._scan(validate_cached=validate_cached)
             rollover_warnings = []
             attempted_rollover = False
             for note in notes:
@@ -787,7 +800,7 @@ class Store:
                 except ConflictError as exc:
                     rollover_warnings.append(f"Автоперенос {note['id']}: {exc}")
             if attempted_rollover:
-                notes, scan_warnings = self._scan()
+                notes, scan_warnings = self._scan(validate_cached=validate_cached)
             warnings = rollover_warnings + scan_warnings
             warnings += [f"Операция {r['id']}: {r['status']}. {r['error'] or 'Запись на диск ожидает повторения'}"
                          for r in db.execute("SELECT id,status,error FROM operations WHERE status!='applied'")]

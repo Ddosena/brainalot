@@ -218,7 +218,7 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     host.create_windows(Webview())
     assert host.full.on_top and host.widget.on_top
     assert host.widget.options["shadow"] is False  # DWM's default square fringe defeats rounded client regions.
-    assert host.full.options.get("shadow", True) is True
+    assert host.full.options["shadow"] is False
     host.window_action("bar")
     assert host.mode == "bar" and host.widget.width == 84 and host.widget.height == 48
     assert host.widget.x == 1920-84
@@ -245,6 +245,25 @@ def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeyp
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     rect, minimum = host._rect("card")
     assert rect == {"x": 100, "y": 200, "width": 360, "height": 128} and minimum == (360, 128)
+
+
+def test_native_full_lifecycle_notifies_own_iframes_before_hide(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
+    host.create_windows(Webview())
+    try:
+        host.window_action("full")
+        assert any(isinstance(call, tuple) and call[0] == "evaluate_js" and "brainalot:visibility" in call[1] and "visible:true" in call[1]
+                   for call in host.full.calls)
+        host.full.calls.clear()
+        host.window_action("card")
+        notification = next(i for i, call in enumerate(host.full.calls)
+                            if isinstance(call, tuple) and call[0] == "evaluate_js" and "brainalot:visibility" in call[1])
+        script = host.full.calls[notification][1]
+        assert "visible:false" in script and "frame.contentDocument" in script and "location.origin" in script
+        assert notification < host.full.calls.index("hide")
+    finally:
+        host.destroy()
 
 
 def test_geometry_is_independent_debounced_and_flushed(tmp_path, monkeypatch):

@@ -105,7 +105,7 @@ export function mountSpotifyPlayer(container, {onVisibility = () => {}, settings
     const settingsLabel = t("Громкость и режимы Spotify");
     expand.setAttribute("aria-label", settingsLabel); expand.title = settingsLabel;
     expand.setAttribute("aria-expanded", String(expanded)); details.setAttribute("aria-expanded", String(expanded));
-    volumeText.textContent = t("Громкость Spotify"); volume.setAttribute("aria-label", t("Громкость Spotify"));
+    volumeText.textContent = t("Громкость Spotify в Windows"); volume.setAttribute("aria-label", t("Громкость Spotify в Windows"));
     const allowedVolume = state?.controls?.volume === true;
     const knownVolume = allowedVolume && Number.isFinite(state.volume);
     volume.disabled = !allowedVolume; volume.dataset.pending = String(busyAction === "volume");

@@ -1,0 +1,15 @@
+.home-capture-actions{position:fixed;z-index:30;left:16px;right:16px;bottom:16px;display:flex;align-items:stretch;gap:8px}
+.home-capture-actions>.capture-open{position:static;left:auto;right:auto;bottom:auto;flex:1;min-width:0;margin:0;width:auto}
+.quick-voice{flex:none;display:flex;min-width:0}
+.quick-voice-start{display:grid;place-items:center;min-width:48px;width:48px;min-height:44px;padding:10px;border:1px solid var(--line);border-radius:11px;background:var(--card);color:var(--accent);cursor:pointer;box-shadow:0 7px 20px var(--soft-shadow)}
+.quick-voice-start>svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.quick-voice-start:hover:not(:disabled){background:var(--tint)}.quick-voice-start:disabled{opacity:.6;cursor:default}
+.quick-voice-start[data-state=recording]{color:var(--error);background:var(--error-bg);outline:2px solid var(--error);outline-offset:-2px}
+.quick-voice :where(button):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.quick-voice-progress,.quick-voice-toast{position:absolute;bottom:calc(100% + 9px);left:0;right:0;box-sizing:border-box;padding:12px 14px;border-radius:12px;background:var(--card);color:var(--ink);box-shadow:0 9px 28px #0003;line-height:1.4}
+.quick-voice [hidden]{display:none!important}
+#quick-voice-status{font-size:12px;margin:0;overflow-wrap:anywhere}#quick-voice-status[data-error=true]{color:var(--error)}
+.quick-voice-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:7px}.quick-voice-actions:has(button:not([hidden])){min-height:28px}
+.quick-voice-actions>button,#quick-voice-edit{border:0;border-radius:7px;padding:6px 9px;background:var(--tint);color:var(--accent);font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+.quick-voice-toast{display:flex;align-items:center;gap:12px}.quick-voice-toast>div{flex:1;min-width:0}.quick-voice-toast strong,.quick-voice-toast span{display:block;overflow-wrap:anywhere}.quick-voice-toast strong{font-size:13px;font-weight:600}.quick-voice-toast span{font-size:12px;color:var(--muted);margin-top:3px}
+@media(max-width:340px){.home-capture-actions{left:10px;right:10px;bottom:10px;gap:6px}.quick-voice-start{width:44px;min-width:44px}.quick-voice-progress,.quick-voice-toast{padding:10px}}

@@ -115,6 +115,14 @@ test("microphone problems become plain Russian or English messages", async () =>
   assert.match(microphoneError({ name: "NotReadableError" }), /another program/);
 });
 
+test("microphone permission recovery refers to the owning desktop or browser", () => {
+  for (const name of ["NotAllowedError", "SecurityError"]) {
+    assert.match(microphoneError({ name }, { desktop: true }), /настольных приложений в настройках Windows/);
+    assert.doesNotMatch(microphoneError({ name }, { desktop: true }), /Chrome/);
+    assert.match(microphoneError({ name }, { desktop: false }), /настройках Chrome/);
+  }
+});
+
 test("the preferred format is Opus in WebM and the level meter is RMS", () => {
   assert.equal(pickMimeType(FakeRecorder), "audio/webm;codecs=opus");
   assert.equal(pickMimeType({ isTypeSupported: () => false }), "");
@@ -242,4 +250,117 @@ test("cancel while Chrome asks for the microphone releases it instead of recordi
   assert.equal(recorder.state, "idle");
   assert.equal(clock.stoppedTracks, 1);
   assert.equal(clock.ticks, null);
+});
+
+test("a cancelled permission request cannot take over a newer recording", async () => {
+  const { options } = harness();
+  const grants = [], stopped = [];
+  const recorder = createVoiceRecorder({ ...options, getUserMedia: () => new Promise(resolve => grants.push(resolve)) });
+  const old = recorder.start();
+  recorder.cancel();
+  const next = recorder.start();
+  grants[0]({ getTracks: () => [{ stop: () => stopped.push("old") }] });
+  await old;
+  assert.equal(recorder.state, "starting");
+  grants[1]({ getTracks: () => [{ stop: () => stopped.push("next") }] });
+  await next;
+  assert.equal(recorder.state, "recording");
+  assert.deepEqual(stopped, ["old"]);
+  recorder.cancel();
+  assert.deepEqual(stopped, ["old", "next"]);
+});
+
+test("a recorder construction failure returns the microphone immediately", async () => {
+  const { options, clock } = harness();
+  const recorder = createVoiceRecorder({ ...options, MediaRecorderClass: class {
+    constructor() { throw new Error("unsupported recorder"); }
+  } });
+  await assert.rejects(recorder.start(), /unsupported/);
+  assert.equal(recorder.state, "idle");
+  assert.equal(clock.stoppedTracks, 1);
+});
+
+test("cancel during transcription ignores late words and callbacks", async () => {
+  const { options, advance } = harness();
+  const button = Object.assign(new EventTarget(), { dataset: {}, setAttribute() {}, style: { setProperty() {} } });
+  const textarea = Object.assign(new EventTarget(), { value: "", selectionStart: 0, selectionEnd: 0 });
+  const status = { textContent: "", hidden: true, dataset: {} };
+  let respond, callbacks = 0;
+  const control = attachDictation({ button, textarea, status, getToken: async () => "x", recorderOptions: options,
+    transcribe: () => new Promise(resolve => { respond = resolve; }), onResult: () => callbacks++ });
+  button.dispatchEvent(new Event("click"));
+  await new Promise(resolve => setImmediate(resolve));
+  advance(100, .4);
+  const finishing = control.finish();
+  await new Promise(resolve => setImmediate(resolve));
+  control.cancel();
+  respond({ text: "late words" });
+  await finishing;
+  assert.equal(textarea.value, "");
+  assert.equal(callbacks, 0);
+  assert.equal(status.hidden, true);
+});
+
+test("settle waits for a pending microphone permission then transcribes", async () => {
+  const { options, advance } = harness();
+  let grant;
+  const button = Object.assign(new EventTarget(), { dataset: {}, setAttribute() {}, style: { setProperty() {} } });
+  const textarea = Object.assign(new EventTarget(), { value: "", selectionStart: 0, selectionEnd: 0 });
+  const control = attachDictation({ button, textarea, getToken: async () => "x", recorderOptions: {
+    ...options, getUserMedia: () => new Promise(resolve => { grant = resolve; }) }, transcribe: async () => ({ text: "words" }) });
+  button.dispatchEvent(new Event("click"));
+  await new Promise(resolve => setImmediate(resolve));
+  let settled = false;
+  const pending = control.settle().then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  grant(await options.getUserMedia({}));
+  // The permission resolution starts the recorder; wait one microtask before its owner stops it.
+  queueMicrotask(() => advance(100, .4));
+  await pending;
+  assert.equal(control.recorder.state, "idle");
+});
+
+test("a recording device error releases the stream and reports the failure", async () => {
+  const { options, clock } = harness();
+  let device;
+  const failures = [];
+  const recorder = createVoiceRecorder({ ...options, MediaRecorderClass: class extends FakeRecorder {
+    constructor(...args) { super(...args); device = this; }
+  }, onError: error => failures.push(error.message) });
+  await recorder.start();
+  device.dispatchEvent(new Event("error"));
+  assert.equal(recorder.state, "idle");
+  assert.equal(clock.stoppedTracks, 1);
+  assert.equal(clock.closed, true);
+  assert.match(failures[0], /Запись прервалась/);
+});
+
+test("transcription timeout and explicit cancellation abort the fetch", async () => {
+  const blob = new Blob(["audio"], { type: "audio/webm" });
+  const fetcher = (_url, { signal }) => new Promise((_resolve, reject) => {
+    const abort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+    if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+  });
+  await assert.rejects(transcribeAudio(blob, { token: "x", fetcher, timeoutMs: 5 }), /слишком много времени/);
+  const controller = new AbortController();
+  const pending = transcribeAudio(blob, { token: "x", fetcher, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(pending, /слишком много времени/);
+});
+
+test("settle rejects a failed dictation so Submit cannot save only the older text", async () => {
+  const { options, advance } = harness();
+  const button = Object.assign(new EventTarget(), { dataset: {}, setAttribute() {}, style: { setProperty() {} } });
+  const textarea = Object.assign(new EventTarget(), { value: "Existing draft", selectionStart: 14, selectionEnd: 14 });
+  const status = { textContent: "", hidden: true, dataset: {} };
+  const control = attachDictation({ button, textarea, status, getToken: async () => "x", recorderOptions: options,
+    transcribe: async () => { throw new Error("ASR unavailable"); } });
+  button.dispatchEvent(new Event("click"));
+  await new Promise(resolve => setImmediate(resolve));
+  advance(100, .4);
+  await assert.rejects(control.settle(), /ASR unavailable/);
+  assert.equal(textarea.value, "Existing draft");
+  assert.equal(status.dataset.error, "true");
+  assert.equal(control.recorder.state, "idle");
 });

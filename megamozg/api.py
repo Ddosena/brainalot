@@ -164,7 +164,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.get("/api/dashboard")
     def dashboard(request: Request):
-        return conditional_json(request, store.dashboard())
+        return conditional_json(request, store.dashboard(validate_cached="if-none-match" in request.headers))
 
     @app.get("/desktop/{asset:path}")
     def desktop_asset(asset: str):
@@ -420,7 +420,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.get("/api/notes")
     def notes(request: Request):
-        return conditional_json(request, {"notes": store.list_notes()})
+        return conditional_json(request, {"notes": store.list_notes(validate_cached="if-none-match" in request.headers)})
 
     @app.post("/api/attachments")
     async def upload_attachment(request: Request):

@@ -29,6 +29,30 @@ async function start({saved={},state={status:'idle',mode:'pomodoro',elapsed_ms:0
   await new Promise(setImmediate);
   return {nodes,getNode:document.getElementById,intervals,events,actions,writes,timeClient,saved,get gesture(){return gesture;},fail(){failRefresh=true;},catalog(value){catalog=Promise.resolve(value);}};
 }
+
+test('ordinary picker offers rest during running work and switches attribution without stopping the timer',async()=>{
+  const task={source:'library',id:'a',title:'A'};
+  const app=await start({state:{status:'running',mode:'stopwatch',task,revision:4,elapsed_ms:120000,duration_ms:0},
+    catalog:Promise.resolve({notes:[{...task,kind:'task',status:'active'}]})});
+  const commands=[];
+  app.timeClient.command=async(action,fields)=>{
+    commands.push({action,...fields});
+    app.timeClient.state={...app.timeClient.state,...fields,revision:5};
+    return app.timeClient.state;
+  };
+  app.events['brainalot-widget-mode']({detail:'card'});
+  await app.nodes.get('widget-task').onclick();await new Promise(setImmediate);
+  const rest=app.nodes.get('widget-task-list').children.find(row=>row.dataset.task==='label:rest');
+  assert.ok(rest,'Rest is present outside the idle activity prompt');
+  await rest.onclick();await new Promise(setImmediate);
+  assert.deepEqual(commands,[{action:'switch_task',task:{source:'label',id:'rest',title:'Отдых'}}]);
+  assert.equal(app.timeClient.state.status,'running');
+  assert.equal(app.timeClient.state.elapsed_ms,120000);
+  assert.equal(app.nodes.get('widget-burning').textContent,'Отдых');
+  app.timeClient.state={...app.timeClient.state,status:'paused',revision:6};
+  await app.intervals[0]();
+  assert.equal(app.nodes.get('widget-burning').textContent,'Отдых');
+});
 test('startup preserves selected hot task until authoritative catalog, then recovers deletion',async()=>{
   let release;
   const saved={'desktop:selected-fire':'library:b'};

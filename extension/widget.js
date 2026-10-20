@@ -194,14 +194,16 @@ function renderTasks() {
   const activity = popup === "activity";
   $("widget-picker-title").textContent = activity ? t("Чем занимаешься?") : t("Перейти к задаче");
   const unique = new Map();
+  const rest = {source: "label", id: "rest", title: t("Отдых")};
   if (activity) {
     const add = (task, group) => { if (!unique.has(taskKey(task))) unique.set(taskKey(task), {...task, group}); };
-    add({source: "label", id: "rest", title: t("Отдых")}, "");
+    add(rest, "");
     burning.forEach(task => add(task, t("Горящие")));
     liveEvents.filter(event => !event.all_day && !event.time_skipped).forEach(event => add({source: "calendar", id: eventKey(event), title: event.title || t("Событие")}, t("Сегодня в календаре")));
     taskCatalog.forEach(task => add(task, task.source === "calendar" ? t("Сегодня в календаре") : t("Задачи")));
   }
-  const tasks = (activity ? [...unique.values()] : taskCatalog).filter(task => task.title.toLocaleLowerCase().includes(query));
+  const tasks = (activity ? [...unique.values()] : [rest, ...taskCatalog.filter(task => taskKey(task) !== taskKey(rest))])
+    .filter(task => task.title.toLocaleLowerCase().includes(query));
   const nodes = tasks.map(task => {
     const row = document.createElement("button"); row.type = "button"; row.dataset.task = taskKey(task);
     row.dataset.active = String(active === taskKey(task)); row.disabled = busy || pending();
