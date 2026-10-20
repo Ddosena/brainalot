@@ -238,16 +238,24 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.post("/api/media/spotify/command")
     async def spotify_command(request: Request):
-        data = await payload(request, {"action", "value"})
+        data = await payload(request, {"action", "value", "request_id"})
         action = data.get("action")
-        if not isinstance(action, str) or action not in {"previous", "play_pause", "next", "shuffle", "repeat", "open"}:
+        if not isinstance(action, str) or action not in {"previous", "play_pause", "next", "shuffle", "repeat", "open", "volume"}:
             raise ValidationError("Неизвестная команда Spotify")
         if action == "shuffle" and type(data.get("value")) is not bool:
             raise ValidationError("Shuffle требует true или false")
         if action == "repeat" and (not isinstance(data.get("value"), str) or data["value"] not in {"off", "track", "list"}):
             raise ValidationError("Недопустимый режим повтора Spotify")
-        if action not in {"shuffle", "repeat"} and "value" in data:
+        if action == "volume":
+            value = data.get("value")
+            if type(value) not in (int, float) or not 0 <= value <= 1:
+                raise ValidationError("Громкость Spotify должна быть числом от 0 до 1")
+        if action not in {"shuffle", "repeat", "volume"} and "value" in data:
             raise ValidationError("Лишний параметр команды Spotify")
+        if "request_id" in data:
+            return await run_in_threadpool(shared.external_command, "spotify", data,
+                                           lambda: spotify.command(action, data.get("value")))
+        # Older desktop versions did not send receipts. Updated clients always do.
         return await run_in_threadpool(spotify.command, action, data.get("value"))
 
     @app.post("/api/time/command")
@@ -304,7 +312,8 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
         today = date.today()
         events, _ = cached_calendar(today - timedelta(days=31), today + timedelta(days=31))
         tasks.extend({"source": "calendar", "id": key, "title": event.get("title") or "Событие"} for key, event in events.items())
-        return {"tasks": [task for task in tasks if q.casefold() in task["title"].casefold()]}
+        return {"today": today.isoformat(),
+                "tasks": [task for task in tasks if q.casefold() in task["title"].casefold()]}
 
     @app.get("/api/recall")
     def recall_settings():

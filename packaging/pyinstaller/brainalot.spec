@@ -13,6 +13,7 @@ EXTENSION_SKIP = {"tests", "dev", "package.json", "node_modules"}
 
 datas = [(ICON, "packaging/brand")]
 datas.append((str(ROOT / "megamozg" / "spotify_bridge.ps1"), "megamozg"))
+datas.append((str(ROOT / "megamozg" / "spotify_audio.cs"), "megamozg"))
 for name in ("LICENSE", "PRIVACY.md", "THIRD_PARTY_NOTICES.md"):
     datas.append((str(LEGAL_ROOT / name), "."))
 for name in ("OFL-Oswald.txt", "OFL-PTSans.txt"):

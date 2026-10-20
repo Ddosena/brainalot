@@ -6,6 +6,12 @@ The application includes Python, FastAPI, Starlette, Uvicorn, Pydantic, PyYAML, 
 
 Oswald and PT Sans fonts are distributed under the SIL Open Font License. Their original notices are included as `extension/fonts/OFL-Oswald.txt` and `extension/fonts/OFL-PTSans.txt`.
 
+The Spotify icon is an unmodified Black/White SVG from Spotify's official icon
+asset package, used to identify and open the local Spotify application.
+Spotify trademarks and brand assets remain the property of Spotify and are
+subject to its brand guidelines, not Brainalot's source-code license:
+https://developer.spotify.com/documentation/design.
+
 The Whisper speech model is downloaded separately when voice input is first enabled. Model weights are not included in the installer; their upstream repository and license are distinct from the Brainalot source license. Audio is processed locally.
 
 Source and support: https://github.com/Ddosena/brainalot

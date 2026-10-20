@@ -1,16 +1,35 @@
-.spotify-player{height:52px;flex:none;box-sizing:border-box;display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--card);color:var(--ink);border-bottom:1px solid var(--line);min-width:0}
-.spotify-player[hidden]{display:none!important}
-.spotify-details{flex:1;min-width:0;line-height:1.25}
+.spotify-player{height:52px;flex:none;box-sizing:border-box;display:flex;align-items:center;gap:7px;padding:5px 12px;background:var(--card);color:var(--ink);border-bottom:1px solid var(--line);min-width:0;position:relative;isolation:isolate;transition:background-color 160ms ease-out}
+.spotify-player[hidden],.spotify-settings[hidden]{display:none!important}
+.spotify-player[data-settings-open=true]{z-index:20}
+.spotify-player:hover,.spotify-player:focus-within{background:var(--tint)}
+.spotify-player button,.spotify-settings button{font:inherit;margin:0;border:0;cursor:pointer;color:var(--muted);background:transparent}
+.spotify-brand{display:grid;place-items:center;width:34px;height:34px;min-width:34px;padding:5px!important;border-radius:50%;flex:none}
+.spotify-brand img{width:24px;height:24px;object-fit:contain;pointer-events:none}
+.spotify-logo-white{display:none}
+:root[data-theme=dark] .spotify-logo-white{display:block}:root[data-theme=dark] .spotify-logo-black{display:none}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]):not([data-theme=dark]) .spotify-logo-white{display:block}:root:not([data-theme=light]):not([data-theme=dark]) .spotify-logo-black{display:none}}
+.spotify-details{flex:1;min-width:0;padding:3px 0!important;text-align:left;line-height:1.25;border-radius:5px;color:var(--ink)!important}
 .spotify-details strong,.spotify-details>span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.spotify-details strong{font-size:12px;font-weight:600}
-.spotify-details>span{margin-top:3px;font-size:11px;color:var(--muted)}
+.spotify-details strong{font-size:12px;font-weight:600}.spotify-details>span{margin-top:3px;font-size:11px;color:var(--muted)}
 .spotify-controls{display:flex;align-items:center;gap:1px;flex:none}
-.spotify-controls>button{position:relative;display:grid;place-items:center;width:25px;height:28px;min-width:25px;min-height:28px;padding:4px;margin:0;border:0;border-radius:7px;background:transparent;color:var(--muted);cursor:pointer}
-.spotify-controls>button:hover{background:var(--tint);color:var(--ink)}
-.spotify-controls>button:disabled{opacity:.38;cursor:default}
-.spotify-controls>button[aria-pressed=true]{background:var(--tint);color:var(--accent)}
-.spotify-controls>button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-.spotify-controls svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
-.spotify-controls>button[data-repeat=track]::after{content:"1";position:absolute;right:1px;bottom:0;font-size:9px;font-weight:650;line-height:1}
+.spotify-controls>button{position:relative;display:grid;place-items:center;width:26px;height:30px;min-width:26px;min-height:30px;padding:5px;border-radius:8px;transition:background-color 120ms ease-out,color 120ms ease-out}
+.spotify-controls>button:hover:not(:disabled),.spotify-settings button:hover:not(:disabled),.spotify-brand:hover:not(:disabled){background:var(--tint);color:var(--ink)}
+.spotify-controls>button[data-spotify-action=play_pause]{border-radius:50%;background:var(--ink);color:var(--card);width:27px;height:27px;min-height:27px;margin:0 2px}
+.spotify-player button:disabled,.spotify-settings button:disabled{opacity:.38;cursor:default}
+.spotify-player button[data-pending=true],.spotify-settings button[data-pending=true]{opacity:1;background:var(--tint);color:var(--accent)}
+.spotify-player button:active:not(:disabled),.spotify-settings button:active:not(:disabled){background:var(--accent);color:var(--accent-contrast,var(--bg))}
+.spotify-player button:focus-visible,.spotify-settings button:focus-visible,.spotify-settings input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.spotify-controls svg,.spotify-settings svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;pointer-events:none;flex:none}
 .spotify-status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 .spotify-player[data-error=true] .spotify-details>span{color:var(--error,var(--muted))}
+.spotify-settings{position:absolute;z-index:40;right:8px;top:calc(100% + 7px);width:280px;max-width:calc(100% - 16px);padding:14px;box-sizing:border-box;border-radius:14px;background:var(--card);color:var(--ink);box-shadow:0 10px 28px var(--strong-shadow,#0004);line-height:1.4}
+.spotify-settings-external{position:static;max-width:none;width:100%;box-shadow:none;border-radius:0;padding:0}
+.spotify-settings-head{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:14px}
+.spotify-settings-head strong{font-size:14px;font-weight:600}.spotify-settings-head>button{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;padding:5px}
+.spotify-volume-label{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--ink)}.spotify-volume-label output{margin-left:auto;font-variant-numeric:tabular-nums}
+.spotify-settings input[type=range]{width:100%;padding:0;margin:10px 0 0;accent-color:var(--accent);height:22px;cursor:pointer}.spotify-settings input:disabled{opacity:.4;cursor:default}
+.spotify-volume-note{color:var(--muted);font-size:11px;line-height:1.4;margin:5px 0 14px}
+.spotify-modes{display:flex;gap:6px;border-top:1px solid var(--line);padding-top:10px}.spotify-modes button{display:flex;align-items:center;gap:7px;min-width:0;flex:1;border-radius:9px;padding:9px 7px;font-size:11px;line-height:1.3;text-align:left}
+.spotify-modes button[aria-pressed=true]{background:var(--tint);color:var(--accent)}
+@media(max-width:340px){.spotify-player{gap:4px;padding-left:8px;padding-right:8px}.spotify-brand{width:31px;min-width:31px;padding:3px!important}.spotify-controls>button{width:24px;min-width:24px;padding:4px}}
+@media(prefers-reduced-motion:reduce){.spotify-player,.spotify-player button,.spotify-settings button{transition:none}}

@@ -223,7 +223,7 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     assert host.mode == "bar" and host.widget.width == 84 and host.widget.height == 48
     assert host.widget.x == 1920-84
     host.window_action("card")
-    assert host.mode == "card" and (host.widget.width, host.widget.height) == (360, 116)
+    assert host.mode == "card" and (host.widget.width, host.widget.height) == (360, 128)
     assert host.widget.x == 1920-360
     host.window_action("topmost", False)
     assert host.widget.on_top is True and host.full.on_top is True
@@ -244,7 +244,7 @@ def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeyp
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     rect, minimum = host._rect("card")
-    assert rect == {"x": 100, "y": 200, "width": 360, "height": 116} and minimum == (360, 116)
+    assert rect == {"x": 100, "y": 200, "width": 360, "height": 128} and minimum == (360, 128)
 
 
 def test_geometry_is_independent_debounced_and_flushed(tmp_path, monkeypatch):
@@ -317,7 +317,7 @@ def test_four_edge_snap_and_inward_card_preserve_position(tmp_path, monkeypatch,
     assert desktop.DesktopHost(tmp_path, 8780, "test", lambda: True).side == side
 
 
-@pytest.mark.parametrize("side,y,above", [("top", 0, False), ("bottom", 736, True),
+@pytest.mark.parametrize("side,y,above", [("top", 0, False), ("bottom", 724, True),
                                        ("right", 650, True), ("left", 100, False)])
 def test_popup_geometry_does_not_persist_temporary_height(tmp_path, monkeypatch, side, y, above):
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
@@ -330,10 +330,10 @@ def test_popup_geometry_does_not_persist_temporary_height(tmp_path, monkeypatch,
     opened = host.window_action("widget_popup", {"open": True, "height": 360})
     assert opened == {"ok": True, "height": 360, "popup_above": above}
     host._remember_geometry(host.widget, "widget")
-    assert host.state.data["geometry"]["card"]["height"] == 64
+    assert host.state.data["geometry"]["card"]["height"] == 76
     assert host.state.data["geometry"]["card"]["y"] == y
     rect = desktop.native_rect(host.widget)
-    assert rect["y"]+rect["height"] == y+64 if above else rect["y"] == y
+    assert rect["y"]+rect["height"] == y+76 if above else rect["y"] == y
     host.window_action("widget_popup", {"open": False})
     assert desktop.native_rect(host.widget) == base
     host.destroy()
@@ -344,14 +344,14 @@ def test_popup_limits_to_workarea_and_mode_switch_restores_base(tmp_path, monkey
     host.media_visible = False
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(-1400, -200, 1400, 900, dpi=144)])
     host.create_windows(Webview()); host.window_action("card")
-    host.side = "bottom"; host.widget.move(-700, 604)
+    host.side = "bottom"; host.widget.move(-700, 586)
     result = host.window_action("widget_popup", {"open": True, "height": 5000})
     assert result == {"ok": True, "popup_above": True, "height": 600}
     assert desktop.native_rect(host.widget)["y"] == -200
     host.window_action("bar")
     assert host._popup_base is None
-    assert host.state.data["geometry"]["card"]["height"] == 96
-    assert host.state.data["geometry"]["card"]["y"] == 604
+    assert host.state.data["geometry"]["card"]["height"] == 114
+    assert host.state.data["geometry"]["card"]["y"] == 586
     assert (host.widget.width, host.widget.height) == (126, 72)
     host.destroy()
 
@@ -365,17 +365,17 @@ def test_widget_media_height_preserves_base_anchor_and_popup(tmp_path,monkeypatc
     host.create_windows(Webview());host.window_action("card");host.side=side
     host.window_action("widget_media",{"visible":False})
     scale=dpi/96
-    base={"x":-900,"y":-200 if side=="top" else 700-round(64*scale) if side=="bottom" else 0,
-          "width":round(360*scale),"height":round(64*scale)}
+    base={"x":-900,"y":-200 if side=="top" else 700-round(76*scale) if side=="bottom" else 0,
+          "width":round(360*scale),"height":round(76*scale)}
     desktop.set_native_rect(host.widget,base)
     expanded=host.window_action("widget_media",{"visible":True})
     card=desktop.native_rect(host.widget)
-    assert expanded["card_height"]==116 and card["height"]==round(116*scale)
+    assert expanded["card_height"]==128 and card["height"]==round(128*scale)
     assert card["y"]+card["height"]==base["y"]+base["height"] if side=="bottom" else card["y"]==base["y"]
     host.window_action("widget_popup",{"open":True,"height":400})
     host.window_action("widget_media",{"visible":False})
-    assert host._popup_base["height"]==round(64*scale)
-    assert host.state.data["geometry"]["card"]["height"]==round(64*scale)
+    assert host._popup_base["height"]==round(76*scale)
+    assert host.state.data["geometry"]["card"]["height"]==round(76*scale)
     host.window_action("widget_popup",{"open":False})
     assert desktop.native_rect(host.widget)==base
     host.window_action("bar")
@@ -392,7 +392,7 @@ def test_widget_media_requires_boolean_and_bootstrap_returns_saved_visibility(tm
     monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1040)])
     host.create_windows(Webview())
     assert desktop.DesktopBridge(host).bootstrap()["media_visible"] is False
-    assert host._widget_size("card")== (360,64)
+    assert host._widget_size("card")== (360,76)
     with pytest.raises(ValueError):host.window_action("widget_media",{"visible":"true"})
     host.destroy()
 
@@ -402,11 +402,33 @@ def test_full_window_minimum_and_bootstrap_system_double_click(tmp_path, monkeyp
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     host.create_windows(Webview())
     host.state.data["geometry"]["full"] = {"width": 1, "height": 1}
+    host.state.data["full_geometry_layout"] = desktop.FULL_GEOMETRY_LAYOUT
     assert host._rect("full")[0]["width"] == 300
     assert host._rect("full")[0]["height"] == 360
     settings = desktop.DesktopBridge(host).bootstrap()["double_click"]
     assert settings["interval_ms"] > 0 and settings["width"] > 0 and settings["height"] > 0
     host.destroy()
+
+
+@pytest.mark.parametrize("area",[desktop.WorkArea(0,0,1280,800,dpi=96),
+                                 desktop.WorkArea(-2560,-200,2560,1400,dpi=144)])
+def test_full_geometry_migrates_once_then_preserves_manual_resize(tmp_path,monkeypatch,area):
+    state=desktop.DesktopState(tmp_path)
+    state.data['geometry']['full']={'x':area.x+50,'y':area.y+40,'width':1120,'height':760,'units':'physical','dpi':area.dpi}
+    state.save()
+    host=desktop.DesktopHost(tmp_path,8780,'test',lambda:True)
+    monkeypatch.setattr(host,'_areas',lambda:[area])
+    migrated,_=host._rect('full')
+    assert migrated['width']==round(484*area.dpi/96)
+    assert migrated['height']==min(area.height,round(900*area.dpi/96))
+    assert area.y<=migrated['y']<=area.y+area.height-migrated['height']
+    assert desktop.DesktopState(tmp_path).data['full_geometry_layout']==desktop.FULL_GEOMETRY_LAYOUT
+    manual={**migrated,'width':620,'height':650,'units':'physical','dpi':area.dpi}
+    host.state.data['geometry']['full']=manual;host.state.save()
+    successor=desktop.DesktopHost(tmp_path,8780,'test',lambda:True)
+    monkeypatch.setattr(successor,'_areas',lambda:[area])
+    resized,_=successor._rect('full')
+    assert resized['width']==620 and resized['height']==650
 
 
 def test_compact_cpu_surface_routes_buttons_keyboard_and_passive_double_clicks(monkeypatch):

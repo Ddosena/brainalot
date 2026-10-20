@@ -179,24 +179,30 @@ export function createTimeClient(api, {storage = null, pendingKey = "time:pendin
       throw error;
     } finally {inFlight=null;}
   }
+  async function submit(action, fields = {}, receipt = null) {
+    await ensureReady();
+    if (busy || retrying) throw new Error(t("Дождитесь ответа сервиса."));
+    busy = true;
+    try {
+      if(outboxPrefix) await restorePending({force:true});
+      if (pending && (!receipt || JSON.stringify(pending) !== JSON.stringify(receipt))) throw new Error(t("Ответ на прошлую команду не получен. Нажмите «Проверить повтор»."));
+      if (!state) await refresh();
+      pending = receipt ? structuredClone(receipt) : {request_id:crypto.randomUUID(), expected_revision:state.revision, action, ...fields};
+      pendingSaved=false;recovered=false;
+      return await deliverPending();
+    } finally { busy = false; }
+  }
   return {
     get state() { return state; }, get pending() { return pending; }, get pendingRecovered() { return recovered; },
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     refresh,
-    async command(action, fields = {}) {
-      await ensureReady();
-      if (busy || retrying) throw new Error(t("Дождитесь ответа сервиса."));
-      busy = true;
-      try {
-        if(outboxPrefix) await restorePending({force:true});
-        if (pending) throw new Error(t("Ответ на прошлую команду не получен. Нажмите «Проверить повтор»."));
-        if (!state) await refresh();
-        pending = { request_id: crypto.randomUUID(), expected_revision: state.revision, action, ...fields };
-        pendingSaved=false;recovered=false;
-        // persist() in delivery runs before the API; failed local saves retain
-        // the exact unsent command in memory for an explicit safe retry.
-        return await deliverPending();
-      } finally { busy = false; }
+    command: (action, fields = {}) => submit(action, fields),
+    async commandWithReceipt(receipt) {
+      if (!receipt || typeof receipt.request_id !== "string" || !receipt.request_id || !Number.isInteger(receipt.expected_revision) || typeof receipt.action !== "string") throw new Error(t("Некорректная сохранённая команда учёта."));
+      await submit(null, {}, receipt);
+      // The same receipt may have been recovered elsewhere, followed by a pause,
+      // stop or task change. Never resurrect its historical running snapshot.
+      return refresh();
     },
     retry() {
       if(busy) return Promise.reject(new Error(t("Дождитесь ответа сервиса.")));

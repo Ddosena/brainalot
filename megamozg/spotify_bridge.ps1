@@ -38,21 +38,36 @@ function Get-SpotifySession {
 function New-SpotifyState {
     return @{
         available = (-not $script:InitializationError); connected = $false; source_id = $null
-        title = ''; artist = ''; playing = $false; shuffle = $null; repeat = $null
-        controls = @{previous=$false; play_pause=$false; next=$false; shuffle=$false; repeat=$false; open=$true}
+        title = ''; artist = ''; playing = $false; shuffle = $null; repeat = $null; volume = $null
+        controls = @{previous=$false; play_pause=$false; next=$false; shuffle=$false; repeat=$false; open=$true; volume=$false}
         error = $null
     }
 }
 
-function Read-SpotifyState($Session) {
+function Get-SpotifyAudio($Value = $null) {
+    try {
+        if (-not ('Brainalot.SpotifyAudio' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'spotify_audio.cs') }
+        if ($null -eq $Value) { return [Brainalot.SpotifyAudio]::Read() }
+        return [Brainalot.SpotifyAudio]::Set([double]$Value)
+    } catch { return @{Available=$false;Success=$false;Volume=$null;Error='Spotify volume is unavailable'} }
+}
+
+function Read-SpotifyState($Session, [bool]$Metadata = $true, [bool]$Audio = $true) {
     $state = New-SpotifyState
+    if (-not $Metadata) { $state.Remove('title'); $state.Remove('artist') }
+    if (-not $Audio) { $state.Remove('volume'); $state.controls.Remove('volume') }
     if ($null -eq $Session) { return $state }
     $info = $Session.GetPlaybackInfo()
-    $media = Await-WinRT ($Session.TryGetMediaPropertiesAsync()) $script:PropertiesType
     $state.connected = $true
     $state.source_id = $Session.SourceAppUserModelId
-    $state.title = [string]$media.Title
-    $state.artist = [string]$media.Artist
+    if ($Metadata) {
+        # Optional metadata failure must not suppress working playback controls.
+        try {
+            $media = Await-WinRT ($Session.TryGetMediaPropertiesAsync()) $script:PropertiesType
+            $state.title = [string]$media.Title
+            $state.artist = [string]$media.Artist
+        } catch { }
+    }
     $state.playing = [string]$info.PlaybackStatus -eq 'Playing'
     if ($null -ne $info.IsShuffleActive) { $state.shuffle = [bool]$info.IsShuffleActive }
     if ($null -ne $info.AutoRepeatMode) {
@@ -63,6 +78,11 @@ function Read-SpotifyState($Session) {
     $state.controls.play_pause = [bool]$info.Controls.IsPlayPauseToggleEnabled
     $state.controls.shuffle = [bool]$info.Controls.IsShuffleEnabled
     $state.controls.repeat = [bool]$info.Controls.IsRepeatEnabled
+    if ($Audio) {
+        $audioState = Get-SpotifyAudio
+        $state.volume = $audioState.Volume
+        $state.controls.volume = [bool]$audioState.Available
+    }
     return $state
 }
 
@@ -72,10 +92,25 @@ while ($null -ne ($line = [Console]::ReadLine())) {
         $request = $line | ConvertFrom-Json
         if ($script:InitializationError) { throw 'Windows media control is unavailable' }
         $session = Get-SpotifySession
-        $state = Read-SpotifyState $session
+        $fullSnapshot = $request.action -eq 'snapshot'
+        $state = Read-SpotifyState $session $fullSnapshot $fullSnapshot
         $ok = $true
         $errorMessage = $null
-        if ($request.action -ne 'snapshot') {
+        $confirmed = $null
+        if ($request.action -eq 'volume') {
+            if ($request.value -isnot [ValueType] -or $request.value -is [bool] -or
+                [double]::IsNaN([double]$request.value) -or [double]::IsInfinity([double]$request.value) -or
+                [double]$request.value -lt 0 -or [double]$request.value -gt 1) {
+                $ok = $false; $errorMessage = 'Volume requires a number between 0 and 1'
+            } else {
+                $audioState = Get-SpotifyAudio $request.value
+                $state.volume = $audioState.Volume
+                $state.controls.volume = [bool]$audioState.Available
+                $ok = [bool]$audioState.Success
+                $confirmed = $ok
+                if (-not $ok) { $errorMessage = [string]$audioState.Error }
+            }
+        } elseif ($request.action -notin @('snapshot', 'state')) {
             if ($request.action -notin @('previous', 'play_pause', 'next', 'shuffle', 'repeat')) {
                 $ok = $false; $errorMessage = 'Unknown Spotify command'
             } elseif ($null -eq $session) {
@@ -99,10 +134,24 @@ while ($null -ne ($line = [Console]::ReadLine())) {
                 }
                 $ok = [bool](Await-WinRT $operation ([bool]))
                 if (-not $ok) { $errorMessage = 'Spotify rejected the command' }
-                $state = Read-SpotifyState $session
+                # Confirm only lightweight playback fields, never title/artist or
+                # endpoint enumeration. At most 125ms of settling, one SMTC call.
+                $before = $state
+                $confirmed = $false
+                for ($attempt = 0; $attempt -lt 6; $attempt++) {
+                    $state = Read-SpotifyState $session $false $false
+                    $confirmed = switch ($request.action) {
+                        'play_pause' { $state.playing -ne $before.playing }
+                        'shuffle' { $state.shuffle -eq $request.value }
+                        'repeat' { $state.repeat -eq $request.value }
+                        default { $null } # skip acceptance has no state-only proof
+                    }
+                    if (-not $ok -or $null -eq $confirmed -or $confirmed -or $attempt -eq 5) { break }
+                    Start-Sleep -Milliseconds 25
+                }
             }
         }
-        $response = @{id=$request.id; ok=$ok; state=$state; error=$errorMessage}
+        $response = @{id=$request.id; ok=$ok; state=$state; error=$errorMessage; confirmed=$confirmed}
     } catch {
         $script:Manager = $null
         $state = New-SpotifyState

@@ -1,5 +1,5 @@
 import { native } from "./desktop-platform.js";
-import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, getTimePreset, timerFields } from "./time-client.js";
+import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, getTimePreset, saveTimePreset, normalizeTimePreset, timerFields } from "./time-client.js";
 import { applyDocument, syncLocale, localeChange, t } from "./i18n.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { compactTasks, taskKey, resolveActiveTask, untrackedStep, eventKey, currentEvent, timerProgress } from "./widget-model.js";
@@ -7,21 +7,24 @@ import { installWindowGestures } from "./desktop-gestures.js";
 import { FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor } from "./focus-timer.js";
 import { mountSpotifyPlayer } from "./spotify-player.js";
 const $ = id => document.getElementById(id);
-const OP_KEY = "desktop:widget-operation", SELECT_KEY = "desktop:selected-task", SELECT_REV_KEY = "desktop:selected-task-revision";
+const isFull = document.body.classList?.contains("desktop-shell") === true;
+// Full and compact windows must not overwrite each other's uncertain note action.
+const OP_KEY = isFull ? "desktop:full-operation" : "desktop:widget-operation", SELECT_KEY = "desktop:selected-task", SELECT_REV_KEY = "desktop:selected-task-revision";
 applyDocument(); void syncLocale();
 const bootstrap = await native.bootstrap();
 const saved = await chrome.storage.local.get(["desktop:selected-fire", SELECT_KEY, SELECT_REV_KEY, OP_KEY, "desktop:spotify-visible", FOCUS_OVERLAY_COLOR_KEY]);
-let mode = bootstrap.widget_mode === "card" ? "card" : "bar";
+let mode = isFull ? "full" : bootstrap.widget_mode === "card" ? "card" : "bar";
 let burning = [], selectedFire = saved["desktop:selected-fire"] || "", selectedTask = saved[SELECT_KEY] || null;
 let selectedRevision = saved[SELECT_REV_KEY] ?? null;
 let operation = saved[OP_KEY] || null;
 let selectedMode = null, selectedPreview = null, refreshing = false, busy = false, catalogReady = false;
 let liveNotes = [], liveEvents = [], taskCatalog = [], totals = [];
+let catalogToday = null, currentPreset = normalizeTimePreset(null);
 let pendingNotice = false, pollNotice = false;
-let gap = null, asking = false, snoozeUntil = 0;
+let gap = null, asking = false, snoozeUntil = 0, activitySince = null;
 let popup = null, popupQueue = Promise.resolve();
-let mediaVisible = bootstrap.media_visible ?? saved["desktop:spotify-visible"] !== false;
-const askRefs = new Map();
+let mediaVisible = !isFull && (bootstrap.media_visible ?? saved["desktop:spotify-visible"] !== false);
+let spotifyPlayer = null;
 document.body.dataset.side = bootstrap.side || "right";
 document.body.dataset.widgetMode = mode;
 document.body.dataset.mediaVisible = String(mediaVisible);
@@ -31,6 +34,7 @@ function applyProgressColor(value) {
 }
 applyProgressColor(saved[FOCUS_OVERLAY_COLOR_KEY]);
 function mediaVisibility(visible) {
+  if (!visible && popup === "media") void setPopup(null);
   mediaVisible = visible; document.body.dataset.mediaVisible = String(visible);
   $("widget-spotify-toggle").textContent = visible ? t("Скрыть Spotify") : t("Показать Spotify");
   // Share the popup geometry queue so hide/show cannot race a late popup resize.
@@ -58,19 +62,24 @@ async function rememberSelection(task) {
   selectedTask = task; selectedRevision = timeClient.state?.revision ?? null;
   await chrome.storage.local.set({[SELECT_KEY]: task, [SELECT_REV_KEY]: selectedRevision});
 }
+async function reloadSelectionIntent() {
+  const latest = await chrome.storage.local.get([SELECT_KEY, SELECT_REV_KEY]);
+  selectedTask = latest[SELECT_KEY] || null; selectedRevision = latest[SELECT_REV_KEY] ?? null;
+}
 function pending() { return Boolean(timeClient.pending || operation); }
 function clearError() { $("widget-error").hidden = true; $("widget-error").textContent = ""; pendingNotice = pollNotice = false; }
 function error(err, {poll = false, show = true} = {}) {
   pendingNotice = false; pollNotice = poll;
   $("widget-error").textContent = err.message; $("widget-error").hidden = false;
   render();
-  if (show && !poll && mode === "card") void setPopup(popup || "notice");
+  if (show && !poll && mode !== "bar") void setPopup(popup || "notice");
 }
 function syncPopup() {
+  if (isFull) { document.body.dataset.popupAbove = "false"; return Promise.resolve(); }
   const requested = popup;
   // Serialize native geometry mutations: a late open must never undo a close.
   popupQueue = popupQueue.catch(() => {}).then(async () => {
-    const height = (requested === "menu" ? 375 : requested === "notice" ? 235 : 460) + (mediaVisible ? 52 : 0);
+    const height = (requested === "menu" ? 387 : requested === "notice" ? 247 : 472) + (mediaVisible ? 52 : 0);
     const result = await native.window_action("widget_popup", {open: Boolean(requested), height});
     if (result?.ok === false) throw new Error(t("Не удалось открыть список. Повторите действие."));
     document.body.dataset.popupAbove = String(Boolean(result?.popup_above));
@@ -79,13 +88,18 @@ function syncPopup() {
 }
 async function setPopup(next, {focus = false} = {}) {
   if (mode === "bar") next = null;
+  if (next !== "media") spotifyPlayer?.closeSettings?.();
   popup = next;
   $("widget-popup").hidden = !next;
-  $("widget-picker").hidden = next !== "tasks";
+  $("widget-picker").hidden = !["tasks", "activity"].includes(next);
   $("widget-menu").hidden = next !== "menu";
+  $("widget-modes").hidden = next !== "modes";
+  $("widget-music-settings").hidden = next !== "media";
+  $("widget-mode-visible").setAttribute("aria-expanded", String(next === "modes"));
+  $("widget-ask-choice").setAttribute("aria-expanded", String(next === "activity"));
   $("widget-task").setAttribute("aria-expanded", String(next === "tasks"));
   $("widget-more").setAttribute("aria-expanded", String(next === "menu" || next === "notice"));
-  if (next === "tasks") renderTasks();
+  if (["tasks", "activity"].includes(next)) renderTasks();
   try { await syncPopup(); }
   catch (err) {
     // A failed native resize must not recursively try opening its own error popup.
@@ -94,10 +108,11 @@ async function setPopup(next, {focus = false} = {}) {
     $("widget-more").setAttribute("aria-expanded", "false");
     error(err, {show: false}); return false;
   }
-  if (focus && popup === next) (next === "tasks" ? $("widget-search") : $("widget-done")).focus();
+  if (focus && popup === next) (["tasks", "activity"].includes(next) ? $("widget-search") : next === "modes" ? $("widget-work-minutes") : $("widget-done")).focus();
 }
 async function windowMode(next) { await setPopup(null); return native.window_action(next); }
 function setMode(value) {
+  if (isFull) return;
   mode = value === "card" ? "card" : "bar";
   document.body.dataset.widgetMode = mode;
   if (popup) void setPopup(null);
@@ -128,6 +143,8 @@ function render() {
   document.body.dataset.longTime = String(value.length > 5);
   const progress = timerProgress(displayState, elapsedAt(displayState));
   $("widget-progress").style.strokeDasharray = $("widget-tab-progress").style.strokeDasharray = `${progress ?? 0} 100`;
+  $("widget-progress").toggleAttribute("hidden", progress === null);
+  $("widget-tab-progress").toggleAttribute("hidden", progress === null);
   $("widget-time-label").textContent = displayState?.status === "paused" ? t("пауза") : displayState?.mode === "stopwatch" ? t("прошло") : t("осталось");
   const label = state?.status === "running" ? t("Пауза") : state?.status === "paused" ? t("Продолжить") : t("Начать");
   $("widget-run").title = label; $("widget-run").setAttribute("aria-label", label);
@@ -138,13 +155,19 @@ function render() {
   const note = task?.source === "library" && liveNotes.find(note => note.id === task.id);
   $("widget-done").disabled = busy || waiting || !note || !["task", "purchase"].includes(note.kind) || ["done", "cancelled", "archived"].includes(note.status);
   $("widget-done").title = note && ["task", "purchase"].includes(note.kind) ? t("Задача выполнена") : t("Выполнение доступно для задач и покупок");
+  $("widget-complete").disabled = $("widget-done").disabled;
+  $("widget-complete").title = $("widget-done").title;
   $("widget-mode").disabled = busy || waiting;
+  $("widget-mode-visible").disabled = busy || waiting;
   $("widget-task").disabled = busy || waiting;
   $("widget-new").disabled = busy || waiting;
   $("widget-new-form").querySelector("button").disabled = busy || waiting;
   const modeKind = selectedMode || state?.mode || "pomodoro";
-  const modeName = modeKind === "stopwatch" ? t("Секундомер") : modeKind === "break" ? t("Перерыв") : "Pomodoro";
+  const modeName = modeKind === "stopwatch" ? t("Секундомер") : modeKind === "break" ? t("Перерыв") : t("Помодоро");
   $("widget-mode").textContent = t("Сменить режим: {mode}", {mode: modeName});
+  const duration = ["running", "paused"].includes(state?.status) && state.mode === modeKind ? state.duration_ms : modeKind === "break" ? currentPreset.break_ms : currentPreset.work_ms;
+  $("widget-mode-visible").querySelector("span").textContent = modeKind === "stopwatch" ? modeName : t("{mode} · {minutes} мин", {mode: modeName, minutes: Math.round(duration / 60000)});
+  document.querySelectorAll("[data-timer-mode]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.timerMode === modeKind)));
   const title = task?.title || t("Выбрать задачу");
   $("widget-burning").textContent = title; $("widget-task").title = title;
   const isCritical = Boolean(task && model.tasks.some(item => taskKey(item) === taskKey(task)));
@@ -160,8 +183,7 @@ function render() {
   if (asking && gap) {
     const minutes = Math.max(1, Math.floor((Date.now() - gap.since) / 60_000));
     $("widget-ask-title").textContent = t("Чем занимаешься?");
-    const first = $("widget-ask-choice").options[0];
-    if (first && first.value === "") first.textContent = t("Выбрать · {minutes} мин", {minutes});
+    $("widget-ask-choice").textContent = t("Выбрать · {minutes} мин", {minutes});
     $("widget-ask-choice").title = t("{minutes} мин без учёта", {minutes});
     $("widget-tab").title = t("Чем занимаешься?");
   }
@@ -169,18 +191,32 @@ function render() {
 function renderTasks() {
   const query = $("widget-search").value.trim().toLocaleLowerCase();
   const active = taskKey(currentTask());
-  const tasks = taskCatalog.filter(task => task.title.toLocaleLowerCase().includes(query));
+  const activity = popup === "activity";
+  $("widget-picker-title").textContent = activity ? t("Чем занимаешься?") : t("Перейти к задаче");
+  const unique = new Map();
+  if (activity) {
+    const add = (task, group) => { if (!unique.has(taskKey(task))) unique.set(taskKey(task), {...task, group}); };
+    add({source: "label", id: "rest", title: t("Отдых")}, "");
+    burning.forEach(task => add(task, t("Горящие")));
+    liveEvents.filter(event => !event.all_day && !event.time_skipped).forEach(event => add({source: "calendar", id: eventKey(event), title: event.title || t("Событие")}, t("Сегодня в календаре")));
+    taskCatalog.forEach(task => add(task, task.source === "calendar" ? t("Сегодня в календаре") : t("Задачи")));
+  }
+  const tasks = (activity ? [...unique.values()] : taskCatalog).filter(task => task.title.toLocaleLowerCase().includes(query));
   const nodes = tasks.map(task => {
     const row = document.createElement("button"); row.type = "button"; row.dataset.task = taskKey(task);
     row.dataset.active = String(active === taskKey(task)); row.disabled = busy || pending();
     const title = document.createElement("strong"); title.textContent = task.title;
     const detail = document.createElement("small");
     const total = totals.find(item => taskKey(item.task) === taskKey(task))?.total_ms || 0;
-    detail.textContent = `${active === taskKey(task) ? t("Выбрана") + " · " : ""}${t("Всего {time}", {time: formatTotal(total)})}`;
-    row.append(title, detail); row.onclick = () => void chooseTask(task);
+    detail.textContent = `${activity && task.group ? task.group + " · " : ""}${active === taskKey(task) ? t("Выбрана") + " · " : ""}${t("Всего {time}", {time: formatTotal(total)})}`;
+    row.append(title, detail); row.onclick = () => void (activity ? answerActivity(task) : chooseTask(task));
     return row;
   });
   if (!nodes.length) { const empty = document.createElement("p"); empty.textContent = t("Задач не найдено"); nodes.push(empty); }
+  if (activity) {
+    const later = document.createElement("button"); later.id = "widget-activity-later"; later.type = "button"; later.textContent = t("Спросить позже");
+    later.onclick = () => { snoozeUntil = Date.now() + 30 * 60_000; asking = false; render(); void setPopup(null); }; nodes.push(later);
+  }
   $("widget-task-list").replaceChildren(...nodes);
 }
 async function chooseTask(task) {
@@ -202,24 +238,51 @@ $("widget-run").onclick = async () => {
       return action("resume");
     }
     if (!task) return setPopup("tasks", {focus: true});
-    if (await action("start", {...timerFields(selectedMode || (state?.mode === "stopwatch" ? "stopwatch" : "pomodoro"), await getTimePreset()), task})) {
+    const nextMode = selectedMode || (["pomodoro", "stopwatch", "break"].includes(state?.mode) ? state.mode : "pomodoro");
+    if (await action("start", {...timerFields(nextMode, await getTimePreset()), task})) {
       selectedMode = selectedPreview = null; render();
     }
   } catch (err) { error(err); }
 };
-$("widget-stop").onclick = async () => { if (await action("stop")) await setPopup(null); };
-$("widget-mode").onclick = async () => {
-  const next = (selectedMode || timeClient.state?.mode) === "stopwatch" ? "pomodoro" : "stopwatch";
+$("widget-stop").onclick = async () => {
+  const task = currentTask();
+  if (await action("stop")) { await rememberSelection(task); await setPopup(null); }
+};
+async function selectMode(next) {
+  if (busy || pending()) return;
   try {
+    const task = currentTask();
+    currentPreset = await getTimePreset();
     if (["running", "paused"].includes(timeClient.state?.status)) {
-      if (!await action("set_mode", timerFields(next, await getTimePreset()))) return;
+      if (timeClient.state.mode !== next && !await action("set_mode", timerFields(next, currentPreset))) return;
       selectedMode = selectedPreview = null;
+      await rememberSelection(task);
     } else {
-      const fields = timerFields(next, await getTimePreset());
+      const fields = timerFields(next, currentPreset);
       selectedMode = next; selectedPreview = {...fields, status: "idle", elapsed_ms: 0};
     }
     render(); await setPopup(null);
   } catch (err) { error(err); }
+}
+async function openModes() {
+  try {
+    currentPreset = await getTimePreset();
+    $("widget-work-minutes").value = currentPreset.work_ms / 60000;
+    $("widget-break-minutes").value = currentPreset.break_ms / 60000;
+    render(); await setPopup(popup === "modes" ? null : "modes");
+  } catch (err) { error(err); }
+}
+$("widget-mode").onclick = openModes;
+$("widget-mode-visible").onclick = openModes;
+document.querySelectorAll("[data-timer-mode]").forEach(button => { button.onclick = () => void selectMode(button.dataset.timerMode); });
+$("widget-preset-form").onsubmit = async event => {
+  event.preventDefault(); if (busy || pending()) return;
+  const work = Number($("widget-work-minutes").value), rest = Number($("widget-break-minutes").value);
+  if (![work, rest].every(value => Number.isInteger(value) && value >= 1 && value <= 180)) { error(new Error(t("Укажите целое время от 1 до 180 минут."))); return; }
+  busy = true; render();
+  try { currentPreset = await saveTimePreset({work_ms: work * 60000, break_ms: rest * 60000}); clearError(); await setPopup(null); }
+  catch (err) { error(err); }
+  finally { busy = false; render(); }
 };
 async function saveOperation(value) {
   // Save before delivery. A reload or uncertain response keeps the same capture id
@@ -243,10 +306,43 @@ async function finishOperation() {
     if (!op.note) await saveOperation({...op, stage: "select", note});
     taskCatalog = [...taskCatalog.filter(task => task.id !== note.id), {source: "library", id: note.id, title: note.title}];
     liveNotes = [...liveNotes.filter(item => item.id !== note.id), note];
-    selectedTask = {source: "library", id: note.id, title: note.title};
-    // Creating while a timer runs follows the same switch rule as an existing task.
-    if (timeClient.state?.status === "running" && taskKey(timeClient.state.task) !== taskKey(selectedTask)) await timeClient.command("switch_task", {task: selectedTask});
-    await rememberSelection(selectedTask);
+    const capturedTask = {source: "library", id: note.id, title: note.title};
+    if (op.activity) {
+      if (operation.stage !== "activated") {
+        await timeClient.refresh();
+        if (!operation.activation) {
+          if (operation.stage === "activate") throw new Error(t("Не сохранилась квитанция запуска. Задача сохранена; проверьте учёт в другом окне."));
+          if (timeClient.state?.status === "running") throw new Error(t("Учёт уже идёт в другом окне. Проверьте его перед запуском."));
+          const activation = {request_id: crypto.randomUUID(), expected_revision: timeClient.state.revision, action: "start",
+            ...timerFields("stopwatch", await getTimePreset()), task: capturedTask, backfill_from: op.activity.backfill_from};
+          await saveOperation({...operation, stage: "activate", activation});
+        }
+        try { await timeClient.commandWithReceipt(operation.activation); }
+        catch (err) {
+          if (err.status >= 400 && err.status < 500 && ![408, 425, 429].includes(err.status)) {
+            // This exact activation was definitely rejected, not lost. Its CAS
+            // must not be regenerated or block the saved task behind endless Retry.
+            await reloadSelectionIntent(); await saveOperation(null);
+            gap = null; asking = false; activitySince = null;
+            $("widget-new-form").hidden = true; $("widget-new-title").value = "";
+            throw Object.assign(new Error(`${t("Задача сохранена, но запуск отклонён. Проверьте текущий учёт и выберите действие заново.")} ${err.message}`), {status: err.status});
+          }
+          throw err;
+        }
+        await saveOperation({...operation, stage: "activated"});
+      }
+      gap = null; asking = false; activitySince = null; selectedMode = selectedPreview = null;
+      // An old receipt may have been followed by a peer stop/task choice. Only
+      // shared time state proves the current activity; do not restamp old A at
+      // the peer's newer revision or erase a newer explicit local choice.
+      await reloadSelectionIntent();
+    } else {
+      if (timeClient.state?.status === "running" && taskKey(timeClient.state.task) !== taskKey(capturedTask)) {
+        // Ordinary creation follows the same running switch rule as existing tasks.
+        await timeClient.command("switch_task", {task: capturedTask});
+      }
+      await rememberSelection(capturedTask);
+    }
   } else if (op.kind === "complete") {
     // Stop is not a permanent precondition: a peer may have resumed this task
     // since an uncertain PATCH. Recheck on every attempt, including stage patch.
@@ -273,7 +369,17 @@ async function finishOperation() {
 async function runOperation() {
   if (busy) return;
   busy = true; render();
-  try { if (timeClient.pending) await timeClient.retry(); await finishOperation(); }
+  try {
+    if (timeClient.pending) {
+      const recovered = timeClient.pending;
+      await timeClient.retry();
+      if (operation?.kind === "capture" && operation.activity && operation.stage === "activate" && operation.activation && recovered.request_id === operation.activation.request_id && JSON.stringify(recovered) === JSON.stringify(operation.activation)) {
+        await timeClient.refresh();
+        await saveOperation({...operation, stage: "activated"});
+      }
+    }
+    await finishOperation();
+  }
   catch (err) {
     // A definite rejection cannot be retried with the old CAS. Let a fresh user
     // action use the newly refreshed note, while transport failures keep the op.
@@ -282,22 +388,33 @@ async function runOperation() {
       await saveOperation(null); await refresh();
     }
     error(err);
-  } finally { busy = false; render(); if (popup === "tasks") renderTasks(); }
+  } finally { busy = false; render(); if (["tasks", "activity"].includes(popup)) renderTasks(); }
 }
 $("widget-done").onclick = async () => {
   if (busy || pending()) return;
   const task = currentTask(), note = task?.source === "library" && liveNotes.find(note => note.id === task.id);
   if (!note || !["task", "purchase"].includes(note.kind) || ["done", "cancelled", "archived"].includes(note.status)) return;
-  try { await saveOperation({kind: "complete", task, version: note.version, stage: "stop"}); await runOperation(); }
+  let prepared = false; busy = true; render();
+  try { await saveOperation({kind: "complete", task, version: note.version, stage: "stop"}); prepared = true; }
   catch (err) { error(err); }
+  finally { busy = false; render(); }
+  if (prepared) await runOperation();
 };
+$("widget-complete").onclick = $("widget-done").onclick;
 $("widget-new-form").onsubmit = async event => {
   event.preventDefault(); if (busy || pending()) return;
   const title = $("widget-new-title").value.trim(); if (!title) return;
+  let prepared = false; busy = true; render();
   try {
-    await saveOperation({kind: "capture", payload: {text: title, title, kind: "task", source: "desktop-widget", external_id: `widget:${crypto.randomUUID()}`}});
-    await runOperation();
+    const {today} = await sharedApi("/api/time/tasks");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(today || "")) throw new Error(t("Сервис не сообщил сегодняшнюю дату. Обновите приложение."));
+    catalogToday = today;
+    await saveOperation({kind: "capture", payload: {text: title, title, kind: "task", due: catalogToday, source: "desktop-widget", external_id: `widget:${crypto.randomUUID()}`},
+      ...(popup === "activity" ? {activity: {backfill_from: Math.floor(activitySince ?? gap?.since ?? Date.now())}} : {})});
+    prepared = true;
   } catch (err) { error(err); }
+  finally { busy = false; render(); }
+  if (prepared) await runOperation();
 };
 $("widget-retry").onclick = async () => {
   if (operation) return runOperation();
@@ -314,7 +431,7 @@ $("widget-new").onclick = () => { $("widget-new-form").hidden = !$("widget-new-f
 $("widget-open").onclick = () => void windowMode("full").catch(error);
 $("widget-switch").onclick = () => void windowMode("bar").catch(error);
 $("widget-tab").onkeydown = event => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); void windowMode("card").catch(error); } };
-installWindowGestures(native, {tab: true, doubleClick: bootstrap.double_click,
+if (!isFull) installWindowGestures(native, {tab: true, doubleClick: bootstrap.double_click,
   onDoubleClick: () => void windowMode(mode === "bar" ? "card" : "bar").catch(error),
   onRightDoubleClick: () => void windowMode("full").catch(error)});
 window.addEventListener("brainalot-widget-mode", event => setMode(event.detail));
@@ -322,32 +439,20 @@ document.addEventListener("keydown", event => {
   if (event.key === "Escape" && popup) { event.preventDefault(); const was = popup; void setPopup(null).then(() => $(was === "tasks" ? "widget-task" : "widget-more").focus()).catch(error); }
 });
 document.addEventListener("pointerdown", event => {
-  if (popup && !event.target.closest("#widget-popup,#widget-task,#widget-more")) void setPopup(null).catch(error);
+  if (popup && !event.target.closest("#widget-popup,#widget-task,#widget-more,#widget-mode-visible,#widget-ask-choice,#widget-spotify")) void setPopup(null).catch(error);
 });
-async function fillAskChoices() {
-  const choice = $("widget-ask-choice"); askRefs.clear();
-  const option = (text, value, ref) => { const item = new Option(text, value); if (ref) askRefs.set(value, ref); return item; };
-  const group = (label, tasks) => { const node = document.createElement("optgroup"); node.label = label; node.append(...tasks.map(task => option(task.title, taskKey(task), task))); return node; };
-  const hot = new Map(burning.map(task => [taskKey(task), task]));
-  const events = liveEvents.filter(event => !event.all_day && !event.time_skipped).map(event => ({source: "calendar", id: eventKey(event), title: event.title || t("Событие")}));
-  const listed = taskCatalog.filter(task => task.source === "library" && !hot.has(taskKey(task)));
-  const placeholder = option(t("Выбрать…"), ""); placeholder.disabled = true; placeholder.selected = true;
-  const items = [placeholder, option(t("Отдых"), "label:rest", {source: "label", id: "rest", title: t("Отдых")})];
-  if (hot.size) items.push(group(t("Горящие"), [...hot.values()]));
-  if (events.length) items.push(group(t("Сегодня в календаре"), events));
-  if (listed.length) items.push(group(t("Задачи"), listed));
-  items.push(option(t("Спросить позже"), "later")); choice.replaceChildren(...items);
-}
-$("widget-ask-choice").onchange = async () => {
-  const value = $("widget-ask-choice").value; if (!value) return;
-  if (value === "later") { snoozeUntil = Date.now() + 30 * 60_000; asking = false; render(); return; }
+async function answerActivity(task) {
+  task = {source: task.source, id: task.id, title: task.title};
   try {
-    const task = askRefs.get(value) || null;
-    if (await action("start", {...timerFields("stopwatch", await getTimePreset()), task, backfill_from: gap ? Math.floor(gap.since) : Date.now()})) {
-      gap = null; asking = false; await rememberSelection(task);
+    if (await action("start", {...timerFields("stopwatch", await getTimePreset()), task, backfill_from: Math.floor(activitySince ?? gap?.since ?? Date.now())})) {
+      gap = null; asking = false; activitySince = null; selectedMode = selectedPreview = null; await rememberSelection(task); await setPopup(null);
     }
   } catch (err) { error(err); }
   render();
+}
+$("widget-ask-choice").onclick = () => {
+  activitySince = gap?.since ?? Date.now(); $("widget-search").value = "";
+  void setPopup(popup === "activity" ? null : "activity", {focus: true}).catch(error);
 };
 async function watchUntracked() {
   if (typeof native.input_idle_ms !== "function") return;
@@ -356,11 +461,16 @@ async function watchUntracked() {
     const now = Date.now(), tracked = timeClient.state?.status === "running" || Boolean(currentEvent(liveEvents, now));
     const step = untrackedStep(gap, {tracked, idleMs: Number(await native.input_idle_ms()) || 0, now}); gap = step.gap;
     const ask = step.ask && now >= snoozeUntil && !pending();
-    if (ask && !asking) await fillAskChoices();
     if (ask !== asking) { asking = ask; render(); }
   } catch { /* Sampling never blocks the common timer; the next sample retries. */ }
 }
 chrome.storage.onChanged.addListener(changes => {
+  if (!busy && changes[OP_KEY]) { operation = changes[OP_KEY].newValue || null; render(); }
+  if (!busy && (changes[SELECT_KEY] || changes[SELECT_REV_KEY])) {
+    if (changes[SELECT_KEY]) selectedTask = changes[SELECT_KEY].newValue || null;
+    if (changes[SELECT_REV_KEY]) selectedRevision = changes[SELECT_REV_KEY].newValue ?? null;
+    render();
+  }
   if (localeChange(changes)) void syncLocale().then(render);
   if (changes["panel:theme"]) document.documentElement.dataset.theme = changes["panel:theme"].newValue;
   if (changes["panel:design"]) document.documentElement.dataset.design = changes["panel:design"].newValue;
@@ -377,6 +487,8 @@ async function refresh(force = false) {
     // even before a hidden full-window preference sync happens to poll.
     const prefs = {...localPrefs, ...sharedPrefs.values};
     liveNotes = notes.notes; taskCatalog = (tasks.tasks || []).filter(task => task.source !== "work"); totals = timeTotals.rows || [];
+    catalogToday = /^\d{4}-\d{2}-\d{2}$/.test(tasks.today || "") ? tasks.today : null;
+    currentPreset = normalizeTimePreset(sharedPrefs.values?.["time:preset"]);
     document.documentElement.dataset.theme = prefs["panel:theme"] || "light"; document.documentElement.dataset.design = prefs["panel:design"] || "stream";
     applyProgressColor(prefs[FOCUS_OVERLAY_COLOR_KEY]);
     burning = liveNotes.filter(note => ["task", "purchase"].includes(note.kind) && note.importance === "critical" && !["done", "cancelled", "archived"].includes(note.status)).map(note => ({source: "library", id: note.id, title: note.title}));
@@ -386,7 +498,7 @@ async function refresh(force = false) {
     catalogReady = true;
     const before = selectedFire;
     if (pollNotice) clearError();
-    render(); if (popup === "tasks") renderTasks();
+    render(); if (["tasks", "activity"].includes(popup)) renderTasks();
     if (selectedFire !== before) void chrome.storage.local.set({"desktop:selected-fire": selectedFire});
   } catch (err) { error(err, {poll: true}); }
   finally { refreshing = false; }
@@ -394,7 +506,13 @@ async function refresh(force = false) {
 timeClient.subscribe(render); render();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
 await refresh(true);
-const spotifyPlayer = mountSpotifyPlayer($("widget-spotify"), {onVisibility: mediaVisibility});
-$("widget-spotify-toggle").onclick = () => { void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(error); };
+if (!isFull) {
+  spotifyPlayer = mountSpotifyPlayer($("widget-spotify"), {onVisibility: mediaVisibility,
+    settingsContainer: $("widget-music-settings"), onSettingsOpen: open => void setPopup(open ? "media" : null).catch(error)});
+  $("widget-spotify-toggle").onclick = () => { void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(error); };
+} else {
+  $("widget-spotify-toggle").hidden = true;
+  $("widget-open").hidden = true;
+}
 document.body.dataset.widgetReady = "true";
 setInterval(refresh, 5000); setInterval(() => { if (!document.hidden) render(); }, 1000); setInterval(watchUntracked, 15_000);

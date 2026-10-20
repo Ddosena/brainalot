@@ -6,6 +6,7 @@ const flush = async () => { for (let i=0; i<16; i++) await Promise.resolve(); };
 function fixture(options={}) {
   const handlers = new Map(), calls = [], captures = new Set();
   const surface = {
+    ownerDocument:{defaultView:{getSelection:()=>({toString:()=>options.selection?.() || ''})}},
     addEventListener(name, handler) { handlers.set(name, handler); },
     setPointerCapture(id) { captures.add(id); },
     hasPointerCapture(id) { return captures.has(id); },
@@ -70,4 +71,17 @@ test('full header callback and compact card default, ordinary body ignored',asyn
   assert.equal(card.calls.filter(([a])=>a==='bar').length,1);
   const body=fixture(); await body.click(0,{target:{closest(){return null;}}});
   assert.deepEqual(body.calls,[]);
+});
+
+test('full free body double click collapses without starting native drag; selected text and cards are excluded',async()=>{
+  let collapsed=0,selection='';
+  const f=fixture({freeDoubleClick:true,selection:()=>selection,onDoubleClick:()=>collapsed++});
+  const body={closest(){return null;}};
+  await f.click(0,{target:body});await f.click(150,{target:body});
+  assert.equal(collapsed,1);assert.deepEqual(f.calls,[],'free body never begins native window dragging');
+  selection='selected words';await f.click(300,{target:body});await f.click(400,{target:body});assert.equal(collapsed,1);
+  selection='';const card={closest(selector){return selector.includes('.note')?this:null;}};
+  await f.click(600,{target:card});await f.click(700,{target:card});assert.equal(collapsed,1);
+  f.emit('pointerdown',{target:body,timeStamp:900});f.emit('pointermove',{target:body,clientX:40,timeStamp:910});f.emit('pointerup',{target:body,clientX:40,timeStamp:920});await flush();
+  await f.click(1000,{target:body});assert.equal(collapsed,1,'text-selection drag does not complete a double click');
 });

@@ -21,6 +21,8 @@ import { WORK_ENABLED } from "./work-availability.js";
 applyDocument();
 const $ = (id) => document.getElementById(id);
 const IS_LIBRARY_WINDOW = new URLSearchParams(location.search).has("library-window");
+const EMBEDDED_DESKTOP = chrome.desktop === true && window !== window.top && new URLSearchParams(location.search).has("embedded-desktop");
+if (EMBEDDED_DESKTOP) document.body.classList.add("desktop-embedded-panel");
 const kinds = {inbox:t("Входящие"),task:t("Дело"),purchase:t("Покупка"),media:t("Медиа"),idea:t("Идея"),thought:t("Мысль"),link:t("Ссылка"),project:t("Проект"),person:t("Человек")};
 const media = {movie:t("Фильм"),series:t("Сериал"),book:t("Книга"),game:t("Игра"),podcast:t("Подкаст"),article:t("Статья")};
 const importance = {low:t("Низкая"),normal:t("Обычная"),high:t("Высокая"),critical:t("Очень высокая")};
@@ -2442,6 +2444,12 @@ function stepRotation(direction) {
 const timeHost = document.createElement("div");
 document.querySelector(".masthead").after(timeHost);
 mountTimeUI(timeHost);
+if (EMBEDDED_DESKTOP) timeHost.querySelector(".time-control").hidden = true;
+if (EMBEDDED_DESKTOP) window.addEventListener("message", event => {
+  if (event.source !== window.parent || event.origin !== location.origin || event.data?.type !== "brainalot:panel-action") return;
+  const id = {search: "find-toggle", appearance: "appearance-toggle", locale: "locale-toggle", settings: "settings-toggle"}[event.data.action];
+  if (id) $(id).click();
+});
 const recallControls = mountRecallControls($("recall-settings"), {currentId:()=>resurfaceId, refresh:()=>refresh(), notes:()=>allNotes});
 const rotationCard = $("rotation-card");
 rotationCard.tabIndex = 0;

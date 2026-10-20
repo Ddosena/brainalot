@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -21,7 +22,7 @@ import time
 from typing import Any
 
 
-_ACTIONS = frozenset({"previous", "play_pause", "next", "shuffle", "repeat", "open"})
+_ACTIONS = frozenset({"previous", "play_pause", "next", "shuffle", "repeat", "open", "volume"})
 _SOURCE = re.compile(r"(?:Spotify\.exe|SpotifyAB\.SpotifyMusic_[a-z0-9]+!Spotify)", re.I)
 
 
@@ -29,7 +30,7 @@ def _empty_state(*, windows: bool, error: str | None = None) -> dict:
     return {
         "available": False, "connected": False, "source_id": None,
         "title": "", "artist": "", "playing": False,
-        "shuffle": None, "repeat": None,
+        "shuffle": None, "repeat": None, "volume": None,
         "controls": {action: windows and action == "open" for action in sorted(_ACTIONS)},
         "error": error,
     }
@@ -54,6 +55,9 @@ def _validated_state(value: Any, *, windows: bool) -> dict:
             shuffle=value.get("shuffle") if type(value.get("shuffle")) is bool else None,
             repeat=value.get("repeat") if value.get("repeat") in ("off", "track", "list") else None,
         )
+        volume = value.get("volume")
+        if type(volume) in (int, float) and 0 <= volume <= 1 and math.isfinite(volume):
+            state["volume"] = float(volume)
         controls = value.get("controls")
         if isinstance(controls, dict):
             for action in _ACTIONS - {"open"}:
@@ -159,25 +163,44 @@ class SpotifyController:
     Close the controller from the API lifecycle to reap the helper immediately.
     """
 
-    def __init__(self, *, adapter=None, platform=None, clock=time.monotonic,
+    def __init__(self, *, adapter=None, snapshot_adapter=None, platform=None, clock=time.monotonic,
                  cache_seconds: float = 1.5, retry_seconds: float = 10.0, opener=None):
         self._windows = (platform or sys.platform) == "win32"
         self._adapter = adapter
+        self._snapshot_adapter = snapshot_adapter or adapter
+        self._injected = adapter is not None
         self._clock = clock
         self._cache_seconds = cache_seconds
         self._retry_seconds = retry_seconds
         self._opener = opener
         self._lock = threading.RLock()
+        self._commands = threading.Lock()
+        self._snapshots = threading.Lock()
+        self._generation = 0
+        self._command_active = False
+        self._warm_thread = None
         self._cached = _empty_state(windows=self._windows)
         self._refresh_at = float("-inf")
         self._closed = False
 
-    def _request(self, action, value=None):
-        if self._adapter is None:
-            self._adapter = _PowerShellBridge()
-        return self._adapter.request(action, value)
+    def _request(self, action, value=None, *, snapshot=False):
+        with self._lock:
+            name = "_snapshot_adapter" if snapshot else "_adapter"
+            if getattr(self, name) is None:
+                setattr(self, name, _PowerShellBridge())
+            adapter = getattr(self, name)
+        return adapter.request(action, value)
 
     def _save(self, value):
+        # Lightweight command replies omit metadata/audio fields instead of
+        # pretending that the current title or mixer level is unknown.
+        if isinstance(value, dict) and value.get("source_id") == self._cached.get("source_id"):
+            value = deepcopy(value)
+            for key in ("title", "artist", "volume"):
+                if key not in value:
+                    value[key] = self._cached[key]
+            if isinstance(value.get("controls"), dict) and "volume" not in value["controls"]:
+                value["controls"]["volume"] = self._cached["controls"]["volume"]
         self._cached = _validated_state(value, windows=self._windows)
         delay = self._cache_seconds if self._cached["available"] else self._retry_seconds
         self._refresh_at = self._clock() + delay
@@ -192,14 +215,53 @@ class SpotifyController:
         with self._lock:
             if self._closed or not self._windows:
                 return _empty_state(windows=False)
-            if self._clock() < self._refresh_at:
+            if self._command_active or self._clock() < self._refresh_at:
                 return deepcopy(self._cached)
-            try:
-                return self._save(self._request("snapshot")["state"])
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                return self._failed("Spotify local integration is unavailable")
+            generation = self._generation
+        # Optional polls coalesce; none wait behind another metadata request.
+        if not self._snapshots.acquire(blocking=False):
+            with self._lock:
+                return deepcopy(self._cached)
+        try:
+            with self._lock:
+                if self._closed:
+                    return _empty_state(windows=False)
+            result = self._request("snapshot", snapshot=True)["state"]
+            with self._lock:
+                state = deepcopy(self._cached) if generation != self._generation or self._closed else self._save(result)
+            self._warm_commands()
+            return state
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            with self._lock:
+                return deepcopy(self._cached) if generation != self._generation or self._closed else self._failed("Spotify local integration is unavailable")
+        finally:
+            self._snapshots.release()
+
+    def _warm_commands(self):
+        # Read-only and optional; a cold first click remains bounded by RPC timeout.
+        with self._lock:
+            if self._injected or self._closed or self._warm_thread is not None:
+                return
+            def warm():
+                if not self._commands.acquire(blocking=False):
+                    return
+                try:
+                    with self._lock:
+                        if self._closed:
+                            return
+                    self._request("state")
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                finally:
+                    self._commands.release()
+            self._warm_thread = threading.Thread(target=warm, name="spotify-warm", daemon=True)
+            self._warm_thread.start()
 
     def command(self, action: str, value=None) -> dict:
+        with self._commands:
+            return self._command(action, value)
+
+    def _command(self, action: str, value=None) -> dict:
         with self._lock:
             error = None
             if not isinstance(action, str) or action not in _ACTIONS:
@@ -208,32 +270,51 @@ class SpotifyController:
                 error = "Shuffle requires a boolean value"
             elif action == "repeat" and value not in ("off", "track", "list"):
                 error = "Repeat requires off, track or list"
-            elif action not in ("shuffle", "repeat") and value is not None:
+            elif action == "volume" and (type(value) not in (int, float) or not 0 <= value <= 1 or not math.isfinite(value)):
+                error = "Volume requires a number between 0 and 1"
+            elif action not in ("shuffle", "repeat", "volume") and value is not None:
                 error = "This Spotify command does not accept a value"
             elif self._closed or not self._windows:
                 error = "Spotify local integration is unavailable"
             if error:
                 return {"ok": False, "error": error, "state": deepcopy(self._cached)}
+            self._generation += 1
+            self._command_active = True
+        try:
             if action == "open":
                 try:
                     (self._opener or os.startfile)("spotify:")
-                    self._refresh_at = float("-inf")
-                    return {"ok": True, "state": deepcopy(self._cached)}
+                    with self._lock:
+                        self._refresh_at = float("-inf")
+                        return {"ok": True, "state": deepcopy(self._cached)}
                 except (OSError, AttributeError):
-                    return {"ok": False, "error": "Could not open Spotify", "state": deepcopy(self._cached)}
+                    with self._lock:
+                        return {"ok": False, "error": "Could not open Spotify", "state": deepcopy(self._cached)}
             try:
                 result = self._request(action, value)
-                state = self._save(result["state"])
+                with self._lock:
+                    state = self._save(result["state"])
+                    # An accepted SMTC request may publish state asynchronously.
+                    # Never freeze its immediate response for the normal 1.5s TTL.
+                    if state["available"]:
+                        self._refresh_at = float("-inf")
                 if result.get("ok") is True:
-                    return {"ok": True, "state": state}
+                    return {"ok": True, "state": state, "confirmed": result.get("confirmed")}
                 message = result.get("error")
                 return {"ok": False, "error": message[:160] if isinstance(message, str) else "Spotify rejected the command", "state": state}
             except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-                return {"ok": False, "error": "Spotify command failed; outcome may be unknown",
-                        "state": self._failed("Spotify local integration is unavailable")}
+                with self._lock:
+                    return {"ok": False, "error": "Spotify command failed; outcome may be unknown",
+                            "state": self._failed("Spotify local integration is unavailable")}
+        finally:
+            with self._lock:
+                self._command_active = False
 
     def close(self):
         with self._lock:
             self._closed = True
+        with self._commands, self._snapshots:
             if self._adapter is not None:
                 self._adapter.close()
+            if self._snapshot_adapter is not None and self._snapshot_adapter is not self._adapter:
+                self._snapshot_adapter.close()

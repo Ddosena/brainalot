@@ -315,11 +315,99 @@ def test_spotify_api_auth_validation_and_lifecycle_without_playback(tmp_path):
         assert client.post("/api/media/spotify/command", json={"action": "next"}).status_code == 401
         assert client.get("/api/media/spotify", headers=auth).json()["title"] == "Synthetic track"
         for body in ({"action": []}, {"action": "unknown"}, {"action": "next", "value": 1},
-                     {"action": "shuffle", "value": "true"}, {"action": "repeat", "value": []}):
+                     {"action": "shuffle", "value": "true"}, {"action": "repeat", "value": []},
+                     {"action": "volume"}, {"action": "volume", "value": True},
+                     {"action": "volume", "value": "0.5"}, {"action": "volume", "value": []},
+                     {"action": "volume", "value": -0.1}, {"action": "volume", "value": 1.1},
+                     {"action": "volume", "value": 10**400}):
             assert client.post("/api/media/spotify/command", json=body, headers=auth).status_code == 422
+        for nonfinite in ("NaN", "Infinity", "-Infinity"):
+            assert client.post("/api/media/spotify/command",
+                               content='{"action":"volume","value":' + nonfinite + '}',
+                               headers={**auth, "Content-Type": "application/json"}).status_code == 422
         assert spotify.calls == []
         for body in ({"action": "next"}, {"action": "shuffle", "value": False},
-                     {"action": "repeat", "value": "track"}):
+                     {"action": "repeat", "value": "track"}, {"action": "volume", "value": 0},
+                     {"action": "volume", "value": 0.64}, {"action": "volume", "value": 1}):
             assert client.post("/api/media/spotify/command", json=body, headers=auth).json()["ok"]
-        assert spotify.calls == [("next", None), ("shuffle", False), ("repeat", "track")]
+        assert spotify.calls == [("next", None), ("shuffle", False), ("repeat", "track"),
+                                 ("volume", 0), ("volume", 0.64), ("volume", 1)]
     assert spotify.closed
+
+
+def test_time_tasks_supplies_server_day_for_quick_capture(tmp_path):
+    from datetime import date
+    store = Store(tmp_path)
+    auth = {"Authorization": "Bearer " + store.token()}
+    app = create_app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        catalog = client.get("/api/time/tasks", headers=auth).json()
+        assert catalog["today"] == date.today().isoformat()
+        response = client.post("/api/captures", headers=auth, json={
+            "text": "Synthetic quick task", "kind": "task", "due": catalog["today"],
+            "source": "desktop-widget", "external_id": "test-quick-task",
+        })
+        assert response.status_code == 200
+        note = response.json()
+        assert note["due"] == catalog["today"]
+        assert note["id"] in {n["id"] for n in store.dashboard()["today"]}
+
+
+def test_spotify_delivery_receipt_survives_duplicate_and_service_restart(tmp_path):
+    class FakeSpotify:
+        def __init__(self): self.calls = []
+        def command(self, action, value=None):
+            self.calls.append((action, value))
+            return {"ok": True, "state": {"title": "Next synthetic track"}}
+        def close(self): pass
+    auth = {"Authorization": "Bearer " + Store(tmp_path).token()}
+    command = {"request_id": "media-lost-response", "action": "next"}
+    first = FakeSpotify()
+    with TestClient(create_app(tmp_path, spotify_controller=first), base_url="http://127.0.0.1:8765") as client:
+        result = client.post("/api/media/spotify/command", json=command, headers=auth).json()
+        assert result["ok"]
+        assert client.post("/api/media/spotify/command", json=command, headers=auth).json() == result
+        assert client.post("/api/media/spotify/command", json={**command, "action": "previous"},
+                           headers=auth).status_code == 409
+        assert first.calls == [("next", None)]
+    restarted = FakeSpotify()
+    with TestClient(create_app(tmp_path, spotify_controller=restarted), base_url="http://127.0.0.1:8765") as client:
+        assert client.post("/api/media/spotify/command", json=command, headers=auth).json() == result
+        assert restarted.calls == []
+
+
+def test_external_receipt_keeps_unknown_outcome_after_dispatch_failure(tmp_path):
+    shared = SharedState(tmp_path)
+    calls = []
+    command = {"request_id": "media-interrupted", "action": "next"}
+    def interrupted():
+        calls.append("next")
+        raise RuntimeError("response lost after side effect")
+    with pytest.raises(RuntimeError):
+        shared.external_command("spotify", command, interrupted)
+    recovered = SharedState(tmp_path).external_command("spotify", command, interrupted)
+    assert recovered["ok"] is False and recovered["pending"] is True
+    assert calls == ["next"]
+
+
+def test_external_receipt_concurrent_redelivery_does_not_repeat_side_effect(tmp_path):
+    from threading import Event
+    started, finish = Event(), Event()
+    calls = []
+    command = {"request_id": "media-overlap", "action": "next"}
+    def delayed():
+        calls.append("next")
+        started.set()
+        assert finish.wait(5)
+        return {"ok": True}
+    shared = SharedState(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(shared.external_command, "spotify", command, delayed)
+        assert started.wait(5)
+        try:
+            duplicate = pool.submit(SharedState(tmp_path).external_command, "spotify", command, delayed)
+            assert duplicate.result(timeout=2)["pending"] is True
+        finally:
+            finish.set()
+        assert first.result(timeout=2) == {"ok": True}
+    assert calls == ["next"]

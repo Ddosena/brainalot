@@ -240,3 +240,26 @@ test("peer recovery during a local delivery cannot replace it or leave a stale b
   assert.equal(a.pending,null);assert.equal(a.state.revision,3);
   assert.equal(Object.keys(saved).length,0,"recovered request was not resurrected");
 });
+
+test("an operation's exact activation receipt stays safe after a peer recovers then stops it and clears the outbox",async()=>{
+  const saved={},writes=[],receipts=new Map();let current={revision:0,status:'idle',task:null},lose=true,startExecutions=0;
+  const storage={async get(key){return key===null?structuredClone(saved):{[key]:structuredClone(saved[key])};},async set(items){Object.assign(saved,structuredClone(items));},async remove(key){delete saved[key];}};
+  const api=async(path,method,body)=>{
+    if(!method)return structuredClone(current);writes.push(structuredClone(body));
+    if(receipts.has(body.request_id))return structuredClone(receipts.get(body.request_id));
+    assert.equal(body.expected_revision,current.revision);
+    current={...current,revision:current.revision+1,status:body.action==='stop'?'idle':'running',task:body.task||current.task};
+    if(body.action==='start')startExecutions++;
+    receipts.set(body.request_id,structuredClone(current));
+    if(lose){lose=false;throw Object.assign(new Error('response lost after commit'),{status:500});}
+    return structuredClone(current);
+  };
+  const options={storage,outboxPrefix:'time:command-outbox:'};
+  const activation={request_id:'durable-activity-start',expected_revision:0,action:'start',mode:'stopwatch',task:{source:'library',id:'a',title:'A'},backfill_from:1000};
+  const first=createTimeClient(api,options);await first.refresh();await assert.rejects(first.commandWithReceipt(activation));
+  const peer=createTimeClient(api,options);await peer.refresh();await peer.retry();await peer.command('stop');
+  assert.equal(Object.keys(saved).length,0);const stoppedRevision=current.revision;
+  const reloaded=createTimeClient(api,options);await reloaded.refresh();await reloaded.commandWithReceipt(activation);
+  assert.equal(current.revision,stoppedRevision);assert.equal(current.status,'idle');assert.equal(reloaded.state.status,'idle');assert.equal(reloaded.state.revision,stoppedRevision);
+  assert.equal(startExecutions,1);assert.deepEqual(writes.filter(body=>body.action==='start'),[activation,activation,activation]);assert.equal(Object.keys(saved).length,0);
+});

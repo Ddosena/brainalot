@@ -189,11 +189,11 @@ def run(root: Path) -> int:
                           errors:[...(window.__brainalotQaErrors||[]),
                             ...(f?.contentWindow?.__brainalotQaErrors||[])]};})()""")
                     try:
-                        expected = {"day": "BRAINALOT", "library": "БИБЛИОТЕКА",
+                        expected = {"day": "ВСПОМНИТЬ", "library": "БИБЛИОТЕКА",
                                     "capture": "ЗАПИСАТЬ"}[name]
                         data = _until(lambda: (s if (s := snapshot()).get("ready") == "complete"
                                                and page.split("?")[0] in (s.get("iframe") or "")
-                                               and expected in (s.get("text") or "")
+                                               and expected in (s.get("text") or "").upper()
                                                else None), 25)
                     except Exception:
                         report["last_view"] = {"name": name, "snapshot": snapshot()}
@@ -293,8 +293,11 @@ def run(root: Path) -> int:
                 _until(lambda: _js(host.widget, "document.getElementById('widget-popup').hidden && "
                     "!document.getElementById('widget-run').disabled && "
                     "document.getElementById('widget-burning').textContent === " + json.dumps(restart_task["title"])))
-                _js(host.widget, "document.getElementById('widget-mode').click(); true")
-                _until(lambda: _js(host.widget, "document.getElementById('widget-mode').textContent.includes('Pomodoro')"))
+                _js(host.widget, "document.getElementById('widget-mode-visible').click(); true")
+                _until(lambda: _js(host.widget, "!document.getElementById('widget-modes').hidden"))
+                _js(host.widget, "document.querySelector('[data-timer-mode=\"pomodoro\"]').click(); true")
+                _until(lambda: _js(host.widget, "document.getElementById('widget-popup').hidden && "
+                    "document.querySelector('[data-timer-mode=\"pomodoro\"]').getAttribute('aria-pressed') === 'true'"))
                 _js(host.widget, "document.getElementById('widget-run').click(); true")
                 restarted = _until(lambda: (s if (s := _request(port, token, "/api/time/state"))["status"] == "running"
                                             and s["mode"] == "pomodoro" else None))

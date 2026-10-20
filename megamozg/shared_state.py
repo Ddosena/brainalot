@@ -66,6 +66,28 @@ class SharedState:
                    hashlib.sha256(encoded(command).encode()).hexdigest(), encoded(result)))
         return result
 
+    def external_command(self, scope, command, perform):
+        """Claim an external side effect durably before dispatching it once.
+
+        HTTP clients may transparently redeliver a POST even when application
+        retries are disabled. A crash between claim and confirmation must leave
+        an explicit unknown outcome, never permission to perform the effect again.
+        The database transaction is not held while the external player responds.
+        """
+        with self.db() as db:
+            previous = self.receipt(db, scope, command)
+            if previous is not None:
+                return previous
+            self.remember(db, scope, command, {
+                "ok": False, "pending": True,
+                "error": "Результат команды неизвестен. Проверь Spotify перед повтором.",
+            })
+        result = perform()
+        with self.db() as db:
+            db.execute("UPDATE receipts SET result=? WHERE scope=? AND id=?",
+                       (encoded(result), scope, command["request_id"]))
+        return result
+
     @staticmethod
     def check_revision(command, revision):
         expected = command.get("expected_revision")

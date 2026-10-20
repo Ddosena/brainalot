@@ -20,9 +20,10 @@ import uuid
 import webbrowser
 
 _log = logging.getLogger("brainalot.desktop")
-WIDGET_SIZES = {"bar": (84, 48), "card": (360, 64)}
+WIDGET_SIZES = {"bar": (84, 48), "card": (360, 76)}
 MEDIA_ROW_HEIGHT = 52
-FULL_SIZE = (1120, 760)
+FULL_SIZE = (484, 900)
+FULL_GEOMETRY_LAYOUT = "unified-484x900-v1"
 MINIMUM_SIZES = {"full": (300, 360), **WIDGET_SIZES}
 STORAGE_FILE = "desktop-ui.json"
 
@@ -225,11 +226,14 @@ class CompactSurface:
         self.image = None
         self._image_digest = None
         self.boxes = []
-        self.ask_options = []
-        self.activity_menu = None
         self.snapshot = None
         self.focus_id = None
         self.press = None
+        self.hover_id = None
+        self.pointer_id = None
+        self.pressed_id = None
+        self._local_pending = {}
+        self.feedback_latencies_ms = []
         self.last_click = None
         self._signature = None
         self._capture_lock = threading.Lock()
@@ -273,6 +277,56 @@ class CompactSurface:
         return next((box["id"] for box in self.boxes if box["id"] != "widget-tab" and box["x"] <= x < box["x"]+box["w"]
                      and box["y"] <= y < box["y"]+box["h"]), None)
 
+    def _pending_ids(self):
+        return {box["id"] for box in self.boxes if box.get("pending")} | set(self._local_pending)
+
+    def _invalidate_feedback(self):
+        """Own UI-thread feedback: no renderer round trip and no background erase."""
+        if self.canvas is None or not self.active: return
+        requested = time.monotonic()
+        user = ctypes.WinDLL("user32")
+        user.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        user.InvalidateRect(int(self.canvas.Handle.ToInt64()), None, False)
+        self.canvas.Update()
+        # Update returns after buffered WM_PAINT has completed, not merely
+        # after drawing into its temporary buffer.
+        self.feedback_latencies_ms.append((time.monotonic()-requested)*1000)
+        self.feedback_latencies_ms = self.feedback_latencies_ms[-32:]
+
+    def _pointer_feedback(self, x=None, y=None, pressed=None, release=False):
+        hit = self._hit(x,y) if x is not None and y is not None else None
+        self.pointer_id = hit
+        box = next((box for box in self.boxes if box["id"] == hit), None)
+        hover = hit if box and not box.get("disabled") else None
+        new_press = None if release else pressed if pressed is not None else self.pressed_id
+        changed = (self.hover_id,self.pressed_id) != (hover,new_press)
+        self.hover_id,self.pressed_id = hover,new_press
+        self._update_cursor()
+        if changed: self._invalidate_feedback()
+
+    def _update_cursor(self):
+        from System.Windows.Forms import Cursors
+        box = next((box for box in self.boxes if box["id"] == self.pointer_id), None)
+        self.canvas.Cursor = (Cursors.AppStarting if self.pointer_id in self._pending_ids() else
+                              Cursors.No if box and box.get("disabled") else Cursors.Hand if box else Cursors.SizeAll)
+
+    def _paint_feedback(self, graphics):
+        from System.Drawing import Color, SolidBrush, Pen
+        dark = bool((self.snapshot or {}).get("dark"))
+        pending = self._pending_ids()
+        for box in self.boxes:
+            control = box["id"]
+            alpha = 42 if control == self.pressed_id else 26 if control in pending else 18 if control == self.hover_id else 0
+            if not alpha: continue
+            path = self._path(max(1,round(box["w"]-2)),max(1,round(box["h"]-2)),min(8,box["h"]/2))
+            from System.Drawing.Drawing2D import Matrix
+            transform = Matrix(); transform.Translate(float(box["x"]+1),float(box["y"]+1));path.Transform(transform);transform.Dispose()
+            color = 255 if dark else 0
+            brush = SolidBrush(Color.FromArgb(alpha,color,color,color)); graphics.FillPath(brush,path);brush.Dispose()
+            if control in pending:
+                pen = Pen(Color.FromArgb(145,color,color,color),1.4);graphics.DrawPath(pen,path);pen.Dispose()
+            path.Dispose()
+
     def _create_canvas(self):
         from System import Array, Object
         from System.Reflection import BindingFlags
@@ -287,6 +341,7 @@ class CompactSurface:
         canvas.TabStop = True
         def paint(_sender, event):
             if self.image is not None: event.Graphics.DrawImageUnscaled(self.image, 0, 0)
+            self._paint_feedback(event.Graphics)
         def down(_sender, event):
             if not self.active: return
             button = 0 if event.Button == MouseButtons.Left else 2 if event.Button == MouseButtons.Right else -1
@@ -295,8 +350,10 @@ class CompactSurface:
             item = {"button":button, "id":self._hit(event.X, event.Y), "x":event.X, "y":event.Y,
                     "point":cursor_position(), "at":time.monotonic(), "moved":False}
             self.press = item
+            self._pointer_feedback(event.X,event.Y,pressed=item["id"] if button == 0 else None)
             if button == 0 and not item["id"]: self._input.put(("begin", item))
         def move(_sender, event):
+            self._pointer_feedback(event.X,event.Y)
             item = self.press
             if not item: return
             point = cursor_position()
@@ -306,6 +363,7 @@ class CompactSurface:
         def up(_sender, event):
             item, self.press = self.press, None
             canvas.Capture = False
+            self._pointer_feedback(event.X,event.Y,release=True)
             if item:
                 point = cursor_position()
                 item["moved"] |= abs(point[0]-item["point"][0])+abs(point[1]-item["point"][1]) >= 5
@@ -320,7 +378,9 @@ class CompactSurface:
         canvas.MouseDown += down; canvas.MouseMove += move; canvas.MouseUp += up
         canvas.PreviewKeyDown += preview; canvas.KeyDown += key
         canvas.Paint += paint
-        self._handlers = (down, move, up, preview, key, paint)
+        def leave(_sender,_event): self._pointer_feedback()
+        canvas.MouseLeave += leave
+        self._handlers = (down, move, up, preview, key, paint, leave)
         self.window.native.Controls.Add(canvas)
         self.canvas = canvas
 
@@ -333,6 +393,8 @@ class CompactSurface:
         self.ready = False
         self._image_digest = None
         self.boxes = []; self.focus_id = None; self.last_click = None
+        self.hover_id = self.pressed_id = self.pointer_id = None
+        self._local_pending.clear()
         def apply():
             from System.Drawing import Rectangle, Region
             from System.Windows.Forms import DockStyle
@@ -396,12 +458,12 @@ class CompactSurface:
             from Microsoft.Web.WebView2.Core import CoreWebView2CapturePreviewImageFormat
             snapshot = self._js("""(() => ({width:innerWidth,height:innerHeight,ready:document.body.dataset.widgetReady==='true',
               mode:document.body.dataset.widgetMode, title:document.getElementById('widget-burning')?.textContent,
-              askOptions:Array.from(document.getElementById('widget-ask-choice')?.options||[])
-                .filter(o=>o.value && !o.disabled).map(o=>({value:o.value,label:o.textContent})),boxes:
-              [...document.querySelectorAll('#widget-spotify button[id]'),
+              dark:document.documentElement.dataset.theme==='dark',boxes:
+              [...document.querySelectorAll('#widget-spotify button[id], .widget-surface button[id], .widget-surface input[type=checkbox][id]'),
                ...['widget-task','widget-ask-choice','widget-run','widget-more','widget-tab'].map(id=>document.getElementById(id))]
+              .filter((e,index,all)=>all.indexOf(e)===index)
               .filter(e=>e && !e.hidden && e.getBoundingClientRect().width)
-              .map(e=>{const r=e.getBoundingClientRect();return {id:e.id,x:r.x,y:r.y,w:r.width,h:r.height,disabled:Boolean(e.disabled)}})}))()""")
+              .map(e=>{const r=e.getBoundingClientRect();return {id:e.id,x:r.x,y:r.y,w:r.width,h:r.height,disabled:Boolean(e.disabled),pending:e.dataset.pending==='true'}})}))()""")
             if (not snapshot.get("ready") or snapshot.get("mode") != signature[0] or
                 not snapshot["boxes"] or (signature[0] == "card" and not snapshot.get("title")) or
                 any(box["x"] < 0 or box["y"] < 0 or box["x"]+box["w"] > snapshot["width"]+.5 or
@@ -432,11 +494,18 @@ class CompactSurface:
             def present():
                 if generation != self.generation or not self.active:
                     image.Dispose(); return
+                before_pending = self._pending_ids()
                 self.snapshot = snapshot
-                self.ask_options = snapshot["askOptions"]
                 self.boxes = [{**box, "x":box["x"]*width/snapshot["width"], "y":box["y"]*height/snapshot["height"],
                                "w":box["w"]*width/snapshot["width"], "h":box["h"]*height/snapshot["height"]}
                               for box in snapshot["boxes"]]
+                now = time.monotonic()
+                for control,issued in list(self._local_pending.items()):
+                    native_pending = any(box["id"] == control and box.get("pending") for box in self.boxes)
+                    if native_pending: self._local_pending[control] = None
+                    elif issued is None or now-issued > .75: self._local_pending.pop(control,None)
+                self._update_cursor()
+                if before_pending != self._pending_ids(): self._invalidate_feedback()
                 if digest == self._image_digest:
                     self.skipped_frames += 1
                     image.Dispose()
@@ -462,25 +531,17 @@ class CompactSurface:
     def _activate_control(self, control):
         if any(box["id"] == control and box.get("disabled") for box in self.boxes): return
         if control == "widget-tab": self.host.window_action("card")
-        elif control == "widget-ask-choice": self._show_activity_menu()
-        elif control: self._js("document.getElementById("+json.dumps(control)+")?.click(); true")
-
-    def _show_activity_menu(self):
-        """Native dropdown for the select in the CPU surface, with the same data/change handler."""
-        options = list(self.ask_options)
-        def show():
-            from System.Drawing import Point
-            from System.Windows.Forms import ContextMenuStrip, ToolStripMenuItem
-            if self.activity_menu: self.activity_menu.Dispose()
-            menu = ContextMenuStrip()
-            for option in options:
-                item = ToolStripMenuItem(option["label"])
-                item.Click += lambda _sender, _event, value=option["value"]: self._input.put(("ask", {"value":value}))
-                menu.Items.Add(item)
-            self.activity_menu = menu
-            box = next((b for b in self.boxes if b["id"] == "widget-ask-choice"), {"x":0,"y":0,"h":48})
-            menu.Show(self.canvas, Point(round(box["x"]),round(box["y"]+box["h"])))
-        self._invoke(show)
+        elif control:
+            feedback = control.startswith("widget-spotify-") and getattr(self,"canvas",None) is not None
+            def pending(value):
+                if value: self._local_pending[control] = time.monotonic()
+                else: self._local_pending.pop(control,None)
+                self._update_cursor()
+                self._invalidate_feedback()
+            if feedback: self._invoke(lambda:pending(True))
+            result = self._js("document.getElementById("+json.dumps(control)+")?.click(); "
+                              "document.getElementById("+json.dumps(control)+")?.dataset.pending === 'true'")
+            if feedback and result is not True: self._invoke(lambda:pending(False))
 
     def _inputs(self):
         while True:
@@ -520,9 +581,6 @@ class CompactSurface:
                         self._js("document.querySelectorAll('.native-keyboard-focus').forEach(e=>e.classList.remove('native-keyboard-focus'));"
                                  "document.getElementById("+json.dumps(self.focus_id)+")?.classList.add('native-keyboard-focus'); true")
                     elif item["key"] in {"Return", "Enter", "Space"}: self._activate_control(self.focus_id)
-                elif action == "ask":
-                    self._js("(() => {const e=document.getElementById('widget-ask-choice'); if(e && !e.closest('#widget-ask').hidden){"
-                             "e.value="+json.dumps(item["value"])+"; e.dispatchEvent(new Event('change',{bubbles:true}));} return true;})()")
                 self._schedule(0)
             except Exception:
                 if not self.closed: _log.warning("Compact input failed",exc_info=True)
@@ -532,7 +590,6 @@ class CompactSurface:
         if self.timer: self.timer.cancel()
         self._input.put(("close",None))
         def dispose():
-            if self.activity_menu: self.activity_menu.Dispose()
             if self.canvas:
                 image, self.image = self.image, None
                 if image: image.Dispose()
@@ -602,6 +659,7 @@ class DesktopHost:
         scale = area.dpi / 96
         size = tuple(round(v * scale) for v in default)
         minimum = tuple(round(v * scale) for v in (MINIMUM_SIZES["full"] if mode == "full" else self._widget_size(mode)))
+        migrate_full = mode == "full" and self.state.data.get("full_geometry_layout") != FULL_GEOMETRY_LAYOUT
         if saved.get("units") == "physical" and saved.get("dpi"):
             ratio = area.dpi / saved["dpi"]
             saved["width"] = round(saved["width"] * ratio)
@@ -614,12 +672,19 @@ class DesktopHost:
         if mode in WIDGET_SIZES:
             # Compact views have a fixed size; only their position is remembered.
             saved.update(width=size[0], height=size[1])
+        elif migrate_full:
+            saved.update(width=size[0], height=size[1])
         if anchor:
             saved.update(x=anchor["x"], y=anchor["y"])
             width, height = saved.get("width", size[0]), saved.get("height", size[1])
             if self.side == "right": saved["x"] = anchor["x"]+anchor["width"]-width
             if self.side == "bottom": saved["y"] = anchor["y"]+anchor["height"]-height
         rect = fit_geometry(saved, areas, size, minimum, self.side if mode == "bar" else None)
+        if migrate_full:
+            with self.state.lock:
+                self.state.data["geometry"]["full"] = {**rect,"units":"physical","screen":area.name,"dpi":area.dpi}
+                self.state.data["full_geometry_layout"] = FULL_GEOMETRY_LAYOUT
+                self.state.save()
         return rect, minimum
 
     def create_windows(self, webview):

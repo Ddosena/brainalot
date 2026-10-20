@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -82,7 +83,7 @@ def test_inactive_state_does_not_invent_controls_or_metadata():
     assert state["available"] is True
     assert state["title"] == ""
     assert state["controls"] == {"next": False, "open": True, "play_pause": False,
-                                  "previous": False, "repeat": False, "shuffle": False}
+                                  "previous": False, "repeat": False, "shuffle": False, "volume": False}
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
@@ -175,6 +176,94 @@ def test_open_failure_is_explicit():
     def fail(_):
         raise OSError("no handler")
     assert SpotifyController(platform="win32", opener=fail).command("open")["ok"] is False
+
+
+@pytest.mark.parametrize("value", [None, True, False, -0.01, 1.01, 10**500, float("nan"), float("inf"), "0.5", []])
+def test_invalid_volume_never_reaches_adapter(value):
+    adapter = Adapter()
+    assert SpotifyController(adapter=adapter, platform="win32").command("volume", value)["ok"] is False
+    assert adapter.calls == []
+
+
+@pytest.mark.parametrize("value", [0, 0.3, 1])
+def test_volume_forwarded_once(value):
+    adapter = Adapter(active_state(volume=value))
+    adapter.state["controls"]["volume"] = True
+    result = SpotifyController(adapter=adapter, platform="win32").command("volume", value)
+    assert result["ok"] is True
+    assert result["state"]["volume"] == value
+    assert adapter.calls == [("volume", value)]
+
+
+@pytest.mark.parametrize("value", [None, -1, 2, 10**500, float("nan"), float("inf"), True, "0.5"])
+def test_unknown_volume_does_not_disable_playback(value):
+    adapter = Adapter(active_state(volume=value))
+    state = SpotifyController(adapter=adapter, platform="win32").snapshot()
+    assert state["volume"] is None
+    assert state["controls"]["next"] is True
+    assert state["controls"]["play_pause"] is True
+
+
+def test_slow_snapshot_never_blocks_command_or_queues_extra_polls():
+    started, release = threading.Event(), threading.Event()
+    class SlowAdapter(Adapter):
+        def request(self, action, value=None):
+            self.calls.append((action, value))
+            if action == "snapshot":
+                started.set()
+                assert release.wait(3)
+                return {"ok": True, "state": active_state(playing=True)}
+            return {"ok": True, "state": active_state(playing=False)}
+    adapter = SlowAdapter()
+    controller = SpotifyController(adapter=adapter, platform="win32")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pending = executor.submit(controller.snapshot)
+        try:
+            assert started.wait(1)
+            command = executor.submit(controller.command, "play_pause")
+            # Snapshot remains held until after command completion: no dependency
+            # on its metadata wait, rather than a timing comparison on a busy CI VM.
+            assert command.result(timeout=1)["ok"] is True
+            for _ in range(10):
+                assert controller.snapshot()["playing"] is False
+            assert adapter.calls == [("snapshot", None), ("play_pause", None)]
+        finally:
+            release.set()
+        assert pending.result(timeout=1)["playing"] is False  # stale poll discarded
+    controller.close()
+
+
+def test_command_light_reply_preserves_metadata_but_invalidates_poll_cache():
+    class LightAdapter(Adapter):
+        def request(self, action, value=None):
+            self.calls.append((action, value))
+            state = active_state(volume=0.4)
+            if action != "snapshot":
+                for key in ("title", "artist", "volume"):
+                    state.pop(key)
+            else:
+                state["controls"]["volume"] = True
+            return {"ok": True, "state": state, "confirmed": False}
+    adapter = LightAdapter()
+    controller = SpotifyController(adapter=adapter, platform="win32")
+    controller.snapshot()
+    response = controller.command("play_pause")
+    assert response["confirmed"] is False
+    assert response["state"]["volume"] == 0.4
+    assert response["state"]["title"] == "Test track"
+    assert response["state"]["controls"]["volume"] is True
+    controller.snapshot()
+    assert adapter.calls == [("snapshot", None), ("play_pause", None), ("snapshot", None)]
+
+
+def test_lost_volume_response_is_not_replayed():
+    adapter = Adapter()
+    adapter.failure = RuntimeError("response lost after accepted write")
+    controller = SpotifyController(adapter=adapter, platform="win32")
+    result = controller.command("volume", 0.3)
+    assert result["ok"] is False and "unknown" in result["error"]
+    controller.snapshot()
+    assert adapter.calls == [("volume", 0.3)]
 
 
 def use_python_helper(monkeypatch, source):
@@ -306,11 +395,13 @@ if ($split -lt 0) { throw 'Shipping helper routing loop not found' }
 Invoke-Expression $source.Substring(0, $split)
 Trace-HarnessPhase 'winrt-initialized'
 $script:Calls = New-Object 'System.Collections.Generic.List[string]'
+$script:MetadataCalls = 0
+$script:Dispatch = New-Object 'System.Collections.Generic.List[double]'
 $script:Fake = [PSCustomObject]@{SourceAppUserModelId='Spotify.exe'}
 $script:Controls = [PSCustomObject]@{IsPreviousEnabled=$true;IsNextEnabled=$true;IsPlayPauseToggleEnabled=$true;IsShuffleEnabled=$true;IsRepeatEnabled=$true}
 $script:Fake | Add-Member ScriptMethod GetPlaybackInfo { return [PSCustomObject]@{PlaybackStatus='Paused';IsShuffleActive=$false;AutoRepeatMode='None';Controls=$script:Controls} }
-$script:Fake | Add-Member ScriptMethod TryGetMediaPropertiesAsync { return [PSCustomObject]@{Title='Fake';Artist='Offline'} }
-$script:Fake | Add-Member ScriptMethod TrySkipPreviousAsync { $script:Calls.Add('previous'); return $true }
+$script:Fake | Add-Member ScriptMethod TryGetMediaPropertiesAsync { $script:MetadataCalls++; Start-Sleep -Milliseconds 200; return [PSCustomObject]@{Title='Fake';Artist='Offline'} }
+$script:Fake | Add-Member ScriptMethod TrySkipPreviousAsync { $script:Dispatch.Add($script:DispatchClock.Elapsed.TotalMilliseconds); $script:Calls.Add('previous'); return $true }
 $script:Fake | Add-Member ScriptMethod TrySkipNextAsync { $script:Calls.Add('next'); return $true }
 $script:Fake | Add-Member ScriptMethod TryTogglePlayPauseAsync { $script:Calls.Add('play_pause'); return $true }
 $script:Fake | Add-Member ScriptMethod TryChangeShuffleActiveAsync { param($v) $script:Calls.Add("shuffle:$v"); return $true }
@@ -327,19 +418,24 @@ $script:Selection = @($script:Browser)
 if ($null -ne (Get-SpotifySession)) { throw 'Browser session was not excluded' }
 Trace-HarnessPhase 'selector-checked'
 function Get-SpotifySession {
+    $script:DispatchClock = [Diagnostics.Stopwatch]::StartNew()
     Trace-HarnessPhase "request:$($request.id)"
     $script:Controls.IsRepeatEnabled = $request.id -ne 9
     return $script:Fake
 }
 function Await-WinRT($Operation, [Type]$ResultType) { return $Operation }
+function Get-SpotifyAudio($Value = $null) {
+    if ($null -ne $Value) { $script:Calls.Add("volume:$Value") }
+    return @{Available=$true;Success=$true;Volume=0.3;Error=$null}
+}
 Trace-HarnessPhase 'ready'
 Invoke-Expression $source.Substring($split)
 Trace-HarnessPhase 'routing-complete'
-[Console]::WriteLine((@{calls=@($script:Calls)} | ConvertTo-Json -Compress))
+[Console]::WriteLine((@{calls=@($script:Calls); metadata_calls=$script:MetadataCalls; dispatch_ms=@($script:Dispatch)} | ConvertTo-Json -Compress))
 ''', encoding="utf-8-sig")
     requests = [("snapshot", None), ("previous", None), ("play_pause", None), ("next", None),
                 ("shuffle", True), ("shuffle", False), ("repeat", "off"), ("repeat", "track"), ("repeat", "list"),
-                ("repeat", "track"), ("shuffle", "invalid"), ("unknown", None)]
+                ("repeat", "track"), ("shuffle", "invalid"), ("unknown", None), ("volume", 0.3), ("volume", "invalid")]
     payload = "".join(json.dumps({"id": i, "action": action, "value": value}) + "\n"
                       for i, (action, value) in enumerate(requests))
     result = run_harness(
@@ -350,7 +446,79 @@ Trace-HarnessPhase 'routing-complete'
     assert result.returncode == 0, result.stderr
     lines = [json.loads(line) for line in result.stdout.splitlines()]
     assert all(line["ok"] is True for line in lines[:9]), lines
-    assert all(line["ok"] is False for line in lines[9:-1]), lines
+    assert all(line["ok"] is False for line in lines[9:12]), lines
+    assert lines[12]["ok"] is True and lines[12]["state"]["volume"] == 0.3
+    assert lines[13]["ok"] is False
     assert lines[9]["error"] == "Spotify does not support this command"
     assert lines[-1]["calls"] == ["previous", "play_pause", "next", "shuffle:True", "shuffle:False",
-                                     "repeat:None", "repeat:Track", "repeat:List"]
+                                     "repeat:None", "repeat:Track", "repeat:List", "volume:0.3"]
+    # Slow metadata was requested once by snapshot, never before/after commands.
+    assert lines[-1]["metadata_calls"] == 1
+    assert lines[-1]["dispatch_ms"][0] < 200
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows .NET Core Audio policy")
+def test_core_audio_policy_targets_only_verified_unambiguous_sessions(tmp_path):
+    audio = Path(__file__).parents[1] / "megamozg" / "spotify_audio.cs"
+    script = tmp_path / "spotify-audio-policy.ps1"
+    phase = tmp_path / "audio.phases"
+    script.write_text(r'''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$source = [IO.File]::ReadAllText($args[0])
+$fake = @'
+namespace Brainalot {
+ public sealed class FakeAudioSession : ISpotifyAudioSession {
+  public string Path; public bool Shared; public float Value; public int Writes; public int Reads;
+  public bool Disappear; public bool LoseResponse;
+  public string ProcessPath { get { Reads++; return Disappear && Reads > 3 ? null : Path; } }
+  public bool SharedProcess { get { return Shared; } }
+  public float Level { get { return Value; } }
+  public void SetLevel(float value) { Writes++; Value = value; if (LoseResponse) throw new System.Exception(); }
+ }
+}
+'@
+Add-Type -TypeDefinition ($source + $fake)
+[IO.File]::WriteAllText($args[1], "ready`n")
+function New-Fake([string]$Path, [float]$Value = 0.2) {
+ $fake = New-Object Brainalot.FakeAudioSession
+ $fake.Path = $Path; $fake.Value = $Value
+ return $fake
+}
+$path = Join-Path $env:APPDATA 'Spotify/Spotify.exe'
+$a = New-Fake $path 0.2
+$b = New-Fake $path 0.6
+$foreign = New-Fake (Join-Path $env:APPDATA 'Chrome/chrome.exe') 0.8
+$spoof = New-Fake 'C:/Unverified/Spotify.exe' 0.9
+$all = [Brainalot.ISpotifyAudioSession[]]@($a,$b,$foreign,$spoof)
+$read = [Brainalot.SpotifyAudio]::Apply($all, $null)
+if (-not $read.Available -or $null -ne $read.Volume -or $a.Writes -ne 0) { throw 'Mixed levels/read-only policy failed' }
+$write = [Brainalot.SpotifyAudio]::Apply($all, 0.4)
+if (-not $write.Success -or $write.Sessions -ne 2 -or $a.Writes -ne 1 -or $b.Writes -ne 1 -or $foreign.Writes -ne 0 -or $spoof.Writes -ne 0) { throw 'Target isolation failed' }
+$otherInstall = New-Fake (Join-Path $env:LOCALAPPDATA 'Spotify/Spotify.exe')
+$ambiguous = [Brainalot.SpotifyAudio]::Apply([Brainalot.ISpotifyAudioSession[]]@($a,$otherInstall),0.5)
+if ($ambiguous.Available -or $a.Writes -ne 1 -or $otherInstall.Writes -ne 0) { throw 'Ambiguous installs were written' }
+$shared = New-Fake $path
+$shared.Shared = $true
+$blocked = [Brainalot.SpotifyAudio]::Apply([Brainalot.ISpotifyAudioSession[]]@($shared),0.5)
+if ($blocked.Available -or $shared.Writes -ne 0) { throw 'Shared process session was written' }
+$gone = New-Fake $path
+$gone.Disappear = $true
+$changed = [Brainalot.SpotifyAudio]::Apply([Brainalot.ISpotifyAudioSession[]]@($gone),0.5)
+if ($changed.Available -or $gone.Writes -ne 0) { throw 'Disappeared target was written' }
+$lost = New-Fake $path
+$lost.LoseResponse = $true
+$unknown = [Brainalot.SpotifyAudio]::Apply([Brainalot.ISpotifyAudioSession[]]@($lost),0.5)
+if ($unknown.Success -or $lost.Writes -ne 1 -or $unknown.Error -notlike '*partial*') { throw 'Lost response was replayed or hidden' }
+$none = [Brainalot.SpotifyAudio]::Apply([Brainalot.ISpotifyAudioSession[]]@($foreign,$spoof),$null)
+if ($none.Available -or $null -ne $none.Volume) { throw 'Missing Spotify session invented' }
+[Console]::WriteLine((@{target_sessions=$write.Sessions;foreign_writes=$foreign.Writes;spoof_writes=$spoof.Writes;lost_response_writes=$lost.Writes} | ConvertTo-Json -Compress))
+''', encoding="utf-8-sig")
+    result = run_harness(
+        [str(Path(__import__('os').environ['SystemRoot']) / 'System32/WindowsPowerShell/v1.0/powershell.exe'),
+         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(script), str(audio), str(phase)],
+        "", phase,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"target_sessions": 2, "foreign_writes": 0,
+                                       "spoof_writes": 0, "lost_response_writes": 1}

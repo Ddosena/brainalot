@@ -18,25 +18,45 @@ applyProgressColor(saved[FOCUS_OVERLAY_COLOR_KEY]);
 const spotifyPlayer = mountSpotifyPlayer(document.getElementById("desktop-spotify"), {onVisibility: visible => {
   document.getElementById("desktop-spotify-toggle").textContent = visible ? t("Скрыть Spotify") : t("Показать Spotify");
 }});
-document.getElementById("desktop-spotify-toggle").onclick = () => void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(showError);
+document.getElementById("desktop-spotify-toggle").onclick = () => {
+  document.querySelector(".desktop-menu").open = false;
+  void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(showError);
+};
 document.documentElement.dataset.theme = saved["panel:theme"] || "light";
 document.documentElement.dataset.design = saved["panel:design"] || "stream";
 document.querySelector('[data-view="work"]').hidden = !WORK_ENABLED;
 function show(view) {
   if (view === "home") view = "day";
   if (view === "work" && !WORK_ENABLED) view = "day";
-  const paths = { day: "panel.html", library: "panel.html?library-window=1", work: "work.html", capture: "capture.html" };
+  const paths = { day: "panel.html?embedded-desktop=1", library: "panel.html?library-window=1&embedded-desktop=1", work: "work.html", capture: "capture.html" };
   const frame = document.getElementById("desktop-content");
   const next = new URL(paths[view] || paths.day, location.href).href;
-  if (frame.src !== next) frame.src = next;
+  if (frame.src !== next) { frame.dataset.loading = "true"; frame.src = next; }
   document.querySelectorAll("[data-view]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === view)));
 }
-show(new URLSearchParams(location.search).get("view") || "day");
-document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => show(button.dataset.view));
+const initialView = new URLSearchParams(location.search).get("view") || "day";
+document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => { document.querySelector(".desktop-menu").open = false; show(button.dataset.view); });
 window.addEventListener("brainalot-view", event => show(event.detail));
 const bootstrap = await native.bootstrap();
-installWindowGestures(native, {doubleClick: bootstrap.double_click,
+installWindowGestures(native, {doubleClick: bootstrap.double_click, freeDoubleClick: true,
   onDoubleClick: () => void native.window_action("card")});
+document.getElementById("desktop-content").addEventListener("load", event => {
+  const frame = event.currentTarget; frame.dataset.loading = "false";
+  try {
+    if (frame.contentDocument?.body) installWindowGestures(native, {surface: frame.contentDocument.body,
+      doubleClick: bootstrap.double_click, freeDoubleClick: true, onDoubleClick: () => void native.window_action("card")});
+  } catch { /* Only same-origin embedded content receives our own gestures. */ }
+});
+show(initialView);
+document.querySelectorAll("[data-panel-action]").forEach(button => { button.onclick = async () => {
+  document.querySelector(".desktop-menu").open = false;
+  const frame = document.getElementById("desktop-content");
+  if (!frame.src.includes("panel.html")) {
+    const loaded = new Promise(resolve => frame.addEventListener("load", resolve, {once: true}));
+    show("day"); await loaded;
+  }
+  frame.contentWindow.postMessage({type: "brainalot:panel-action", action: button.dataset.panelAction}, location.origin);
+}; });
 function renderProgress() {
   const progress = timerProgress(timeClient.state, elapsedAt(timeClient.state));
   const bar = document.getElementById("desktop-progress");
@@ -46,8 +66,6 @@ function renderProgress() {
 timeClient.subscribe(renderProgress);
 renderProgress();
 setInterval(() => { if (!document.hidden) renderProgress(); }, 1000);
-setInterval(() => { if (!document.hidden) void timeClient.refresh().catch(() => {}); }, 5000);
-void timeClient.refresh().catch(() => {});
 const showError = error => { const el=document.getElementById("desktop-error"); el.textContent=error.message; el.hidden=false; };
 document.getElementById("desktop-compact").onclick = async () => {
   try {
@@ -70,3 +88,6 @@ chrome.storage.onChanged.addListener(changes => {
   if (changes["panel:design"]) document.documentElement.dataset.design = changes["panel:design"].newValue;
   if (changes[FOCUS_OVERLAY_COLOR_KEY]) applyProgressColor(changes[FOCUS_OVERLAY_COLOR_KEY].newValue);
 });
+// One controller owns the header's task, modes, completion/outbox and activity UI.
+// The standalone Chrome panel keeps its own time UI below its own masthead.
+await import("./widget.js");
