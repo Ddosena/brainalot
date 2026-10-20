@@ -2,14 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import * as model from '../widget-model.js';
+import {FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor} from '../focus-timer.js';
 
 async function start({saved={},state={status:'idle',mode:'pomodoro',elapsed_ms:0,duration_ms:1500000},pending=null,catalog=Promise.resolve({notes:[]}),apiOverride=null}={}) {
   const source=(await readFile(new URL('../widget.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
   const nodes=new Map(),intervals=[],events={},actions=[],writes=[];
-  const element=()=>({dataset:{},style:{},value:'',options:[],children:[],classList:{toggle(){}},setAttribute(){},focus(){},
+  const element=()=>({dataset:{},style:{},value:'',options:[],children:[],classList:{toggle(){}},setAttribute(){},toggleAttribute(){},focus(){},
     append(...items){this.children.push(...items);},querySelector(){return this.button??=element();},
     replaceChildren(...children){this.options=this.children=children;},hidden:false,textContent:''});
-  const document={body:{dataset:{}},documentElement:{dataset:{}},hidden:false,addEventListener(){},createElement:element,
+  const document={body:{dataset:{}},documentElement:{dataset:{},style:{setProperty(){}}},hidden:false,addEventListener(){},createElement:element,
     getElementById(id){if(!nodes.has(id)){const el=element();el.hidden=['widget-error','widget-retry','widget-popup'].includes(id);nodes.set(id,el);}return nodes.get(id);}};
   const chrome={storage:{local:{async get(keys){return typeof keys==='string'?{[keys]:saved[keys]}:Object.fromEntries((keys||Object.keys(saved)).map(key=>[key,saved[key]]));},
     async set(items){writes.push(items);Object.assign(saved,items);}},onChanged:{addListener(){}}}};
@@ -20,6 +21,7 @@ async function start({saved={},state={status:'idle',mode:'pomodoro',elapsed_ms:0
     elapsedAt:()=>2000,formatTime:()=> '00:02',formatTotal:()=> '0 мин',getTimePreset:()=>{},timerFields:()=>{},
     applyDocument(){},async syncLocale(){},localeChange:()=>false,t:(text,args)=>text.replace(/\{(\w+)\}/g,(_,key)=>args?.[key]??''),calendarImportanceLevel:()=>null,
     ...model,installWindowGestures:(_native,options)=>{gesture=options;},document,chrome,
+    FOCUS_OVERLAY_COLOR_KEY,NEON_COLORS,normalizeNeonColor,mountSpotifyPlayer:()=>({visible:false,setVisible(){}}),
     window:{addEventListener(name,fn){events[name]=fn;}},Option:function(text,value){return{text,value};},setInterval:fn=>intervals.push(fn)};
   const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
   await new AsyncFunction(...Object.keys(env),source)(...Object.values(env));

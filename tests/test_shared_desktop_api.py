@@ -282,3 +282,44 @@ def test_shared_timer_preset_validation_cas_and_replay(tmp_path):
         with pytest.raises(ValidationError):
             shared.set_preferences({"request_id": "invalid", "expected_revision": 1, "patch": {"time:preset": preset}})
     assert shared.preferences() == result
+
+
+def test_shared_timer_color_preserves_palette_and_rejects_invalid_values(tmp_path):
+    shared = SharedState(tmp_path)
+    for revision, color in enumerate(("fire", "pink", "violet", "cyan", "lime", "amber")):
+        command = {"request_id": f"color-{color}", "expected_revision": revision,
+                   "patch": {"panel:focus-overlay-color": color}}
+        result = shared.set_preferences(command)
+        assert result["values"]["panel:focus-overlay-color"] == color
+        assert SharedState(tmp_path).set_preferences(command) == result
+    for value in (None, [], {}, 2, True, "#ffffff", "other"):
+        with pytest.raises(ValidationError):
+            shared.set_preferences({"request_id": "invalid", "expected_revision": 6,
+                                    "patch": {"panel:focus-overlay-color": value}})
+    assert shared.preferences()["revision"] == 6
+
+
+def test_spotify_api_auth_validation_and_lifecycle_without_playback(tmp_path):
+    class FakeSpotify:
+        def __init__(self): self.calls, self.closed = [], False
+        def snapshot(self): return {"connected": True, "title": "Synthetic track", "controls": {"next": True}}
+        def command(self, action, value=None):
+            self.calls.append((action, value))
+            return {"ok": True, "state": self.snapshot()}
+        def close(self): self.closed = True
+    spotify = FakeSpotify()
+    app = create_app(tmp_path, spotify_controller=spotify)
+    auth = {"Authorization": "Bearer " + Store(tmp_path).token()}
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.get("/api/media/spotify").status_code == 401
+        assert client.post("/api/media/spotify/command", json={"action": "next"}).status_code == 401
+        assert client.get("/api/media/spotify", headers=auth).json()["title"] == "Synthetic track"
+        for body in ({"action": []}, {"action": "unknown"}, {"action": "next", "value": 1},
+                     {"action": "shuffle", "value": "true"}, {"action": "repeat", "value": []}):
+            assert client.post("/api/media/spotify/command", json=body, headers=auth).status_code == 422
+        assert spotify.calls == []
+        for body in ({"action": "next"}, {"action": "shuffle", "value": False},
+                     {"action": "repeat", "value": "track"}):
+            assert client.post("/api/media/spotify/command", json=body, headers=auth).json()["ok"]
+        assert spotify.calls == [("next", None), ("shuffle", False), ("repeat", "track")]
+    assert spotify.closed

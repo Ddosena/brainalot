@@ -24,6 +24,9 @@ brainalot = "megamozg.cli:main"
 [tool.setuptools.dynamic]
 version = {attr = "megamozg.__version__"}
 
+[tool.setuptools.package-data]
+megamozg = ["spotify_bridge.ps1"]
+
 [tool.setuptools.packages.find]
 include = ["megamozg*"]
 

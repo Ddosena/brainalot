@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ import webbrowser
 
 _log = logging.getLogger("brainalot.desktop")
 WIDGET_SIZES = {"bar": (84, 48), "card": (360, 64)}
+MEDIA_ROW_HEIGHT = 52
 FULL_SIZE = (1120, 760)
 MINIMUM_SIZES = {"full": (300, 360), **WIDGET_SIZES}
 STORAGE_FILE = "desktop-ui.json"
@@ -174,6 +176,7 @@ class DesktopBridge:
         return {"port": self._host.port, "token": self._host.token, "desktop": True,
                 "mode": self._host.mode, "widget_mode": self._host.widget_mode,
                 "topmost": self._host.topmost, "side": self._host.side,
+                "media_visible": self._host.media_visible,
                 "double_click": double_click_settings(area.dpi)}
 
     def window_action(self, action, value=None):
@@ -219,6 +222,8 @@ class CompactSurface:
         self.generation = 0
         self.timer = None
         self.canvas = None
+        self.image = None
+        self._image_digest = None
         self.boxes = []
         self.ask_options = []
         self.activity_menu = None
@@ -231,6 +236,7 @@ class CompactSurface:
         self._input = queue.Queue()
         self._move_pending = False
         self.frames = 0
+        self.skipped_frames = 0
         self.capture_seconds = 0.0
         self._worker = threading.Thread(target=self._inputs, name="brainalot-compact-input", daemon=True)
         self._worker.start()
@@ -268,10 +274,19 @@ class CompactSurface:
                      and box["y"] <= y < box["y"]+box["h"]), None)
 
     def _create_canvas(self):
-        from System.Windows.Forms import UserControl, DockStyle, MouseButtons, Keys
+        from System import Array, Object
+        from System.Reflection import BindingFlags
+        from System.Windows.Forms import UserControl, DockStyle, MouseButtons, Keys, ControlStyles
         canvas = UserControl()
+        # BackgroundImage assignment invalidates with a separate background
+        # erase. Paint our bitmap in one buffered WM_PAINT instead.
+        setter = canvas.GetType().GetMethod("SetStyle", BindingFlags.Instance | BindingFlags.NonPublic)
+        setter.Invoke(canvas, Array[Object]([ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, True]))
         canvas.Dock = DockStyle.Fill
         canvas.TabStop = True
+        def paint(_sender, event):
+            if self.image is not None: event.Graphics.DrawImageUnscaled(self.image, 0, 0)
         def down(_sender, event):
             if not self.active: return
             button = 0 if event.Button == MouseButtons.Left else 2 if event.Button == MouseButtons.Right else -1
@@ -304,7 +319,8 @@ class CompactSurface:
             self._input.put(("key", {"key":str(event.KeyCode), "shift":bool(event.Shift)}))
         canvas.MouseDown += down; canvas.MouseMove += move; canvas.MouseUp += up
         canvas.PreviewKeyDown += preview; canvas.KeyDown += key
-        self._handlers = (down, move, up, preview, key)
+        canvas.Paint += paint
+        self._handlers = (down, move, up, preview, key, paint)
         self.window.native.Controls.Add(canvas)
         self.canvas = canvas
 
@@ -315,6 +331,7 @@ class CompactSurface:
         if self.active and signature == self._signature: return
         self.active = True; self.generation += 1; self._signature = signature
         self.ready = False
+        self._image_digest = None
         self.boxes = []; self.focus_id = None; self.last_click = None
         def apply():
             from System.Drawing import Rectangle, Region
@@ -374,15 +391,17 @@ class CompactSurface:
         try:
             from System.Drawing import Bitmap, Graphics, Image, Rectangle
             from System.Drawing.Drawing2D import SmoothingMode
+            from System.Drawing.Imaging import ImageLockMode, PixelFormat
             from System.IO import MemoryStream
             from Microsoft.Web.WebView2.Core import CoreWebView2CapturePreviewImageFormat
             snapshot = self._js("""(() => ({width:innerWidth,height:innerHeight,ready:document.body.dataset.widgetReady==='true',
               mode:document.body.dataset.widgetMode, title:document.getElementById('widget-burning')?.textContent,
               askOptions:Array.from(document.getElementById('widget-ask-choice')?.options||[])
                 .filter(o=>o.value && !o.disabled).map(o=>({value:o.value,label:o.textContent})),boxes:
-              ['widget-task','widget-ask-choice','widget-run','widget-more','widget-tab'].map(id=>document.getElementById(id))
-              .filter(e=>e && !e.hidden && e.getBoundingClientRect().width && !e.disabled)
-              .map(e=>{const r=e.getBoundingClientRect();return {id:e.id,x:r.x,y:r.y,w:r.width,h:r.height}})}))()""")
+              [...document.querySelectorAll('#widget-spotify button[id]'),
+               ...['widget-task','widget-ask-choice','widget-run','widget-more','widget-tab'].map(id=>document.getElementById(id))]
+              .filter(e=>e && !e.hidden && e.getBoundingClientRect().width)
+              .map(e=>{const r=e.getBoundingClientRect();return {id:e.id,x:r.x,y:r.y,w:r.width,h:r.height,disabled:Boolean(e.disabled)}})}))()""")
             if (not snapshot.get("ready") or snapshot.get("mode") != signature[0] or
                 not snapshot["boxes"] or (signature[0] == "card" and not snapshot.get("title")) or
                 any(box["x"] < 0 or box["y"] < 0 or box["x"]+box["w"] > snapshot["width"]+.5 or
@@ -404,23 +423,35 @@ class CompactSurface:
                     graphics.SetClip(path)
                     graphics.DrawImage(source, Rectangle(0,0,width,height))
                     graphics.Dispose(); path.Dispose()
+                    pixels = image.LockBits(Rectangle(0,0,width,height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb)
+                    try:
+                        digest = hashlib.sha256(ctypes.string_at(int(pixels.Scan0.ToInt64()), abs(pixels.Stride)*height)).digest()
+                    finally: image.UnlockBits(pixels)
                 finally: source.Dispose()
             finally: stream.Dispose()
             def present():
                 if generation != self.generation or not self.active:
                     image.Dispose(); return
-                old = self.canvas.BackgroundImage
-                self.canvas.BackgroundImage = image
-                self.frames += 1
-                self.ready = True
                 self.snapshot = snapshot
                 self.ask_options = snapshot["askOptions"]
                 self.boxes = [{**box, "x":box["x"]*width/snapshot["width"], "y":box["y"]*height/snapshot["height"],
                                "w":box["w"]*width/snapshot["width"], "h":box["h"]*height/snapshot["height"]}
                               for box in snapshot["boxes"]]
+                if digest == self._image_digest:
+                    self.skipped_frames += 1
+                    image.Dispose()
+                    return
+                old, self.image = self.image, image
+                self._image_digest = digest
+                self.frames += 1
+                first_frame = not self.ready
+                self.ready = True
+                user = ctypes.WinDLL("user32")
+                user.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+                user.InvalidateRect(int(self.canvas.Handle.ToInt64()), None, False)
                 if old: old.Dispose()
                 if not self.window.native.Visible: self.window.native.Show()
-                self.window.native.Opacity = 1
+                if first_frame: self.window.native.Opacity = 1
             self._invoke(present)
         except Exception:
             if not self.closed: _log.debug("Compact bitmap refresh failed", exc_info=True)
@@ -429,6 +460,7 @@ class CompactSurface:
             self._capture_lock.release(); self._schedule()
 
     def _activate_control(self, control):
+        if any(box["id"] == control and box.get("disabled") for box in self.boxes): return
         if control == "widget-tab": self.host.window_action("card")
         elif control == "widget-ask-choice": self._show_activity_menu()
         elif control: self._js("document.getElementById("+json.dumps(control)+")?.click(); true")
@@ -481,7 +513,7 @@ class CompactSurface:
                                                            "card" if self.host.mode == "bar" else "bar")
                 elif action == "key":
                     if item["key"] == "Tab":
-                        ids = [box["id"] for box in self.boxes]
+                        ids = [box["id"] for box in self.boxes if not box.get("disabled")]
                         if not ids: continue
                         index = ids.index(self.focus_id) if self.focus_id in ids else (0 if item["shift"] else -1)
                         self.focus_id = ids[(index+(-1 if item["shift"] else 1))%len(ids)]
@@ -502,8 +534,7 @@ class CompactSurface:
         def dispose():
             if self.activity_menu: self.activity_menu.Dispose()
             if self.canvas:
-                image = self.canvas.BackgroundImage
-                self.canvas.BackgroundImage = None
+                image, self.image = self.image, None
                 if image: image.Dispose()
                 self.canvas.Dispose()
             region = self.window.native.Region
@@ -517,6 +548,7 @@ class DesktopHost:
         self.root, self.port, self.token = Path(root), int(port), token
         self.on_quit = on_quit
         self.state = DesktopState(root)
+        self.media_visible = self.state.get({"desktop:spotify-visible": True})["desktop:spotify-visible"] is not False
         self.mode = "full"
         self.widget_mode = self.state.data.get("widget_mode", "bar")
         if self.widget_mode not in WIDGET_SIZES:
@@ -539,6 +571,10 @@ class DesktopHost:
         self._popup_above = False
         self._compact_surface = None
 
+    def _widget_size(self, mode):
+        width, height = WIDGET_SIZES[mode]
+        return width, height+(MEDIA_ROW_HEIGHT if mode == "card" and self.media_visible else 0)
+
     def _sync_compact_surface(self):
         if not self.widget or not hasattr(getattr(self.widget, "native", None), "Invoke"):
             return
@@ -556,7 +592,7 @@ class DesktopHost:
 
     def _rect(self, mode, anchor=None):
         areas = self._areas()
-        default = FULL_SIZE if mode == "full" else WIDGET_SIZES[mode]
+        default = FULL_SIZE if mode == "full" else self._widget_size(mode)
         saved = dict(self.state.data["geometry"].get(mode, {}))
         # Migrate old logical widget geometry once. Discard ambiguous oversized
         # tab dimensions; its native bounds must equal the visible small surface.
@@ -565,7 +601,7 @@ class DesktopHost:
         area = select_area(anchor or saved, areas)
         scale = area.dpi / 96
         size = tuple(round(v * scale) for v in default)
-        minimum = tuple(round(v * scale) for v in MINIMUM_SIZES[mode])
+        minimum = tuple(round(v * scale) for v in (MINIMUM_SIZES["full"] if mode == "full" else self._widget_size(mode)))
         if saved.get("units") == "physical" and saved.get("dpi"):
             ratio = area.dpi / saved["dpi"]
             saved["width"] = round(saved["width"] * ratio)
@@ -600,8 +636,8 @@ class DesktopHost:
                                            js_api=bridge, hidden=True, frameless=True, resizable=False,
                                            easy_drag=False, on_top=True, shadow=False, min_size=MINIMUM_SIZES["bar"],
                                            x=80, y=80,
-                                           width=WIDGET_SIZES[self.widget_mode][0],
-                                           height=WIDGET_SIZES[self.widget_mode][1])
+                                           width=self._widget_size(self.widget_mode)[0],
+                                           height=self._widget_size(self.widget_mode)[1])
         for name, window in (("full", self.full), ("widget", self.widget)):
             original_evaluate_js = getattr(window, "evaluate_js", None)
             if callable(original_evaluate_js):
@@ -741,7 +777,7 @@ class DesktopHost:
                         rect["width"], rect["height"] = (round(v*area.dpi/96) for v in WIDGET_SIZES["bar"])
                         self.side = nearest_edge(rect, area)
                         self.state.data["side"] = self.side
-                    rect = fit_geometry(rect, self._areas(), WIDGET_SIZES.get(self.mode, FULL_SIZE),
+                    rect = fit_geometry(rect, self._areas(), self._widget_size(self.mode) if self.mode in WIDGET_SIZES else FULL_SIZE,
                                         side=self.side if self.mode == "bar" else None)
                 set_native_rect(window, rect)
             if action == "gesture_end":
@@ -763,10 +799,10 @@ class DesktopHost:
                     self._switching = False
             self._popup_above = False
             self._sync_compact_surface()
-            return {"ok": True, "popup_above": False, "height": WIDGET_SIZES[self.widget_mode][1]}
+            return {"ok": True, "popup_above": False, "height": self._widget_size(self.widget_mode)[1]}
         if self.mode != "card":
-            return {"ok": False, "popup_above": False, "height": WIDGET_SIZES[self.widget_mode][1]}
-        requested = value.get("height", WIDGET_SIZES["card"][1])
+            return {"ok": False, "popup_above": False, "height": self._widget_size(self.widget_mode)[1]}
+        requested = value.get("height", self._widget_size("card")[1])
         if isinstance(requested, bool) or not isinstance(requested, (int, float)) or not 0 < requested < 100000:
             raise ValueError("Popup height must be a positive logical size")
         if self._popup_base is None:
@@ -781,6 +817,43 @@ class DesktopHost:
             self._switching = False
         return {"ok": True, "popup_above": self._popup_above, "height": round(rect["height"]*96/area.dpi)}
 
+    def _widget_media(self, value):
+        if not isinstance(value, dict) or not isinstance(value.get("visible"), bool):
+            raise ValueError("Media visibility must be a boolean")
+        visible = value["visible"]
+        changed = self.media_visible != visible
+        self.media_visible = visible
+        self.state.set({"desktop:spotify-visible": visible})
+        result = {"ok": True, "media_visible": visible, "card_height": self._widget_size("card")[1],
+                  "height": self._widget_size(self.widget_mode)[1], "popup_above": self._popup_above}
+        if self.mode != "card" or not changed:
+            if self.mode == "card":
+                current = native_rect(self.widget)
+                area = select_area(current, self._areas())
+                result["height"] = round(current["height"]*96/area.dpi)
+            return result
+        before = native_rect(self.widget)
+        base = dict(self._popup_base or before)
+        area = select_area(base, self._areas())
+        height = round(self._widget_size("card")[1]*area.dpi/96)
+        extra = max(0, before["height"]-base["height"])
+        if self.side == "bottom": base["y"] += base["height"]-height
+        base["height"] = height
+        base = fit_geometry(base, self._areas(), self._widget_size("card"))
+        rect = base
+        if self._popup_base is not None:
+            self._popup_base = base
+            rect, self._popup_above = popup_geometry(base, area, base["height"]+extra, self.side)
+        self._switching = True
+        try:
+            set_native_rect(self.widget, rect, tuple(round(v*area.dpi/96) for v in self._widget_size("card")))
+            self._sync_compact_surface()
+        finally:
+            self._switching = False
+        self._remember_geometry(self.widget, "widget")
+        result.update(height=round(rect["height"]*96/area.dpi), popup_above=self._popup_above)
+        return result
+
     def window_action(self, action, value=None):
         with self._lock:
             if self._quitting:
@@ -789,6 +862,8 @@ class DesktopHost:
                 return self._gesture(action, value)
             if action == "widget_popup":
                 return self._widget_popup(value)
+            if action == "widget_media":
+                return self._widget_media(value)
             if action == "topmost":
                 self.topmost = True
                 # pywebview's on_top setter writes WinForms.TopMost off the UI

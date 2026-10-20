@@ -55,6 +55,23 @@ test("a write that may have reached the same service is not repeated", async () 
   assert.equal(attempts, 1);
 });
 
+test("non-replayable playback command reconnects but is never redelivered to a new port", async () => {
+  const chrome = fakeChrome({
+    answer: {ok:true,token:"new",port:8770},
+    stored: {connection:{token:"old",port:8765}},
+  });
+  const calls = [];
+  const connection = createConnection(chrome, {request: async (path, options) => {
+    calls.push({path, ...options});
+    assert.equal(options.replay, undefined);
+    throw new ApiError("response lost", 0);
+  }});
+  await assert.rejects(connection.api("/api/media/spotify/command", "POST", {action:"next"}, {replay:false}), /response lost/);
+  assert.equal(calls.length, 1);
+  assert.equal(chrome.store.connection.port, 8770);
+  assert.equal(chrome.store.connection.token, "new");
+});
+
 test("a missing host leaves the manual token path working", async () => {
   const chrome = fakeChrome({ lastError: { message: "Specified native messaging host not found." } });
   const connection = createConnection(chrome, { request: async (path, { token }) => { if (!token) throw new ApiError("no token", 401); } });

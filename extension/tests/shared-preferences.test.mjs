@@ -138,3 +138,26 @@ test("a real local change racing the delayed remote event is still sent once", a
     assert.deepEqual(chrome.values[PENDING], []);
   } finally { sync.stop(); }
 });
+
+test("an existing Chrome color migrates once into an already initialized shared state", async () => {
+  const chrome = fakeChrome({"panel:focus-overlay-color":"cyan"}), server = fakeServer();
+  const sync = syncPreferences(server.api, chrome);
+  try {
+    await until(() => server.state.values["panel:focus-overlay-color"] === "cyan");
+    await tick(); await tick();
+    assert.equal(server.calls.length, 1);
+    await sync.pollNow(); await tick();
+    assert.equal(server.calls.length, 1);
+  } finally { sync.stop(); }
+});
+
+test("existing remote timer color wins over stale local choice without feedback writes", async () => {
+  const chrome = fakeChrome({"panel:focus-overlay-color":"pink"});
+  const server = fakeServer({revision:4,values:{"panel:focus-overlay-color":"lime"}});
+  const sync = syncPreferences(server.api, chrome);
+  try {
+    await until(() => chrome.values["panel:focus-overlay-color"] === "lime");
+    await tick(); await tick();
+    assert.equal(server.calls.length, 0);
+  } finally { sync.stop(); }
+});

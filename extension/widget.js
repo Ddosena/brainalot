@@ -4,11 +4,13 @@ import { applyDocument, syncLocale, localeChange, t } from "./i18n.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { compactTasks, taskKey, resolveActiveTask, untrackedStep, eventKey, currentEvent, timerProgress } from "./widget-model.js";
 import { installWindowGestures } from "./desktop-gestures.js";
+import { FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor } from "./focus-timer.js";
+import { mountSpotifyPlayer } from "./spotify-player.js";
 const $ = id => document.getElementById(id);
 const OP_KEY = "desktop:widget-operation", SELECT_KEY = "desktop:selected-task", SELECT_REV_KEY = "desktop:selected-task-revision";
 applyDocument(); void syncLocale();
 const bootstrap = await native.bootstrap();
-const saved = await chrome.storage.local.get(["desktop:selected-fire", SELECT_KEY, SELECT_REV_KEY, OP_KEY]);
+const saved = await chrome.storage.local.get(["desktop:selected-fire", SELECT_KEY, SELECT_REV_KEY, OP_KEY, "desktop:spotify-visible", FOCUS_OVERLAY_COLOR_KEY]);
 let mode = bootstrap.widget_mode === "card" ? "card" : "bar";
 let burning = [], selectedFire = saved["desktop:selected-fire"] || "", selectedTask = saved[SELECT_KEY] || null;
 let selectedRevision = saved[SELECT_REV_KEY] ?? null;
@@ -18,9 +20,27 @@ let liveNotes = [], liveEvents = [], taskCatalog = [], totals = [];
 let pendingNotice = false, pollNotice = false;
 let gap = null, asking = false, snoozeUntil = 0;
 let popup = null, popupQueue = Promise.resolve();
+let mediaVisible = bootstrap.media_visible ?? saved["desktop:spotify-visible"] !== false;
 const askRefs = new Map();
 document.body.dataset.side = bootstrap.side || "right";
 document.body.dataset.widgetMode = mode;
+document.body.dataset.mediaVisible = String(mediaVisible);
+function applyProgressColor(value) {
+  const color = NEON_COLORS.find(color => color.id === normalizeNeonColor(value));
+  document.documentElement.style.setProperty("--timer-progress-color", color.tube);
+}
+applyProgressColor(saved[FOCUS_OVERLAY_COLOR_KEY]);
+function mediaVisibility(visible) {
+  mediaVisible = visible; document.body.dataset.mediaVisible = String(visible);
+  $("widget-spotify-toggle").textContent = visible ? t("Скрыть Spotify") : t("Показать Spotify");
+  // Share the popup geometry queue so hide/show cannot race a late popup resize.
+  popupQueue = popupQueue.catch(() => {}).then(async () => {
+    const result = await native.window_action("widget_media", {visible});
+    if (result?.ok === false) throw new Error(t("Не удалось изменить размер плеера. Повторите действие."));
+    if (result?.popup_above !== undefined) document.body.dataset.popupAbove = String(result.popup_above);
+  });
+  return popupQueue.then(() => { if (popup) return syncPopup(); }).catch(error);
+}
 function currentTask() {
   const current = resolveActiveTask(timeClient.state, liveNotes, liveEvents);
   if (timeClient.state?.status === "running") return current;
@@ -50,7 +70,8 @@ function syncPopup() {
   const requested = popup;
   // Serialize native geometry mutations: a late open must never undo a close.
   popupQueue = popupQueue.catch(() => {}).then(async () => {
-    const result = await native.window_action("widget_popup", {open: Boolean(requested), height: requested === "menu" ? 340 : requested === "notice" ? 235 : 460});
+    const height = (requested === "menu" ? 375 : requested === "notice" ? 235 : 460) + (mediaVisible ? 52 : 0);
+    const result = await native.window_action("widget_popup", {open: Boolean(requested), height});
     if (result?.ok === false) throw new Error(t("Не удалось открыть список. Повторите действие."));
     document.body.dataset.popupAbove = String(Boolean(result?.popup_above));
   });
@@ -126,6 +147,10 @@ function render() {
   $("widget-mode").textContent = t("Сменить режим: {mode}", {mode: modeName});
   const title = task?.title || t("Выбрать задачу");
   $("widget-burning").textContent = title; $("widget-task").title = title;
+  const isCritical = Boolean(task && model.tasks.some(item => taskKey(item) === taskKey(task)));
+  $("widget-task").classList.toggle("is-critical", isCritical);
+  $("widget-critical-mark").toggleAttribute("hidden", !isCritical);
+  $("widget-task").setAttribute("aria-label", isCritical ? `${title}. ${t("Горящая задача")}` : title);
   const hot = taskKey(model.hot) !== taskKey(task) ? model.hot : model.tasks.find(item => taskKey(item) !== taskKey(task));
   $("widget-current").hidden = !hot;
   $("widget-current").textContent = hot ? t("Горит: {title}", {title: hot.title}) : "";
@@ -339,15 +364,21 @@ chrome.storage.onChanged.addListener(changes => {
   if (localeChange(changes)) void syncLocale().then(render);
   if (changes["panel:theme"]) document.documentElement.dataset.theme = changes["panel:theme"].newValue;
   if (changes["panel:design"]) document.documentElement.dataset.design = changes["panel:design"].newValue;
+  if (changes[FOCUS_OVERLAY_COLOR_KEY]) applyProgressColor(changes[FOCUS_OVERLAY_COLOR_KEY].newValue);
+  if (changes["panel:calendar-importance"]) void refresh();
 });
 async function refresh(force = false) {
   if (refreshing || !force && document.hidden) return;
   refreshing = true;
   try {
     await timeClient.refresh();
-    const [notes, prefs, tasks, timeTotals] = await Promise.all([sharedApi("/api/notes"), chrome.storage.local.get(["panel:calendar-importance", "panel:theme", "panel:design"]), sharedApi("/api/time/tasks"), sharedApi("/api/time/totals")]);
+    const [notes, localPrefs, sharedPrefs, tasks, timeTotals] = await Promise.all([sharedApi("/api/notes"), chrome.storage.local.get(["panel:calendar-importance", "panel:theme", "panel:design", FOCUS_OVERLAY_COLOR_KEY]), sharedApi("/api/ui/preferences"), sharedApi("/api/time/tasks"), sharedApi("/api/time/totals")]);
+    // Read the common preferences directly. Calendar fire and color must update
+    // even before a hidden full-window preference sync happens to poll.
+    const prefs = {...localPrefs, ...sharedPrefs.values};
     liveNotes = notes.notes; taskCatalog = (tasks.tasks || []).filter(task => task.source !== "work"); totals = timeTotals.rows || [];
     document.documentElement.dataset.theme = prefs["panel:theme"] || "light"; document.documentElement.dataset.design = prefs["panel:design"] || "stream";
+    applyProgressColor(prefs[FOCUS_OVERLAY_COLOR_KEY]);
     burning = liveNotes.filter(note => ["task", "purchase"].includes(note.kind) && note.importance === "critical" && !["done", "cancelled", "archived"].includes(note.status)).map(note => ({source: "library", id: note.id, title: note.title}));
     const now = new Date(), day = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
     const calendar = await sharedApi(`/api/calendar/events?start=${day}&end=${day}`).catch(() => ({events: []})); liveEvents = calendar.events || [];
@@ -362,5 +393,8 @@ async function refresh(force = false) {
 }
 timeClient.subscribe(render); render();
 document.addEventListener("visibilitychange", () => { if (!document.hidden) void refresh(); });
-await refresh(true); document.body.dataset.widgetReady = "true";
+await refresh(true);
+const spotifyPlayer = mountSpotifyPlayer($("widget-spotify"), {onVisibility: mediaVisibility});
+$("widget-spotify-toggle").onclick = () => { void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(error); };
+document.body.dataset.widgetReady = "true";
 setInterval(refresh, 5000); setInterval(() => { if (!document.hidden) render(); }, 1000); setInterval(watchUntracked, 15_000);

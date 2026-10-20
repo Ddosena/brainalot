@@ -126,6 +126,7 @@ def _persistence_probe(window):
 
 
 def run(root: Path) -> int:
+    os.environ["BRAINALOT_DISABLE_MEDIA"] = "1"  # Diagnostics never control the owner's music.
     """Only app.main may call this, after checking an explicit BRAINALOT_HOME."""
     root = Path(root)
     output = root / "state" / "desktop-smoke"

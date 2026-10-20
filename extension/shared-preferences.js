@@ -1,4 +1,4 @@
-export const SHARED_KEYS = ["panel:calendar-importance", "panel:theme", "panel:design", "panel:locale", "time:preset"];
+export const SHARED_KEYS = ["panel:calendar-importance", "panel:theme", "panel:design", "panel:locale", "panel:focus-overlay-color", "time:preset"];
 const PENDING = "shared:preferences-pending", CONFLICT = "shared:preferences-conflict";
 export function syncPreferences(api, chromeApi = globalThis.chrome) {
   let state = null, busy = false, conflict = false;
@@ -37,6 +37,15 @@ export function syncPreferences(api, chromeApi = globalThis.chrome) {
           const local = await chromeApi.storage.local.get(SHARED_KEYS);
           const patch = Object.fromEntries(Object.entries(local).filter(([,v]) => v !== undefined));
           if (Object.keys(patch).length) queue.push({patch,request_id:crypto.randomUUID(),expected_revision:0});
+        }
+        // Color became shared after the other preferences. Seed an existing
+        // Chrome choice only while the server has no color; never overwrite it.
+        if (!chromeApi.desktop && !queue.length && state.values["panel:focus-overlay-color"] === undefined) {
+          const local = await chromeApi.storage.local.get(["panel:focus-overlay-color"]);
+          const color = local["panel:focus-overlay-color"];
+          if (["fire","pink","violet","cyan","lime","amber"].includes(color)) {
+            queue.push({patch:{"panel:focus-overlay-color":color},request_id:crypto.randomUUID(),expected_revision:state.revision});
+          }
         }
       }
       while (queue.length) {

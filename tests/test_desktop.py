@@ -223,7 +223,7 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     assert host.mode == "bar" and host.widget.width == 84 and host.widget.height == 48
     assert host.widget.x == 1920-84
     host.window_action("card")
-    assert host.mode == "card" and (host.widget.width, host.widget.height) == (360, 64)
+    assert host.mode == "card" and (host.widget.width, host.widget.height) == (360, 116)
     assert host.widget.x == 1920-360
     host.window_action("topmost", False)
     assert host.widget.on_top is True and host.full.on_top is True
@@ -244,7 +244,7 @@ def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeyp
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     rect, minimum = host._rect("card")
-    assert rect == {"x": 100, "y": 200, "width": 360, "height": 64} and minimum == (360, 64)
+    assert rect == {"x": 100, "y": 200, "width": 360, "height": 116} and minimum == (360, 116)
 
 
 def test_geometry_is_independent_debounced_and_flushed(tmp_path, monkeypatch):
@@ -321,6 +321,7 @@ def test_four_edge_snap_and_inward_card_preserve_position(tmp_path, monkeypatch,
                                        ("right", 650, True), ("left", 100, False)])
 def test_popup_geometry_does_not_persist_temporary_height(tmp_path, monkeypatch, side, y, above):
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    host.media_visible = False
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1000, 800)])
     host.create_windows(Webview()); host.window_action("card")
     host.side = side
@@ -340,6 +341,7 @@ def test_popup_geometry_does_not_persist_temporary_height(tmp_path, monkeypatch,
 
 def test_popup_limits_to_workarea_and_mode_switch_restores_base(tmp_path, monkeypatch):
     host = desktop.DesktopHost(tmp_path, 8780, "test", lambda: True)
+    host.media_visible = False
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(-1400, -200, 1400, 900, dpi=144)])
     host.create_windows(Webview()); host.window_action("card")
     host.side = "bottom"; host.widget.move(-700, 604)
@@ -351,6 +353,47 @@ def test_popup_limits_to_workarea_and_mode_switch_restores_base(tmp_path, monkey
     assert host.state.data["geometry"]["card"]["height"] == 96
     assert host.state.data["geometry"]["card"]["y"] == 604
     assert (host.widget.width, host.widget.height) == (126, 72)
+    host.destroy()
+
+
+@pytest.mark.parametrize("dpi", [96,144])
+@pytest.mark.parametrize("side", ["left","right","top","bottom"])
+def test_widget_media_height_preserves_base_anchor_and_popup(tmp_path,monkeypatch,dpi,side):
+    host=desktop.DesktopHost(tmp_path,8780,"test",lambda:True)
+    area=desktop.WorkArea(-1000,-200,1000,900,dpi=dpi)
+    monkeypatch.setattr(host,"_areas",lambda:[area])
+    host.create_windows(Webview());host.window_action("card");host.side=side
+    host.window_action("widget_media",{"visible":False})
+    scale=dpi/96
+    base={"x":-900,"y":-200 if side=="top" else 700-round(64*scale) if side=="bottom" else 0,
+          "width":round(360*scale),"height":round(64*scale)}
+    desktop.set_native_rect(host.widget,base)
+    expanded=host.window_action("widget_media",{"visible":True})
+    card=desktop.native_rect(host.widget)
+    assert expanded["card_height"]==116 and card["height"]==round(116*scale)
+    assert card["y"]+card["height"]==base["y"]+base["height"] if side=="bottom" else card["y"]==base["y"]
+    host.window_action("widget_popup",{"open":True,"height":400})
+    host.window_action("widget_media",{"visible":False})
+    assert host._popup_base["height"]==round(64*scale)
+    assert host.state.data["geometry"]["card"]["height"]==round(64*scale)
+    host.window_action("widget_popup",{"open":False})
+    assert desktop.native_rect(host.widget)==base
+    host.window_action("bar")
+    bar=desktop.native_rect(host.widget)
+    host.window_action("widget_media",{"visible":True})
+    assert desktop.native_rect(host.widget)==bar
+    host.destroy()
+    assert desktop.DesktopHost(tmp_path,8780,"test",lambda:True).media_visible is True
+
+
+def test_widget_media_requires_boolean_and_bootstrap_returns_saved_visibility(tmp_path,monkeypatch):
+    state=desktop.DesktopState(tmp_path);state.set({"desktop:spotify-visible":False})
+    host=desktop.DesktopHost(tmp_path,8780,"test",lambda:True)
+    monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1040)])
+    host.create_windows(Webview())
+    assert desktop.DesktopBridge(host).bootstrap()["media_visible"] is False
+    assert host._widget_size("card")== (360,64)
+    with pytest.raises(ValueError):host.window_action("widget_media",{"visible":"true"})
     host.destroy()
 
 
@@ -401,6 +444,36 @@ def test_compact_cpu_surface_routes_buttons_keyboard_and_passive_double_clicks(m
     assert surface.focus_id == "widget-run"
     surface.boxes = [{"id":"widget-tab","x":0,"y":0,"w":84,"h":48}]
     assert surface._hit(10,10) is None  # A tab is passive for the mouse: single click must not expand.
+
+
+def test_compact_surface_media_button_hitboxes_are_controls_and_keyboard_targets():
+    surface=desktop.CompactSurface.__new__(desktop.CompactSurface)
+    scripts=[]
+    surface.boxes=[{"id":"widget-spotify-play_pause","x":12,"y":10,"w":28,"h":28}]
+    surface.focus_id=None;surface.closed=False;surface._input=queue.Queue()
+    surface._js=lambda script:scripts.append(script);surface._schedule=lambda *_:None
+    assert surface._hit(20,20)=="widget-spotify-play_pause"
+    surface._input.put(("key",{"key":"Tab","shift":False}))
+    surface._input.put(("key",{"key":"Return","shift":False}))
+    surface._input.put(("close",None));surface._inputs()
+    assert any('"widget-spotify-play_pause")?.click()' in script for script in scripts)
+
+
+def test_disabled_media_controls_block_drag_but_are_skipped_by_keyboard():
+    surface=desktop.CompactSurface.__new__(desktop.CompactSurface)
+    scripts=[]
+    surface.boxes=[{"id":"widget-spotify-next","x":0,"y":0,"w":28,"h":28,"disabled":True},
+                   {"id":"widget-run","x":30,"y":0,"w":28,"h":28}]
+    surface.focus_id=None;surface.closed=False;surface._input=queue.Queue()
+    surface._js=lambda script:scripts.append(script);surface._schedule=lambda *_:None
+    assert surface._hit(10,10)=="widget-spotify-next"
+    surface._activate_control('widget-spotify-next')
+    assert scripts==[]
+    surface._input.put(("key",{"key":"Tab","shift":False}))
+    surface._input.put(("key",{"key":"Return","shift":False}))
+    surface._input.put(("close",None));surface._inputs()
+    assert surface.focus_id=='widget-run'
+    assert any('"widget-run")?.click()' in script for script in scripts)
 
 
 def test_quit_failure_keeps_current_visible_state(tmp_path, monkeypatch):

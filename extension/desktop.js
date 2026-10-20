@@ -4,10 +4,21 @@ import { timeClient, sharedApi, elapsedAt } from "./time-client.js";
 import { resolveActiveTask, timerProgress } from "./widget-model.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { WORK_ENABLED } from "./work-availability.js";
+import { FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor } from "./focus-timer.js";
+import { mountSpotifyPlayer } from "./spotify-player.js";
 await import("./background.js");
 const { applyDocument, syncLocale, localeChange, t } = await import("./i18n.js");
 if (!await syncLocale()) applyDocument();
-const saved = await chrome.storage.local.get(["panel:theme", "panel:design"]);
+const saved = await chrome.storage.local.get(["panel:theme", "panel:design", FOCUS_OVERLAY_COLOR_KEY]);
+function applyProgressColor(value) {
+  const color = NEON_COLORS.find(color => color.id === normalizeNeonColor(value));
+  document.documentElement.style.setProperty("--timer-progress-color", color.tube);
+}
+applyProgressColor(saved[FOCUS_OVERLAY_COLOR_KEY]);
+const spotifyPlayer = mountSpotifyPlayer(document.getElementById("desktop-spotify"), {onVisibility: visible => {
+  document.getElementById("desktop-spotify-toggle").textContent = visible ? t("Скрыть Spotify") : t("Показать Spotify");
+}});
+document.getElementById("desktop-spotify-toggle").onclick = () => void spotifyPlayer.setVisible(!spotifyPlayer.visible).catch(showError);
 document.documentElement.dataset.theme = saved["panel:theme"] || "light";
 document.documentElement.dataset.design = saved["panel:design"] || "stream";
 document.querySelector('[data-view="work"]').hidden = !WORK_ENABLED;
@@ -57,4 +68,5 @@ chrome.storage.onChanged.addListener(changes => {
   if (localeChange(changes)) void syncLocale();
   if (changes["panel:theme"]) document.documentElement.dataset.theme = changes["panel:theme"].newValue;
   if (changes["panel:design"]) document.documentElement.dataset.design = changes["panel:design"].newValue;
+  if (changes[FOCUS_OVERLAY_COLOR_KEY]) applyProgressColor(changes[FOCUS_OVERLAY_COLOR_KEY].newValue);
 });

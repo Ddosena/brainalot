@@ -30,10 +30,11 @@ from .shared_state import SharedState
 from .work_store import WorkStore
 from .time_tracking import TimeStore
 from .browser_bridge import BrowserBridge
+from .spotify import SpotifyController
 from . import paths, features
 
 
-def create_app(root: str | Path, port: int = 8765) -> FastAPI:
+def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -> FastAPI:
     store = Store(root)
     calendar = CalendarFeed(root)
     google_calendar = GoogleCalendarApi(root, port=port)
@@ -45,6 +46,8 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     work = WorkStore(root) if features.WORK_ENABLED else None
     timer = TimeStore(root)
     browser = BrowserBridge(root)
+    spotify = spotify_controller if spotify_controller is not None else SpotifyController(
+        platform="disabled" if os.environ.get("BRAINALOT_DISABLE_MEDIA") == "1" else None)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -52,10 +55,14 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
         try:
             yield
         finally:
-            await run_in_threadpool(timer.stop_service)
+            try:
+                await run_in_threadpool(timer.stop_service)
+            finally:
+                await run_in_threadpool(spotify.close)
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.timer = timer
+    app.state.spotify = spotify
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
@@ -224,6 +231,24 @@ def create_app(root: str | Path, port: int = 8765) -> FastAPI:
     @app.get("/api/time/state")
     def time_state():
         return timer.state()
+
+    @app.get("/api/media/spotify")
+    def spotify_state():
+        return spotify.snapshot()
+
+    @app.post("/api/media/spotify/command")
+    async def spotify_command(request: Request):
+        data = await payload(request, {"action", "value"})
+        action = data.get("action")
+        if not isinstance(action, str) or action not in {"previous", "play_pause", "next", "shuffle", "repeat", "open"}:
+            raise ValidationError("Неизвестная команда Spotify")
+        if action == "shuffle" and type(data.get("value")) is not bool:
+            raise ValidationError("Shuffle требует true или false")
+        if action == "repeat" and (not isinstance(data.get("value"), str) or data["value"] not in {"off", "track", "list"}):
+            raise ValidationError("Недопустимый режим повтора Spotify")
+        if action not in {"shuffle", "repeat"} and "value" in data:
+            raise ValidationError("Лишний параметр команды Spotify")
+        return await run_in_threadpool(spotify.command, action, data.get("value"))
 
     @app.post("/api/time/command")
     async def time_command(request: Request):

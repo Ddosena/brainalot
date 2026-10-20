@@ -57,18 +57,22 @@ export function createConnection(chromeApi, { now = () => Date.now(), request = 
   }
 
   async function api(path, method = "GET", body, options = {}) {
+    const {replay = true, ...requestOptions} = options || {};
     const config = await current();
     try {
-      return await request(path, { token: config.token, port: config.port, method, body, ...options });
+      return await request(path, { token: config.token, port: config.port, method, body, ...requestOptions });
     } catch (error) {
       // 401: the token changed (a reinstall); 0: the service is down or moved to another port.
       if (error?.status !== 401 && error?.status !== 0) throw error;
       const fresh = await connect();
       if (!fresh) throw error;
+      // Playback commands such as Next are not idempotent. Reconnect for later
+      // requests, but never silently repeat an explicitly non-replayable action.
+      if (!replay) throw error;
       // A write that timed out may have reached the service: repeat it only when it surely did not.
       const unreached = error.status === 401 || fresh.port !== config.port || fresh.token !== config.token;
       if (method !== "GET" && !unreached) throw error;
-      return request(path, { token: fresh.token, port: fresh.port, method, body, ...options });
+      return request(path, { token: fresh.token, port: fresh.port, method, body, ...requestOptions });
     }
   }
 

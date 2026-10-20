@@ -19,6 +19,12 @@ export const IGNITION_MS = comicIgnitionMs(IGNITION_VARIANT);
 
 const reducedMotion = () => globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
 const round = value => Math.round(value * 10) / 10;
+// DOMRects are viewport pixels (already affected by CSS zoom), while positioned
+// descendants and the authored drawing use their containing block's local px.
+function clientScale(element, rect = element.getBoundingClientRect()) {
+  return {x: element.offsetWidth ? rect.width / element.offsetWidth : 1,
+    y: element.offsetHeight ? rect.height / element.offsetHeight : 1};
+}
 
 // Steady burning is stepped at 12 frames a second, like hand-drawn animation «on twos»: the pose
 // morphs are CSS `d` animations on ~250 paths per fire, main-thread style and paint work on every
@@ -82,8 +88,9 @@ function visibleRect(element, stop) {
     const style = getComputedStyle(parent);
     if (style.overflowY === "visible" && style.overflowX === "visible") continue;
     const box = parent.getBoundingClientRect();
-    top = Math.max(top, box.top + parent.clientTop);
-    bottom = Math.min(bottom, box.top + parent.clientTop + parent.clientHeight);
+    const scale = clientScale(parent, box);
+    top = Math.max(top, box.top + parent.clientTop * scale.y);
+    bottom = Math.min(bottom, box.top + (parent.clientTop + parent.clientHeight) * scale.y);
   }
   return {rect, top, bottom};
 }
@@ -123,10 +130,10 @@ export function createFireLayer(host) {
     setTimeout(() => burst.element.remove(), DYING_MS);
   }
 
-  function ignite(burst, point, rect) {
+  function ignite(burst, point, rect, scale) {
     burst.element.classList.remove("is-appearing");
     // Row coordinates; without a point the fire starts at the importance dot on the right.
-    const origin = point ? {x: point.x - rect.left, y: point.y - rect.top} : null;
+    const origin = point ? {x: (point.x - rect.left) / scale.x, y: (point.y - rect.top) / scale.y} : null;
     const duration = document.hidden ? 0 : igniteComicFire(burst.svg, {point: origin, variant: IGNITION_VARIANT});
     if (!duration) {
       burst.element.classList.add("is-boiling");
@@ -161,6 +168,7 @@ export function createFireLayer(host) {
     // Until the sprite is parsed the ignitions wait; libraryReady schedules the first drawing.
     if (!rows.size || !library) return;
     const origin = layer.getBoundingClientRect();
+    const scale = clientScale(layer, origin);
     for (const [key, row] of rows) {
       const {rect, top, bottom} = visibleRect(row, host);
       let burst = bursts.get(key);
@@ -189,8 +197,8 @@ export function createFireLayer(host) {
       }
       if (rect.width < 1 || rect.height < 1 || bottom <= top) { burst.element.hidden = true; continue; }
       burst.element.hidden = false;
-      const width = Math.round(rect.width);
-      const height = Math.round(rect.height);
+      const width = Math.round(rect.width / scale.x);
+      const height = Math.round(rect.height / scale.y);
       const radius = parseFloat(getComputedStyle(row).borderTopLeftRadius) || 7;
       const size = `${width}x${height}x${radius}`;
       if (burst.size !== size) {
@@ -204,13 +212,13 @@ export function createFireLayer(host) {
         burst.svg.style.transformOrigin = `${round(width / 2 - canvas.x)}px ${round(height / 2 - canvas.y)}px`;
       }
       const {canvas} = burst.plan;
-      burst.element.style.transform = `translate(${round(rect.left - origin.left + canvas.x)}px, ${round(rect.top - origin.top + canvas.y)}px)`;
+      burst.element.style.transform = `translate(${round((rect.left - origin.left) / scale.x + canvas.x)}px, ${round((rect.top - origin.top) / scale.y + canvas.y)}px)`;
       // A row scrolled half out of its list: cut the fire along the same edge.
-      const cutTop = top > rect.top + 0.5 ? top - rect.top - canvas.y : 0;
-      const cutBottom = bottom < rect.bottom - 0.5 ? rect.bottom - bottom + (canvas.y + canvas.height - rect.height) : 0;
+      const cutTop = top > rect.top + 0.5 ? (top - rect.top) / scale.y - canvas.y : 0;
+      const cutBottom = bottom < rect.bottom - 0.5 ? (rect.bottom - bottom) / scale.y + (canvas.y + canvas.height - height) : 0;
       burst.element.style.clipPath = cutTop || cutBottom ? `inset(${round(cutTop)}px 0 ${round(cutBottom)}px 0)` : "";
       if (ignitions.has(key)) {
-        ignite(burst, ignitions.get(key).point, rect);
+        ignite(burst, ignitions.get(key).point, rect, scale);
         ignitions.delete(key);
       }
     }
@@ -259,13 +267,14 @@ export function createFireLayer(host) {
       bubble.classList.remove("is-leaving", "is-below");
       if (row) {
         const hostRect = host.getBoundingClientRect();
+        const scale = clientScale(host, hostRect);
         const rect = row.getBoundingClientRect();
         const width = bubble.offsetWidth;
         const height = bubble.offsetHeight;
-        const anchor = rect.right - hostRect.left - host.clientLeft - 14;
+        const anchor = (rect.right - hostRect.left) / scale.x - host.clientLeft - 14;
         const left = Math.max(4, Math.min(anchor + 14 - width, host.clientWidth - width - 4));
-        let top = rect.top - hostRect.top - host.clientTop - height - 10;
-        if (top < 2) { top = rect.bottom - hostRect.top - host.clientTop + 10; bubble.classList.add("is-below"); }
+        let top = (rect.top - hostRect.top) / scale.y - host.clientTop - height - 10;
+        if (top < 2) { top = (rect.bottom - hostRect.top) / scale.y - host.clientTop + 10; bubble.classList.add("is-below"); }
         bubble.style.left = `${round(left)}px`;
         bubble.style.top = `${round(top)}px`;
         bubble.style.setProperty("--arrow-x", `${round(Math.max(10, Math.min(width - 16, anchor - left - 5)))}px`);

@@ -133,9 +133,14 @@ class SharedState:
             current = json.loads(row[0]) if row else {"revision": 0, "values": {}}
             self.check_revision(command, current["revision"])
             patch = command.get("patch")
-            allowed = {"panel:calendar-importance", "panel:theme", "panel:design", "panel:locale", "time:preset"}
+            allowed = {"panel:calendar-importance", "panel:theme", "panel:design", "panel:locale",
+                       "panel:focus-overlay-color", "time:preset"}
             if not isinstance(patch, dict) or set(patch) - allowed or len(encoded(patch)) > 100000:
                 raise ValidationError("Недопустимые общие настройки интерфейса")
+            if "panel:focus-overlay-color" in patch:
+                color = patch["panel:focus-overlay-color"]
+                if not isinstance(color, str) or color not in {"fire", "pink", "violet", "cyan", "lime", "amber"}:
+                    raise ValidationError("Недопустимый цвет линии таймера")
             if "time:preset" in patch:
                 preset = patch["time:preset"]
                 if (not isinstance(preset, dict) or set(preset) != {"work_ms", "break_ms"}
