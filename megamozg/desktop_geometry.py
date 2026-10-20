@@ -197,6 +197,34 @@ def double_click_settings(dpi=96):
         return {"interval_ms": int(user.GetDoubleClickTime()), "width": max(2, width), "height": max(2, height)}
 
 
+def clear_native_frame(window):
+    """Remove the compositor's rectangular non-client fringe on our widget.
+
+    A rounded HWND region clips client GDI, but pywebview's default shadow
+    explicitly enables DWM non-client rendering with one-pixel glass margins.
+    That DWM fringe survives outside the rounded region on Windows 10.
+    """
+    native = getattr(window, "native", None)
+    if os.name != "nt" or native is None or not hasattr(native, "Handle"):
+        return False
+    class Margins(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_int) for name in ("left", "right", "top", "bottom")]
+    dwm = ctypes.WinDLL("dwmapi")
+    dwm.DwmExtendFrameIntoClientArea.argtypes = [wintypes.HWND, ctypes.POINTER(Margins)]
+    dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    hwnd = int(native.Handle.ToInt64())
+    margins = Margins(0, 0, 0, 0)
+    disabled = ctypes.c_int(1)  # DWMNCRP_DISABLED, a per-window setting.
+    cleared = dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins)) == 0
+    policy_set = dwm.DwmSetWindowAttribute(hwnd, 2, ctypes.byref(disabled), ctypes.sizeof(disabled)) == 0
+    user = _user32()
+    user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    # Refresh only our non-client frame, keeping position, size, z-order and focus.
+    refreshed = bool(user.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0037))
+    return policy_set and cleared and refreshed
+
+
 def native_rect(window):
     native = getattr(window, "native", None)
     if native is not None and hasattr(native, "Handle"):

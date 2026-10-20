@@ -12,7 +12,7 @@ import time
 from urllib.error import HTTPError
 from .desktop_geometry import (WorkArea, work_areas, fit_geometry, select_area, native_rect,
                                set_native_rect, cursor_position, enable_thread_dpi, enable_process_dpi,
-                               nearest_edge, popup_geometry, double_click_settings)
+                               nearest_edge, popup_geometry, double_click_settings, clear_native_frame)
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 import uuid
@@ -335,6 +335,7 @@ class CompactSurface:
             self.window.native.Region = Region(path)
             if old: old.Dispose()
             path.Dispose()
+            clear_native_frame(self.window)
             self.canvas.Show(); self.canvas.BringToFront()
             if was_focused: self.canvas.Focus()
         self._invoke(apply)
@@ -597,7 +598,7 @@ class DesktopHost:
                                          width=FULL_SIZE[0], height=FULL_SIZE[1])
         self.widget = webview.create_window("Brainalot", self._url(f"widget.html?mode={self.widget_mode}"),
                                            js_api=bridge, hidden=True, frameless=True, resizable=False,
-                                           easy_drag=False, on_top=True, min_size=MINIMUM_SIZES["bar"],
+                                           easy_drag=False, on_top=True, shadow=False, min_size=MINIMUM_SIZES["bar"],
                                            x=80, y=80,
                                            width=WIDGET_SIZES[self.widget_mode][0],
                                            height=WIDGET_SIZES[self.widget_mode][1])
@@ -667,6 +668,7 @@ class DesktopHost:
 
     def _show(self, window):
         if window:
+            if window is self.widget: clear_native_frame(window)
             window.show()
             window.restore()
 

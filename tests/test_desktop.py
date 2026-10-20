@@ -180,6 +180,7 @@ class Event:
 
 class Window:
     def __init__(self, **kwargs):
+        self.options = kwargs
         self.x, self.y = kwargs["x"], kwargs["y"]
         self.width, self.height = kwargs["width"], kwargs["height"]
         self.on_top = kwargs.get("on_top", False)
@@ -216,6 +217,8 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
     host.create_windows(Webview())
     assert host.full.on_top and host.widget.on_top
+    assert host.widget.options["shadow"] is False  # DWM's default square fringe defeats rounded client regions.
+    assert host.full.options.get("shadow", True) is True
     host.window_action("bar")
     assert host.mode == "bar" and host.widget.width == 84 and host.widget.height == 48
     assert host.widget.x == 1920-84
