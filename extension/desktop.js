@@ -28,6 +28,9 @@ document.querySelector('[data-view="work"]').hidden = !WORK_ENABLED;
 function show(view) {
   if (view === "home") view = "day";
   if (view === "work" && !WORK_ENABLED) view = "day";
+  if (view !== "work" && document.body.classList.contains("work-expanded")) {
+    void native.window_action("work_expand", false).then(() => document.body.classList.remove("work-expanded")).catch(error => showError(error));
+  }
   const paths = { day: "panel.html?embedded-desktop=1", library: "panel.html?library-window=1&embedded-desktop=1", work: "work.html", capture: "capture.html" };
   const frame = document.getElementById("desktop-content");
   const next = new URL(paths[view] || paths.day, location.href).href;
@@ -38,6 +41,20 @@ const initialView = new URLSearchParams(location.search).get("view") || "day";
 document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => { document.querySelector(".desktop-menu").open = false; show(button.dataset.view); });
 window.addEventListener("brainalot-view", event => show(event.detail));
 const bootstrap = await native.bootstrap();
+document.body.classList.toggle("work-expanded", !!bootstrap.work_expanded);
+window.addEventListener("message", async event => {
+  const frame = document.getElementById("desktop-content"), request = event.data;
+  if (event.origin !== location.origin || event.source !== frame.contentWindow ||
+      request?.type !== "brainalot-work-fullscreen-request" || typeof request.expanded !== "boolean" ||
+      !frame.src.includes("/work.html")) return;
+  try {
+    const result = await native.window_action("work_expand", request.expanded);
+    document.body.classList.toggle("work-expanded", !!result.expanded);
+    event.source.postMessage({type: "brainalot-work-fullscreen-result", request_id: request.request_id, ...result}, event.origin);
+  } catch (error) {
+    event.source.postMessage({type: "brainalot-work-fullscreen-result", request_id: request.request_id, ok: false, error: error.message}, event.origin);
+  }
+});
 installWindowGestures(native, {doubleClick: bootstrap.double_click, freeDoubleClick: true,
   onDoubleClick: () => void native.window_action("card")});
 document.getElementById("desktop-content").addEventListener("load", event => {

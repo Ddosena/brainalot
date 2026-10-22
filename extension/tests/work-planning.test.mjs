@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { daySummary, taskRemaining, clampDate } from "../work-planning.js";
+import { daySummary, builderDaySummary, taskRemaining, clampDate } from "../work-planning.js";
 
 test("day totals keep calendar, planned, credited and actual time distinct", () => {
   const day = { date: "2030-03-04", fixed_minutes: 105 };
@@ -24,6 +24,26 @@ test("task remaining prefers explicit daily outcome without treating actual minu
   assert.equal(taskRemaining(task, plan), 80);
   plan.day_outcomes.push({ task_id: "t", date: "2030-03-03", remaining_minutes: 0, done: true });
   assert.equal(taskRemaining(task, plan), 0);
+  plan.result = { tasks: [{ id: "t", remaining_minutes: 37 }] };
+  assert.equal(taskRemaining(task, plan), 37);
+});
+
+test("builder energy excludes unselected AUTO forecast and keeps a 45-minute opening", () => {
+  const date = "2030-03-04";
+  const forecast = [{ id: "auto", date, minutes: 90, progress_percent: 0 }];
+  const day = { date, fixed_minutes: 255, weekly_review_minutes: 0, builder_selected_minutes: 0,
+    builder_total_work_minutes: 255, builder_available_minutes: 45, total_work_minutes: 345 };
+  const empty = builderDaySummary(day, forecast, {}, 300);
+  assert.equal(empty.selected.length, 0);
+  assert.equal(empty.total, 255);
+  assert.equal(empty.free, 45);
+  const chosen = { ...day, builder_selected_minutes: 45, builder_total_work_minutes: 300,
+    builder_available_minutes: 0 };
+  const manual = { id: "manual", date, manual: true, minutes: 45 };
+  const filled = builderDaySummary(chosen, [...forecast, manual], {}, 300);
+  assert.deepEqual(filled.selected.map(c => c.id), ["manual"]);
+  assert.equal(filled.total, 300);
+  assert.equal(filled.free, 0);
 });
 
 function browserStorage() {
@@ -102,8 +122,13 @@ function planningServer() {
       const old = receipts.get(body.request_id);
       if (old) { assert.deepEqual(body, old.body); return old.response; }
       if (body.expected_revision !== revision) throw Object.assign(new Error("conflict"), { status: 409 });
+      if (body.action === "day_budget" && body.data.minutes === 15) {
+        throw Object.assign(new Error("selected cubes do not fit"), { status: 422 });
+      }
       if (hold) { hold.enter(); await hold.promise; hold = null; }
-      state = { ...state, planning: { ...state.planning,
+      if (body.action === "day_budget") state = { ...state, planning: { ...state.planning,
+        settings: { ...state.planning.settings, budget_minutes: body.data.minutes } } };
+      else state = { ...state, planning: { ...state.planning,
         completed_cubes: { ...state.planning.completed_cubes, [body.data.cube_id]: {
           task_id: "synthetic", date: "2030-03-04", planned_minutes: 90, percent: body.data.percent,
           actual_minutes: body.data.actual_minutes ?? 0,
@@ -161,4 +186,8 @@ test("planning CAS preserves intervening board edits and retries the same durabl
   await store.discardPlanningDraft();
   assert.equal(await store.getPendingPlanningDraft(), null);
   assert.equal(store.get().projects.at(-1).id, "other-tab");
+  await assert.rejects(store.planningAction("day_budget", { date: "2030-03-04", minutes: 15 }), { status: 422 });
+  assert.equal(await store.getPendingPlanningDraft(), null);
+  await store.planningAction("day_budget", { date: "2030-03-04", minutes: 360 });
+  assert.equal(store.get().planning.settings.budget_minutes, 360);
 });

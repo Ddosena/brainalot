@@ -264,6 +264,8 @@ textarea { resize: vertical; line-height: 1.45; }
 .cd-n { font-weight: 650; }
 
 .top-actions { flex: none; display: flex; align-items: center; gap: 8px; }
+#work-fullscreen { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+@media (max-width: 600px) { #work-fullscreen { width: 32px; min-width: 32px; padding: 0; justify-content: center; } #work-fullscreen span { display: none; } }
 .range-label { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 104px; text-align: right; }
 .nav { display: flex; align-items: center; }
 #go-today.is-off { color: var(--faint); }

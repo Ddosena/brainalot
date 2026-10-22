@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 import uuid
 
 from .desktop import DesktopHost
+from .desktop_geometry import native_rect, select_area
 from .runtime import Service, port_free
 
 
@@ -209,6 +210,21 @@ def run(root: Path) -> int:
                 _until(lambda: "work.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 _until(lambda: _js(host.full, "document.getElementById('desktop-content')?.contentDocument?.documentElement?.dataset?.workEnabled") == "true")
                 report["work_loaded"] = True
+                _until(lambda: _js(host.full, "!!document.getElementById('desktop-content')?.contentDocument?.getElementById('work-fullscreen')?.onclick"))
+                before_work = native_rect(host.full)
+                _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').click()")
+                _until(lambda: _js(host.full, "document.body.classList.contains('work-expanded')"))
+                expanded_work = native_rect(host.full)
+                area = select_area(expanded_work, host._areas())
+                if abs(expanded_work["width"] - area.width) > 2 or abs(expanded_work["height"] - area.height) > 2:
+                    raise RuntimeError("Work did not expand to monitor work area")
+                _until(lambda: _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').getAttribute('aria-pressed')") == "true")
+                _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').click()")
+                _until(lambda: not _js(host.full, "document.body.classList.contains('work-expanded')"))
+                restored_work = native_rect(host.full)
+                if any(abs(restored_work[key] - before_work[key]) > 2 for key in ("x", "y", "width", "height")):
+                    raise RuntimeError("Work did not restore its previous window bounds")
+                report["work_expansion"] = {"before": before_work, "expanded": expanded_work, "restored": restored_work}
                 host.open_page("panel.html")
                 _until(lambda: "panel.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 state = _request(port, token, "/api/time/state")

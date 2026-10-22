@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import ValidationError
@@ -37,6 +38,88 @@ WEEKLY_REVIEW_CHECKLIST = (
     ("steps", "Пошаговые задачи на 7 дней"),
     ("recalculate", "Пересчёт и согласование плана"),
 )
+
+
+def _ensure_segments(planning):
+    if "task_segments" in planning:
+        return
+    baseline = _remaining_unsegmented(planning)
+    segments = []
+    for task in planning["tasks"]:
+        total = baseline[task["id"]]
+        if total <= 0:
+            continue
+        count = (total + 299) // 300
+        base, extra = divmod(total, count)
+        steps = STEPS[task.get("kind", "other")]
+        for index in range(count):
+            minutes = base + (1 if index < extra else 0)
+            label, output = steps[min(len(steps)-1, index * len(steps) // count)]
+            segments.append({
+                "id": "segment:" + sha256(f"{task['id']}|{index}".encode()).hexdigest()[:24],
+                "task_id": task["id"], "parent_id": None,
+                "title": f"{label}: {task['title']}", "minutes": minutes,
+                "output": output, "steps": [], "origin": "auto",
+            })
+    planning["task_segments"] = segments
+    planning["segment_baseline_remaining"] = baseline
+    planning.setdefault("segment_progress", {})
+
+
+def reconcile_segment_estimates(planning, previous):
+    """Keep started/manual segments while absorbing a corrected parent estimate."""
+    if "task_segments" not in planning:
+        return
+    baseline = planning["segment_baseline_remaining"]
+    prior_tasks = {task["id"]: task for task in previous.get("tasks", [])}
+    current_tasks = {task["id"]: task for task in planning["tasks"]}
+    active = set(planning.get("segment_progress", {}))
+    active.update(entry["segment_id"] for entry in planning.get("completed_cubes", {}).values()
+                  if entry.get("segment_id") and (entry["percent"] or entry.get("actual_minutes")))
+    active.update(lock.get("segment_id") for lock in planning.get("locks", []) if lock.get("segment_id"))
+    for task_id in list(baseline):
+        if task_id not in current_tasks:
+            if any(segment["task_id"] == task_id and segment["id"] in active
+                   for segment in planning["task_segments"]):
+                raise ValidationError("Нельзя удалить задачу с начатым или выбранным этапом")
+            planning["task_segments"] = [segment for segment in planning["task_segments"]
+                                         if segment["task_id"] != task_id]
+            del baseline[task_id]
+    for task_id, task in current_tasks.items():
+        if task_id not in baseline:
+            baseline[task_id] = 0
+            delta = task["estimate_minutes"]["central"]
+        else:
+            delta = task["estimate_minutes"]["central"] - prior_tasks.get(
+                task_id, task)["estimate_minutes"]["central"]
+        if delta < 0:
+            amount = -delta
+            donors = [segment for segment in reversed(planning["task_segments"])
+                      if segment["task_id"] == task_id and segment["origin"] == "auto"
+                      and segment["id"] not in active]
+            if sum(segment["minutes"] for segment in donors) < amount:
+                raise ValidationError("Исправленная оценка меньше начатых или выбранных этапов")
+            for donor in donors:
+                take = min(amount, donor["minutes"])
+                donor["minutes"] -= take
+                amount -= take
+                if donor["minutes"] == 0:
+                    planning["task_segments"].remove(donor)
+                if amount == 0:
+                    break
+        elif delta > 0:
+            step, output = STEPS[task.get("kind", "other")][0]
+            while delta:
+                size = min(delta, 300)
+                planning["task_segments"].append({
+                    "id": "segment:" + uuid4().hex, "task_id": task_id, "parent_id": None,
+                    "title": f"{step}: {task['title']}", "minutes": size,
+                    "output": output, "steps": [], "origin": "auto",
+                })
+                delta -= size
+            delta = task["estimate_minutes"]["central"] - prior_tasks.get(
+                task_id, task)["estimate_minutes"]["central"] if task_id in prior_tasks else task["estimate_minutes"]["central"]
+        baseline[task_id] += delta
 
 
 def _day(value, label):
@@ -111,7 +194,7 @@ def _has_free_cube_slot(day, cubes, break_minutes):
     free = [(_clock(a, "free window start"), _clock(b, "free window end"))
             for a, b in day.get("free_windows", [])]
     for cube in cubes:
-        if cube["date"] == day["date"]:
+        if cube["date"] == day["date"] and cube.get("start") is not None and cube.get("end") is not None:
             a, b = _clock(cube["start"], "cube.start"), _clock(cube["end"], "cube.end")
             free = _subtract(free, (a-break_minutes, b+break_minutes))
     review = day.get("weekly_review")
@@ -192,6 +275,31 @@ def validate_planning(planning, state=None):
         _int(override.get("minutes"), "capacity override minutes", settings["day_limit_minutes"], 480)
         if not isinstance(override.get("reason"), str) or not override["reason"].strip():
             raise ValidationError("capacity override: нужна причина")
+    manual_days = planning.get("manual_days", {})
+    if not isinstance(manual_days, dict):
+        raise ValidationError("manual_days: требуется объект")
+    for day, manual in manual_days.items():
+        if _day(day, "manual day") not in days or not isinstance(manual, dict):
+            raise ValidationError("manual_days: день вне горизонта или неверная форма")
+        minutes = _int(manual.get("budget_minutes"), "manual day budget", 0, 480)
+        if minutes % 15:
+            raise ValidationError("manual day budget: шаг 15 минут")
+    prep_overrides = planning.get("prep_overrides", {})
+    if not isinstance(prep_overrides, dict):
+        raise ValidationError("prep_overrides: требуется объект")
+    for prep_id, minutes in prep_overrides.items():
+        identifier(prep_id, "prep_id")
+        if _int(minutes, "prep minutes", 0, 120) % 5:
+            raise ValidationError("prep minutes: шаг 5 минут")
+    prep_progress = planning.get("prep_progress", {})
+    if not isinstance(prep_progress, dict):
+        raise ValidationError("prep_progress: требуется объект")
+    for prep_id, progress in prep_progress.items():
+        identifier(prep_id, "prep progress id")
+        if not isinstance(progress, dict):
+            raise ValidationError("prep_progress: требуется объект результата")
+        _int(progress.get("percent"), "prep progress percent", 0, 100)
+        _int(progress.get("actual_minutes", 0), "prep actual_minutes")
     weekly = settings.get("weekly_review", {"enabled": False})
     if not isinstance(weekly, dict) or type(weekly.get("enabled")) is not bool:
         raise ValidationError("settings.weekly_review: требуется enabled bool")
@@ -249,6 +357,52 @@ def validate_planning(planning, state=None):
             raise ValidationError("task.resources: требуется список")
         for resource in task.get("resources", []):
             _validate_resource(resource, course, settings)
+    segment_by_id = {}
+    segments = planning.get("task_segments")
+    if segments is not None:
+        if not isinstance(segments, list) or len(segments) > 10000:
+            raise ValidationError("task_segments: требуется список до 10000")
+        totals = defaultdict(int)
+        for segment in segments:
+            if not isinstance(segment, dict):
+                raise ValidationError("task_segment: требуется объект")
+            segment_id = identifier(segment.get("id"), "segment.id")
+            task_id = segment.get("task_id")
+            if segment_id in segment_by_id or task_id not in seen:
+                raise ValidationError("task_segment: повтор ID или неизвестная задача")
+            if segment.get("parent_id") is not None:
+                raise ValidationError("task_segment.parent_id: первая версия поддерживает только null")
+            _int(segment.get("minutes"), "segment.minutes", 1, 300)
+            if segment.get("origin") not in {"auto", "manual"}:
+                raise ValidationError("segment.origin: auto или manual")
+            if not isinstance(segment.get("title"), str) or not segment["title"].strip() or len(segment["title"]) > 300:
+                raise ValidationError("segment.title: текст до 300")
+            if not isinstance(segment.get("output", ""), str) or len(segment.get("output", "")) > 1000:
+                raise ValidationError("segment.output: текст до 1000")
+            if (not isinstance(segment.get("steps", []), list) or len(segment.get("steps", [])) > 20 or
+                    any(not isinstance(step, str) or not step.strip() or len(step) > 500
+                        for step in segment.get("steps", []))):
+                raise ValidationError("segment.steps: до 20 коротких шагов")
+            segment_by_id[segment_id] = segment
+            totals[task_id] += segment["minutes"]
+        baseline = planning.get("segment_baseline_remaining")
+        if not isinstance(baseline, dict) or set(baseline) != seen:
+            raise ValidationError("segment_baseline_remaining: требуется остаток каждой задачи")
+        for task in tasks:
+            value = _int(baseline[task["id"]], "segment baseline", 0, task["estimate_minutes"]["central"])
+            if totals[task["id"]] != value:
+                raise ValidationError("Сумма этапов должна равняться базовому остатку задачи")
+    segment_progress = planning.get("segment_progress", {})
+    if not isinstance(segment_progress, dict):
+        raise ValidationError("segment_progress: требуется объект")
+    for segment_id, report in segment_progress.items():
+        if segment_id not in segment_by_id or not isinstance(report, dict):
+            raise ValidationError("segment_progress: неизвестный этап")
+        _int(report.get("percent"), "segment.percent", 0, 100)
+        _int(report.get("cube_credit_at_report"), "segment.cube_credit_at_report",
+             0, segment_by_id[segment_id]["minutes"])
+        if _day(report.get("date"), "segment.date") not in days:
+            raise ValidationError("segment_progress.date вне горизонта")
     calendar = planning.get("calendar")
     if not isinstance(calendar, dict) or not isinstance(calendar.get("events"), list):
         raise ValidationError("planning.calendar.events: требуется список")
@@ -307,6 +461,10 @@ def validate_planning(planning, state=None):
         _int(entry.get("planned_minutes"), "completed cube planned_minutes")
         _int(entry.get("percent"), "completed cube percent", 0, 100)
         _int(entry.get("actual_minutes", 0), "completed cube actual_minutes")
+        if entry.get("segment_id") is not None:
+            segment = segment_by_id.get(entry["segment_id"])
+            if segment is None or segment["task_id"] != entry["task_id"]:
+                raise ValidationError("completed cube.segment_id: чужой этап")
     pairs = set()
     for entry in planning.get("day_outcomes", []):
         if not isinstance(entry, dict) or entry.get("task_id") not in seen:
@@ -327,10 +485,22 @@ def validate_planning(planning, state=None):
             raise ValidationError("lock: неизвестная задача или locked != true")
         identifier(lock.get("cube_id"), "lock.cube_id")
         _day(lock.get("date"), "lock.date")
-        _clock(lock.get("start"), "lock.start")
-        _clock(lock.get("end"), "lock.end")
         minutes = _int(lock.get("minutes"), "lock.minutes", 1, 90)
-        if minutes < 60 and lock.get("is_remainder") is not True:
+        if lock.get("segment_id") is not None:
+            segment = segment_by_id.get(lock["segment_id"])
+            if segment is None or segment["task_id"] != lock["task_id"]:
+                raise ValidationError("lock.segment_id: чужой этап")
+        if lock.get("manual"):
+            if minutes not in (15, 30, 45, 60, 90) and not (lock.get("is_remainder") and 1 <= minutes < 60):
+                raise ValidationError("manual lock: размер 15/30/45/60/90")
+            if lock.get("floating"):
+                if lock.get("start") is not None or lock.get("end") is not None:
+                    raise ValidationError("floating lock: время должно быть null")
+                _int(lock.get("order"), "floating lock order", 0, 10000)
+            else:
+                _clock(lock.get("start"), "lock.start")
+                _clock(lock.get("end"), "lock.end")
+        elif minutes < 60 and lock.get("is_remainder") is not True:
             raise ValidationError("lock: короткий кубик требует is_remainder=true")
     if len(planning.get("history", [])) > 40:
         raise ValidationError("planning.history: максимум 40")
@@ -434,7 +604,7 @@ def _ledger(planning, days):
     start, end = days[0], days[-1]
     window = (_clock(settings["work_start"], "work_start"), _clock(settings["work_end"], "work_end"))
     entries = {day.isoformat(): {"timed": [], "work": [], "prep": [], "homework": 0,
-                                "events": [], "lessons": [], "unknown": []} for day in days}
+                                "events": [], "lessons": [], "prep_cubes": [], "unknown": []} for day in days}
     rules = planning["calendar"].get("rules", {})
     _, synthetic, matched_ids = _live_details(planning)
     for event in [*(e for e in planning["calendar"]["events"] if str(e["id"]) not in matched_ids), *synthetic]:
@@ -472,15 +642,24 @@ def _ledger(planning, days):
                     entry["unknown"].append(event["id"])
             cursor += timedelta(days=1)
         if category == "lesson" and start <= first.date() <= end:
-            entries[first.date().isoformat()]["lessons"].append((int(first.hour*60+first.minute), event["id"]))
+            entries[first.date().isoformat()]["lessons"].append(
+                (int(first.hour*60+first.minute), event["id"],
+                 event.get("prep_key") or event.get("occurrence_id") or event["id"]))
     for entry in entries.values():
         entry["timed"] = _union(entry["timed"])
         entry["work"] = _union(entry["work"])
     # Prepare before each lesson, moving earlier around existing events/preparation.
     for key, entry in entries.items():
-        for lesson_start, event_id in sorted(entry["lessons"]):
+        for lesson_start, event_id, stable_key in sorted(entry["lessons"]):
             candidate = lesson_start
-            duration = settings["prep_minutes"]
+            prep_id = _prep_id(stable_key, key)
+            duration = planning.get("prep_overrides", {}).get(prep_id, settings["prep_minutes"])
+            entry["prep_cubes"].append({
+                "id": prep_id, "calendar_event_id": event_id, "date": key,
+                "lesson_start": _hhmm(lesson_start), "minutes": duration,
+                "default_minutes": settings["prep_minutes"], "floating": True,
+                "start": None, "end": None,
+            })
             if duration == 0:
                 continue
             while candidate - duration >= 0:
@@ -501,11 +680,12 @@ def _ledger(planning, days):
         entry["homework_minutes"] = (min(30, _int(settings.get("homework_minutes", 30),
                                                    "homework_minutes", 0, 30)) if entry["homework"] else 0)
         entry["fixed_minutes"] = entry["timed_minutes"] + entry["prep_minutes"] + entry["homework_minutes"]
+        manual = planning.get("manual_days", {}).get(key)
         override = settings.get("day_capacity_overrides", {}).get(key)
-        if override and entry["lessons"]:
-            raise ValidationError("capacity override: день с уроком не допускается")
-        entry["day_limit_minutes"] = override["minutes"] if override else settings["day_limit_minutes"]
-        entry["emergency_approved"] = bool(override)
+        entry["day_limit_minutes"] = (manual["budget_minutes"] if manual is not None else
+                                      override["minutes"] if override else settings["day_limit_minutes"])
+        entry["raised_load"] = entry["day_limit_minutes"] > settings["day_limit_minutes"]
+        entry["emergency_approved"] = entry["raised_load"]
         entry["available_minutes"] = max(0, entry["day_limit_minutes"] - entry["fixed_minutes"])
         entry["over_cap_minutes"] = max(0, entry["fixed_minutes"] - entry["day_limit_minutes"])
         free = [window]
@@ -576,10 +756,12 @@ def _weekly_reviews(planning, days, ledger, rest, locks):
                 continue
             led = ledger[key]
             day_locks = [x for x in locks if x["date"] == key]
-            if led["available_minutes"]-sum(x["minutes"] for x in day_locks) < weekly["minutes"]:
+            if led["available_minutes"]-sum(_lock_reservation(planning, x) for x in day_locks) < weekly["minutes"]:
                 continue
             free = list(led["free_windows"])
             for lock in day_locks:
+                if lock.get("floating"):
+                    continue
                 left, right = _clock(lock["start"], "lock.start"), _clock(lock["end"], "lock.end")
                 free = _subtract(free, (left-break_minutes, right+break_minutes))
             slot = next(((right-60, right) for left, right in reversed(free) if right-left >= 60), None)
@@ -593,7 +775,7 @@ def _weekly_reviews(planning, days, ledger, rest, locks):
     return reviews, by_date
 
 
-def _remaining(planning):
+def _remaining_unsegmented(planning):
     remaining = {task["id"]: task["estimate_minutes"]["central"] for task in planning["tasks"]}
     timeline = [(entry["date"], 0, entry["task_id"], entry)
                 for entry in planning.get("completed_cubes", {}).values()]
@@ -606,6 +788,66 @@ def _remaining(planning):
             remaining[tid] = 0
         elif entry.get("remaining_minutes") is not None:
             remaining[tid] = entry["remaining_minutes"]
+    return remaining
+
+
+def _segment_effective_credits(planning):
+    by_id = {segment["id"]: segment for segment in planning.get("task_segments", [])}
+    cube_credit = defaultdict(int)
+    for entry in planning.get("completed_cubes", {}).values():
+        segment_id = entry.get("segment_id")
+        if segment_id in by_id:
+            cube_credit[segment_id] += round(entry["planned_minutes"] * entry["percent"] / 100)
+    credits = {}
+    for segment_id, segment in by_id.items():
+        report = planning.get("segment_progress", {}).get(segment_id)
+        if report:
+            explicit = round(segment["minutes"] * report["percent"] / 100)
+            effective = explicit + max(0, cube_credit[segment_id] - report["cube_credit_at_report"])
+        else:
+            effective = cube_credit[segment_id]
+        credits[segment_id] = min(segment["minutes"], max(0, effective))
+    return credits
+
+
+def _remaining(planning):
+    segments = {segment["id"]: segment for segment in planning.get("task_segments", [])}
+    if not segments:
+        return _remaining_unsegmented(planning)
+    remaining = {task["id"]: task["estimate_minutes"]["central"] for task in planning["tasks"]}
+    state = {segment_id: {"cube": 0, "explicit": None, "anchor": 0, "effective": 0}
+             for segment_id in segments}
+    timeline = [(entry["date"], 0, entry["task_id"], entry)
+                for entry in planning.get("completed_cubes", {}).values()]
+    timeline += [(entry["date"], 1, segments[segment_id]["task_id"], (segment_id, entry))
+                 for segment_id, entry in planning.get("segment_progress", {}).items()
+                 if segment_id in segments]
+    timeline += [(entry["date"], 2, entry["task_id"], entry)
+                 for entry in planning.get("day_outcomes", [])]
+    for _, kind, task_id, entry in sorted(timeline, key=lambda x: (x[0], x[1], x[2])):
+        if kind == 2:
+            if entry.get("done"):
+                remaining[task_id] = 0
+            elif entry.get("remaining_minutes") is not None:
+                remaining[task_id] = entry["remaining_minutes"]
+            continue
+        if kind == 0:
+            credit = round(entry["planned_minutes"] * entry["percent"] / 100)
+            segment_id = entry.get("segment_id")
+            if segment_id not in segments:
+                remaining[task_id] = max(0, remaining[task_id]-credit)
+                continue
+            state[segment_id]["cube"] += credit
+        else:
+            segment_id, report = entry
+            state[segment_id]["explicit"] = round(segments[segment_id]["minutes"] * report["percent"] / 100)
+            state[segment_id]["anchor"] = report["cube_credit_at_report"]
+        part = state[segment_id]
+        effective = (part["cube"] if part["explicit"] is None else
+                     part["explicit"] + max(0, part["cube"]-part["anchor"]))
+        effective = min(segments[segment_id]["minutes"], max(0, effective))
+        remaining[task_id] = max(0, remaining[task_id] - (effective-part["effective"]))
+        part["effective"] = effective
     return remaining
 
 
@@ -628,10 +870,22 @@ def _stable_cube_id(task_id, day, start, phase):
     return sha256(f"{task_id}|{day}|{start}|{phase}".encode()).hexdigest()[:24]
 
 
+def _prep_id(event_id, day):
+    return "prep:" + sha256(f"{event_id}|{day}".encode()).hexdigest()[:24]
+
+
 def _final_remainder(minutes):
     while minutes >= 60:
         minutes -= 90 if minutes >= 90 and minutes - 90 != 30 else 60
     return minutes
+
+
+def _lock_reservation(planning, lock):
+    if lock.get("manual"):
+        progress = planning.get("completed_cubes", {}).get(lock["cube_id"])
+        if progress and (progress.get("percent", 0) > 0 or progress.get("actual_minutes", 0) > 0):
+            return 0
+    return lock["minutes"]
 
 
 def _validate_locks(planning, ledger, remaining, rest, from_date):
@@ -648,28 +902,37 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
         if day not in ledger or day in rest:
             raise ValidationError(f"lock {day}: вне горизонта или выходной")
         task = tasks[lock["task_id"]]
-        a, b = _clock(lock["start"], "lock.start"), _clock(lock["end"], "lock.end")
         minutes = lock["minutes"]
-        if b-a != minutes or not (minutes in (60, 90) or 1 <= minutes < 60 and lock.get("is_remainder") is True):
-            raise ValidationError("lock: 60–90 минут либо подтверждённый финальный остаток")
+        manual = bool(lock.get("manual"))
+        if manual and lock.get("floating"):
+            if minutes not in (15, 30, 45, 60, 90) and not lock.get("is_remainder"):
+                raise ValidationError("floating lock: размер 15/30/45/60/90")
+            a = b = None
+        else:
+            a, b = _clock(lock["start"], "lock.start"), _clock(lock["end"], "lock.end")
+            if b-a != minutes or not (manual or minutes in (60, 90) or
+                                      1 <= minutes < 60 and lock.get("is_remainder") is True):
+                raise ValidationError("lock: неверная длительность")
         if lock.get("phase", "preparation") == "review" and task.get("methodist_start") and day < task["methodist_start"]:
             raise ValidationError("lock: review раньше окна методиста")
-        if not any(left <= a and b <= right for left, right in ledger[day]["free_windows"]):
+        if a is not None and not any(left <= a and b <= right for left, right in ledger[day]["free_windows"]):
             raise ValidationError("lock: занятый слот или вне рабочего окна")
-        occupied[day].append((a, b, lock["task_id"]))
-        by_task[lock["task_id"]] += minutes
+        if a is not None:
+            occupied[day].append((a, b, lock["task_id"]))
+        by_task[lock["task_id"]] += _lock_reservation(planning, lock)
         phase = lock.get("phase", "preparation")
-        by_phase[(lock["task_id"], phase)] += minutes
-        if minutes < 60:
+        if not manual:
+            by_phase[(lock["task_id"], phase)] += minutes
+        if minutes < 60 and not manual:
             short_locks[(lock["task_id"], phase)].append(lock)
-        if (planning["settings"].get("priority_course") and planning["settings"].get("priority_until")
+        if (not manual and planning["settings"].get("priority_course") and planning["settings"].get("priority_until")
                 and day < planning["settings"]["priority_until"] and task.get("early_prep")
                 and task["course"] != planning["settings"]["priority_course"]):
             d = date.fromisoformat(day)
             early_by_week[(d-timedelta(days=d.weekday())).isoformat()] += lock["minutes"]
     for day, intervals in occupied.items():
         ids = {item[2] for item in intervals}
-        if len(ids) > 1:
+        if len(ids) > 1 and day not in planning.get("manual_days", {}):
             primary = [tid for tid in ids if tasks[tid]["course"] == planning["settings"].get("priority_course")]
             secondary = [tid for tid in ids if tasks[tid].get("early_prep")
                          and tasks[tid]["course"] != planning["settings"].get("priority_course")]
@@ -677,7 +940,8 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
             if not (day < planning["settings"].get("priority_until", "") and len(ids) == 2
                     and len(primary) == len(secondary) == 1 and secondary_minutes == 60):
                 raise ValidationError("lock: больше одной фокусной задачи в день")
-        if ledger[day]["fixed_minutes"] + sum(b-a for a, b, _ in intervals) > ledger[day]["day_limit_minutes"]:
+        if (day not in planning.get("manual_days", {}) and
+                ledger[day]["fixed_minutes"] + sum(b-a for a, b, _ in intervals) > ledger[day]["day_limit_minutes"]):
             raise ValidationError("lock: дневной лимит превышен")
         for first, second in zip(sorted(intervals), sorted(intervals)[1:]):
             if second[0]-first[1] < planning["settings"]["break_minutes"]:
@@ -696,7 +960,121 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
         raise ValidationError("lock: ранняя подготовка второго курса чаще одного часа в неделю")
 
 
+def _manual_day_view(planning, key, led, locks, weekly_review, rest):
+    ordered = sorted(locks, key=lambda item: (item.get("order", 0), item["cube_id"]))
+    reports = {cube_id: entry for cube_id, entry in planning.get("completed_cubes", {}).items()
+               if entry["date"] == key}
+    measured = sum(entry.get("actual_minutes", 0) for entry in reports.values())
+    estimated = sum(round(entry["planned_minutes"] * entry["percent"] / 100)
+                    for entry in reports.values() if not entry.get("actual_minutes"))
+    reported_work = measured + estimated
+    unstarted = sum(_lock_reservation(planning, lock) for lock in ordered)
+    weekly_minutes = weekly_review["minutes"] if weekly_review else 0
+    completed_preps = planning.get("prep_progress", {})
+    prep_cubes = []
+    prep_actual_minutes = 0
+    prep_actual_excess = 0
+    for prep in led["prep_cubes"]:
+        report = completed_preps.get(prep["id"], {})
+        actual = report.get("actual_minutes", 0)
+        prep_actual_minutes += actual
+        prep_actual_excess += max(0, actual-prep["minutes"])
+        prep_cubes.append({**prep, "progress_percent": report.get("percent", 0),
+                           "actual_minutes": actual})
+    total = led["fixed_minutes"] + prep_actual_excess + weekly_minutes + reported_work + unstarted
+    first = ordered[0] if ordered else None
+    segment_by_id = {segment["id"]: segment for segment in planning.get("task_segments", [])}
+    first_segment = segment_by_id.get(first.get("segment_id")) if first else None
+    goal = (first_segment.get("output") or first_segment["title"]) if first_segment else (first.get("output") if first else None)
+    reported = bool(reports) or any(entry["date"] == key for entry in planning.get("day_outcomes", []))
+    return {"date": key, "rest_provisional": key in rest,
+            "manual": True, "focus_task_id": first["task_id"] if first else None,
+            "focus_segment_id": first.get("segment_id") if first else None, "goal": goal,
+            "secondary_early_prep_exception": False,
+            "calendar_minutes": led["timed_minutes"], "lesson_count": len(led["lessons"]),
+            "lesson_prep_minutes": led["prep_minutes"], "prep_cubes": prep_cubes,
+            "prep_actual_minutes": prep_actual_minutes,
+            "prep_actual_excess_minutes": prep_actual_excess,
+            "all_day_assumed_minutes": led["homework_minutes"], "fixed_minutes": led["fixed_minutes"],
+            "development_minutes": reported_work + unstarted, "manual_cube_minutes": unstarted,
+            "builder_selected_minutes": reported_work + unstarted,
+            "builder_available_minutes": max(0, led["day_limit_minutes"] -
+                                             led["fixed_minutes"] - prep_actual_excess -
+                                             weekly_minutes - reported_work - unstarted),
+            "weekly_review_minutes": weekly_minutes,
+            "weekly_review": ({k: weekly_review[k] for k in ("id", "start", "end", "minutes", "status")}
+                              if weekly_review else None),
+            "total_work_minutes": total, "budget_minutes": led["day_limit_minutes"],
+            "builder_total_work_minutes": total,
+            "builder_over_cap_minutes": max(0, total-led["day_limit_minutes"]),
+            "day_limit_minutes": led["day_limit_minutes"], "energy_units": led["day_limit_minutes"]/60,
+            "raised_load": led["raised_load"], "emergency_approved": led["raised_load"],
+            "unused_capacity_minutes": max(0, led["day_limit_minutes"]-total),
+            "over_cap_minutes": max(0, total-led["day_limit_minutes"]),
+            "free_windows": [[_hhmm(a), _hhmm(b)] for a, b in led["free_windows"]],
+            "event_ids": led["events"], "calendar_needs_review": bool(led["unknown"]) or
+            bool(planning["calendar"].get("stale")) or not planning["calendar"].get("configured", True),
+            "needs_review": bool(led["unknown"]) or bool(estimated) or
+            bool(planning["calendar"].get("stale")) or not planning["calendar"].get("configured", True),
+            "over_cap_fixed_minutes": led["over_cap_minutes"],
+            "reported": reported, "report_basis": "actual" if measured else "estimated_from_percent" if estimated else None,
+            "reported_actual_minutes": measured if measured else None,
+            "reported_effective_minutes": reported_work if reported else None}
+
+
+def _task_pool(planning, cubes, days):
+    pool_today = max(days[0], min(days[-1], datetime.now(
+        ZoneInfo(planning["settings"]["timezone"])).date()))
+    manual_reserved = defaultdict(int)
+    manual_segment_reserved = defaultdict(int)
+    for lock in planning.get("locks", []):
+        if lock.get("manual") and lock["date"] >= pool_today.isoformat():
+            amount = _lock_reservation(planning, lock)
+            manual_reserved[lock["task_id"]] += amount
+            if lock.get("segment_id"):
+                manual_segment_reserved[lock["segment_id"]] += amount
+    auto_future = defaultdict(int)
+    for cube in cubes:
+        if not cube.get("manual") and cube["date"] >= pool_today.isoformat():
+            auto_future[cube["task_id"]] += cube["minutes"]
+    actual_remaining = _remaining(planning)
+    credits = _segment_effective_credits(planning)
+    segments_by_task = defaultdict(list)
+    for segment in planning.get("task_segments", []):
+        remaining_segment = max(0, segment["minutes"]-credits.get(segment["id"], 0))
+        if remaining_segment <= 0:
+            continue
+        segments_by_task[segment["task_id"]].append({
+            "id": segment["id"], "task_id": segment["task_id"], "title": segment["title"],
+            "minutes": segment["minutes"], "remaining_minutes": remaining_segment,
+            "progress_percent": round(100*credits.get(segment["id"], 0)/segment["minutes"]),
+            "steps": segment.get("steps", []), "output": segment.get("output", ""),
+            "origin": segment["origin"],
+            "available_for_manual_minutes": max(
+                0, remaining_segment-manual_segment_reserved[segment["id"]]),
+        })
+    return [{
+        "task_id": task["id"], "course": task["course"], "title": task["title"],
+        "due": task.get("due"), "due_status": task.get("due_status"),
+        "remaining_minutes": actual_remaining[task["id"]],
+        "manual_reserved_minutes": manual_reserved[task["id"]],
+        "auto_future_minutes": auto_future[task["id"]],
+        "available_for_manual_minutes": max(
+            0, actual_remaining[task["id"]]-manual_reserved[task["id"]]),
+        "segments": segments_by_task[task["id"]],
+    } for task in sorted(planning["tasks"], key=lambda task: _priority(
+        task, actual_remaining, pool_today, planning["settings"]))
+       if actual_remaining[task["id"]] > 0]
+
+
+def _refresh_result_remaining(planning):
+    actual = _remaining(planning)
+    for task in planning.get("result", {}).get("tasks", []):
+        task["remaining_minutes"] = actual.get(task["id"], 0)
+
+
 def calculate(planning, *, from_date=None, reason="recalculate"):
+    _ensure_segments(planning)
     days = validate_planning(planning)
     requested = _day(from_date, "from_date") if from_date else days[0]
     if not days[0] <= requested <= days[-1]:
@@ -715,8 +1093,11 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
     for entry in planning.get("completed_cubes", {}).values():
         reported_cube_by_day[entry["date"]].append(entry)
     outcome_dates = {entry["date"] for entry in planning.get("day_outcomes", [])}
+    local_today = datetime.now(ZoneInfo(planning["settings"]["timezone"])).date().isoformat()
     for day in old_days:
         key = day["date"]
+        if key in planning.get("manual_days", {}):
+            continue
         day.setdefault("calendar_needs_review", day.get("needs_review", False))
         reports = reported_cube_by_day.get(key, [])
         if reports:
@@ -735,20 +1116,29 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                        unreported_planned_minutes=max(0, prior_planned - credited),
                        development_minutes=effective_work,
                        total_work_minutes=day["fixed_minutes"] + day.get("weekly_review_minutes", 0) + effective_work,
+                       builder_total_work_minutes=day["fixed_minutes"] +
+                       day.get("weekly_review_minutes", 0) + effective_work,
                        unused_capacity_minutes=0,
                        needs_review=day.get("needs_review", False) or bool(estimated))
+            day["builder_available_minutes"] = max(
+                0, day["day_limit_minutes"]-day["builder_total_work_minutes"])
+            day["builder_over_cap_minutes"] = max(
+                0, day["builder_total_work_minutes"]-day["day_limit_minutes"])
         elif key in outcome_dates:
             day.update(reported=True, report_basis="actual_unknown",
                        planned_development_minutes=day.get("development_minutes", 0),
                        reported_actual_minutes=None, unused_capacity_minutes=0,
                        needs_review=True)
-        else:
+        elif key < local_today:
             day.update(historical_unreported=True, unused_capacity_minutes=0,
                        needs_review=True)
     remaining = _remaining(planning)
     task_by_id = {task["id"]: task for task in planning["tasks"]}
     future_locks = [deepcopy(x) for x in planning.get("locks", []) if x["date"] >= start.isoformat()]
-    rest = _rest_days(days, ledger, planning["tasks"], {x["date"] for x in future_locks})
+    occupied_dates = {x["date"] for x in future_locks}
+    occupied_dates.update(day for day, manual in planning.get("manual_days", {}).items()
+                          if manual.get("budget_minutes", 0) > 0)
+    rest = _rest_days(days, ledger, planning["tasks"], occupied_dates)
     _validate_locks(planning, ledger, remaining, rest, start.isoformat())
     weekly_reviews, reviews_by_day = _weekly_reviews(planning, days, ledger, rest, future_locks)
     prior_reviews = {x["id"]: x for x in old.get("weekly_reviews", [])}
@@ -761,7 +1151,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
             reviews_by_day[prior["date"]] = weekly_reviews[index]
     reserved = defaultdict(int)
     for lock in future_locks:
-        reserved[lock["task_id"]] += lock["minutes"]
+        reserved[lock["task_id"]] += _lock_reservation(planning, lock)
     result_days, cubes = old_days, old_cubes
     early_weekly = defaultdict(int)
     for cube in old_cubes:
@@ -780,6 +1170,17 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
         locks = [x for x in future_locks if x["date"] == key]
         weekly_review = reviews_by_day.get(key)
         weekly_minutes = weekly_review["minutes"] if weekly_review else 0
+        if key in planning.get("manual_days", {}):
+            for lock in sorted(locks, key=lambda item: (item.get("order", 0), item["cube_id"])):
+                amount = _lock_reservation(planning, lock)
+                remaining[lock["task_id"]] -= amount
+                reserved[lock["task_id"]] -= amount
+                progress = planning.get("completed_cubes", {}).get(lock["cube_id"], {})
+                cubes.append({**lock, "id": lock["cube_id"], "course": task_by_id[lock["task_id"]]["course"],
+                              "progress_percent": progress.get("percent", 0),
+                              "actual_minutes": progress.get("actual_minutes", 0)})
+            result_days.append(_manual_day_view(planning, key, led, locks, weekly_review, rest))
+            continue
         for lock in locks:
             remaining[lock["task_id"]] -= lock["minutes"]
             reserved[lock["task_id"]] -= lock["minutes"]
@@ -898,12 +1299,24 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
         secondary_exception = priority_active and focus and task_by_id[focus]["course"] == planning["settings"].get("priority_course") and any(
             task_by_id[x["task_id"]]["course"] != planning["settings"].get("priority_course")
             for x in locks + placed)
+        reported_course = sum(
+            (entry.get("actual_minutes") or round(entry["planned_minutes"]*entry["percent"]/100))
+            for entry in planning.get("completed_cubes", {}).values() if entry["date"] == key)
+        prep_excess = sum(max(0, planning.get("prep_progress", {}).get(prep["id"], {}).get("actual_minutes", 0) -
+                              prep["minutes"]) for prep in led["prep_cubes"])
+        builder_selected = sum(_lock_reservation(planning, lock) for lock in locks
+                               if lock.get("manual") or lock.get("locked")) + reported_course
+        builder_total = led["fixed_minutes"] + prep_excess + weekly_minutes + builder_selected
         result_days.append({"date": key, "rest_provisional": key in rest,
                             "focus_task_id": focus, "calendar_minutes": led["timed_minutes"],
                             "secondary_early_prep_exception": bool(secondary_exception),
                             "lesson_count": len(led["lessons"]), "lesson_prep_minutes": led["prep_minutes"],
                             "all_day_assumed_minutes": led["homework_minutes"],
                             "fixed_minutes": led["fixed_minutes"], "development_minutes": planned,
+                            "builder_selected_minutes": builder_selected,
+                            "builder_total_work_minutes": builder_total,
+                            "builder_available_minutes": max(0, led["day_limit_minutes"]-builder_total),
+                            "builder_over_cap_minutes": max(0, builder_total-led["day_limit_minutes"]),
                             "weekly_review_minutes": weekly_minutes,
                             "weekly_review": ({k: weekly_review[k] for k in ("id", "start", "end", "minutes", "status")}
                                               if weekly_review else None),
@@ -913,6 +1326,11 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                             "unused_capacity_minutes": max(0, led["available_minutes"]-weekly_minutes-planned),
                             "free_windows": [[_hhmm(a), _hhmm(b)] for a, b in led["free_windows"]],
                             "event_ids": led["events"],
+            "prep_cubes": [{**prep, "progress_percent": planning.get("prep_progress", {}).get(prep["id"], {}).get("percent", 0),
+                            "actual_minutes": planning.get("prep_progress", {}).get(prep["id"], {}).get("actual_minutes", 0)}
+                           for prep in led["prep_cubes"]],
+            "budget_minutes": led["day_limit_minutes"], "energy_units": led["day_limit_minutes"]/60,
+            "manual": False, "raised_load": led["raised_load"], "over_cap_minutes": max(0, led["fixed_minutes"]+weekly_minutes+planned-led["day_limit_minutes"]),
                             "calendar_needs_review": bool(led["unknown"]) or bool(planning["calendar"].get("stale")) or not planning["calendar"].get("configured", True),
                             "needs_review": bool(led["unknown"]) or bool(planning["calendar"].get("stale")) or not planning["calendar"].get("configured", True),
                             "over_cap_fixed_minutes": led["over_cap_minutes"]})
@@ -934,14 +1352,19 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                        and (not due or c["date"] <= due))
         demand = _remaining(planning)[tid]
         deficit = max(0, demand-assigned)
-        record = {**task, "scheduled_by_due_minutes": assigned, "deficit_by_due_minutes": deficit,
+        record = {**task, "remaining_minutes": demand,
+                  "scheduled_by_due_minutes": assigned, "deficit_by_due_minutes": deficit,
                   "remaining_at_horizon_minutes": remaining[tid]}
         result_tasks.append(record)
         if due and deficit:
             risks.append({"code": "deadline_deficit", "task_id": tid, "minutes": deficit})
+    task_pool = _task_pool(planning, cubes, days)
     for day in result_days:
         if day["over_cap_fixed_minutes"]:
             risks.append({"code": "fixed_work_exceeds_day_limit", "date": day["date"], "minutes": day["over_cap_fixed_minutes"]})
+        if day.get("manual") and day.get("over_cap_minutes", 0):
+            risks.append({"code": "manual_day_over_budget", "date": day["date"],
+                          "minutes": day["over_cap_minutes"]})
         if day.get("reported") and day["total_work_minutes"] > day["day_limit_minutes"]:
             risks.append({"code": "reported_work_exceeds_day_limit", "date": day["date"],
                           "minutes": day["total_work_minutes"]-day["day_limit_minutes"]})
@@ -1008,6 +1431,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
             if len(emergency_proposals) >= 12:
                 break
     result = {"days": result_days, "cubes": cubes, "tasks": result_tasks, "totals": totals,
+              "task_pool": task_pool,
               "needs_detail_review": bool(orphaned_details),
               "orphaned_detail_count": len(orphaned_details),
               "weekly_reviews": weekly_reviews,
@@ -1036,6 +1460,12 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                                                 "live_events": planning.get("live_events", []),
                                                 "weekly_review_done": planning.get("weekly_review_done", {}),
                                                 "cube_details": planning.get("cube_details", {}),
+                                                "manual_days": planning.get("manual_days", {}),
+                                                "prep_overrides": planning.get("prep_overrides", {}),
+                                                "prep_progress": planning.get("prep_progress", {}),
+                                                "task_segments": planning.get("task_segments", []),
+                                                "segment_baseline_remaining": planning.get("segment_baseline_remaining", {}),
+                                                "segment_progress": planning.get("segment_progress", {}),
                                                 "from": start.isoformat()}).encode()).hexdigest()[:24]
     return planning
 
@@ -1058,6 +1488,8 @@ def merge_calendar_refresh(planning, response):
             prior = old_by_fingerprint[fingerprint(event)][0]
         if prior and prior.get("category"):
             copied["category"] = prior["category"]
+        if prior:
+            copied["prep_key"] = prior.get("prep_key") or prior.get("occurrence_id") or prior.get("id")
         events.append(copied)
     incomplete = bool(response.get("stale") or response.get("error") or not response.get("configured"))
     if incomplete:
@@ -1081,9 +1513,364 @@ def merge_calendar_refresh(planning, response):
     return planning
 
 
+def _builder_date(planning, value):
+    selected = _day(value, "day builder date")
+    if selected not in _dates(planning["settings"]):
+        raise ValidationError("Дата конструктора вне горизонта")
+    today = datetime.now(ZoneInfo(planning["settings"]["timezone"])).date()
+    if selected < today:
+        raise ValidationError("Прошедший день доступен только для чтения")
+    return selected.isoformat()
+
+
+def _started(planning, cube_id):
+    report = planning.get("completed_cubes", {}).get(cube_id)
+    return bool(report and (report.get("percent", 0) > 0 or report.get("actual_minutes", 0) > 0))
+
+
+def _manual_locks(planning, key):
+    return sorted((lock for lock in planning.get("locks", []) if lock["date"] == key and lock.get("manual")),
+                  key=lambda lock: (lock.get("order", 0), lock["cube_id"]))
+
+
+def _normalize_manual_order(planning, key):
+    for index, lock in enumerate(_manual_locks(planning, key)):
+        lock["order"] = index
+
+
+def _materialize_manual_day(planning, key):
+    existing_day = next((day for day in planning.get("result", {}).get("days", []) if day["date"] == key), None)
+    if existing_day is None:
+        raise ValidationError("План дня отсутствует; сначала выполните recalculate")
+    planning.setdefault("manual_days", {}).setdefault(
+        key, {"budget_minutes": existing_day.get("day_limit_minutes", planning["settings"]["day_limit_minutes"])})
+    locks = planning.setdefault("locks", [])
+    by_id = {lock["cube_id"]: lock for lock in locks}
+    selected = [cube for cube in planning["result"].get("cubes", [])
+                if cube["date"] == key and (cube.get("manual") or cube.get("locked") or
+                                            _started(planning, cube["id"]))]
+    for index, cube in enumerate(selected):
+        lock = by_id.get(cube["id"])
+        if lock is None:
+            lock = {"cube_id": cube["id"], "task_id": cube["task_id"], "date": key,
+                    "minutes": cube["minutes"], "phase": cube.get("phase", "preparation"),
+                    "title": cube.get("title", ""), "output": cube.get("output", ""),
+                    "locked": True, "manual": True, "floating": True, "start": None, "end": None,
+                    "is_remainder": bool(cube.get("is_remainder")), "order": index}
+            if cube.get("segment_id"):
+                lock["segment_id"] = cube["segment_id"]
+            if cube.get("steps"):
+                lock["steps"] = deepcopy(cube["steps"])
+            locks.append(lock)
+            by_id[lock["cube_id"]] = lock
+        else:
+            lock.update(manual=True, floating=True, start=None, end=None)
+            lock.setdefault("order", index)
+    _normalize_manual_order(planning, key)
+
+
+def _refresh_manual_day(planning, key):
+    ledger = _ledger(planning, _dates(planning["settings"]))
+    led = ledger[key]
+    reviews = planning.get("result", {}).get("weekly_reviews", [])
+    review = next((review for review in reviews if review.get("date") == key), None)
+    locks = _manual_locks(planning, key)
+    row = _manual_day_view(planning, key, led, locks, review, set())
+    old_days = planning["result"].get("days", [])
+    for index, day in enumerate(old_days):
+        if day["date"] == key:
+            old_days[index] = row
+            break
+    old_cubes = planning["result"].get("cubes", [])
+    old_cubes[:] = [cube for cube in old_cubes if cube["date"] != key]
+    task_by_id = {task["id"]: task for task in planning["tasks"]}
+    for lock in locks:
+        report = planning.get("completed_cubes", {}).get(lock["cube_id"], {})
+        cube = {**lock, "id": lock["cube_id"], "course": task_by_id[lock["task_id"]]["course"],
+                "progress_percent": report.get("percent", 0), "actual_minutes": report.get("actual_minutes", 0)}
+        if detail := planning.get("cube_details", {}).get(lock["cube_id"]):
+            cube.update(deepcopy(detail))
+        old_cubes.append(cube)
+    if row["over_cap_minutes"] and any(_lock_reservation(planning, lock) for lock in locks):
+        raise ValidationError("Бюджета недостаточно для не начатых кубиков: сначала верните или переставьте кубик")
+    available_by_task = _remaining(planning)
+    reserved_by_task = defaultdict(int)
+    for lock in planning.get("locks", []):
+        if lock.get("manual"):
+            reserved_by_task[lock["task_id"]] += _lock_reservation(planning, lock)
+    if any(reserved > available_by_task[tid] for tid, reserved in reserved_by_task.items()):
+        raise ValidationError("Выбранные ручные кубики превышают остаток задачи")
+    segment_credits = _segment_effective_credits(planning)
+    by_segment = {segment["id"]: segment for segment in planning.get("task_segments", [])}
+    segment_reserved = defaultdict(int)
+    for lock in planning.get("locks", []):
+        if lock.get("manual") and lock.get("segment_id"):
+            segment_id = lock["segment_id"]
+            if segment_id not in by_segment or by_segment[segment_id]["task_id"] != lock["task_id"]:
+                raise ValidationError("Ручной кубик ссылается на чужой этап")
+            segment_reserved[segment_id] += _lock_reservation(planning, lock)
+    if any(reserved > by_segment[segment_id]["minutes"]-segment_credits.get(segment_id, 0)
+           for segment_id, reserved in segment_reserved.items()):
+        raise ValidationError("Выбранные кубики превышают остаток этапа")
+
+
+def apply_day_builder(planning, action, data):
+    planning = deepcopy(planning)
+    if not isinstance(data, dict):
+        raise ValidationError("day builder data: требуется объект")
+    affected = set()
+    if action == "day_budget":
+        if set(data) != {"date", "minutes"}:
+            raise ValidationError("day_budget: нужны date,minutes")
+        key = _builder_date(planning, data["date"])
+        minutes = _int(data["minutes"], "day_budget.minutes", 0, 480)
+        if minutes % 15:
+            raise ValidationError("day_budget: шаг 15 минут")
+        _materialize_manual_day(planning, key)
+        planning["manual_days"][key]["budget_minutes"] = minutes
+        affected.add(key)
+    elif action in {"prep_set", "prep_progress"}:
+        allowed = {"prep_id", "minutes"} if action == "prep_set" else {"prep_id", "percent", "actual_minutes"}
+        required = {"prep_id", "minutes"} if action == "prep_set" else {"prep_id", "percent"}
+        if set(data) - allowed or not required <= set(data):
+            raise ValidationError(f"{action}: неверные поля")
+        prep_id = identifier(data["prep_id"], "prep_id")
+        prep = next((prep for day in planning.get("result", {}).get("days", [])
+                     for prep in day.get("prep_cubes", []) if prep["id"] == prep_id), None)
+        if prep is None:
+            raise ValidationError(f"{action}: подготовка не найдена")
+        key = _builder_date(planning, prep["date"])
+        _materialize_manual_day(planning, key)
+        if action == "prep_set":
+            minutes = _int(data["minutes"], "prep_set.minutes", 0, 120)
+            if minutes % 5:
+                raise ValidationError("prep_set: шаг 5 минут")
+            progress = planning.get("prep_progress", {}).get(prep_id)
+            if progress and (progress.get("percent", 0) > 0 or progress.get("actual_minutes", 0) > 0):
+                credited = round(prep["default_minutes"] * progress.get("percent", 0) / 100)
+                if minutes < max(progress.get("actual_minutes", 0), credited):
+                    raise ValidationError("Подтверждённую подготовку нельзя уменьшить или убрать")
+            planning.setdefault("prep_overrides", {})[prep_id] = minutes
+        else:
+            percent = _int(data["percent"], "prep_progress.percent", 0, 100)
+            prior = planning.setdefault("prep_progress", {}).get(prep_id, {})
+            actual = _int(data.get("actual_minutes", prior.get("actual_minutes", 0)),
+                          "prep_progress.actual_minutes")
+            planning["prep_progress"][prep_id] = {"percent": percent, "actual_minutes": actual, "date": key}
+        affected.add(key)
+    elif action in {"day_cube_remove", "day_cube_move", "day_cube_resize"}:
+        allowed = ({"cube_id"} if action == "day_cube_remove" else
+                   {"cube_id", "date", "index"} if action == "day_cube_move" else
+                   {"cube_id", "minutes"})
+        required = {"cube_id"} if action == "day_cube_remove" else (
+            {"cube_id", "date"} if action == "day_cube_move" else {"cube_id", "minutes"})
+        if set(data) - allowed or not required <= set(data):
+            raise ValidationError(f"{action}: неверные поля")
+        cube_id = identifier(data["cube_id"], "cube_id")
+        cube = next((cube for cube in planning.get("result", {}).get("cubes", [])
+                     if cube["id"] == cube_id), None)
+        if cube is None:
+            raise ValidationError("Кубик не найден")
+        old_day = _builder_date(planning, cube["date"])
+        _materialize_manual_day(planning, old_day)
+        lock = next((lock for lock in planning["locks"] if lock["cube_id"] == cube_id), None)
+        if lock is None:
+            raise ValidationError("AUTO-прогноз не выбран в конструктор и уже доступен в пуле")
+        if _started(planning, cube_id):
+            if action != "day_cube_move" or data["date"] != old_day:
+                raise ValidationError("Начатый кубик нельзя удалить, изменить или перенести")
+        if action == "day_cube_remove":
+            planning["locks"].remove(lock)
+            affected.add(old_day)
+        elif action == "day_cube_resize":
+            minutes = _int(data["minutes"], "day_cube_resize.minutes", 15, 90)
+            if minutes not in (15, 30, 45, 60, 90):
+                raise ValidationError("day_cube_resize: размер 15/30/45/60/90")
+            lock.update(minutes=minutes, is_remainder=False)
+            affected.add(old_day)
+        else:
+            target = _builder_date(planning, data["date"])
+            _materialize_manual_day(planning, target)
+            lock["date"] = target
+            siblings = [item for item in _manual_locks(planning, target) if item["cube_id"] != cube_id]
+            index = _int(data.get("index", len(siblings)), "day_cube_move.index", 0, len(siblings))
+            siblings.insert(index, lock)
+            for order, item in enumerate(siblings):
+                item["order"] = order
+            affected.update((old_day, target))
+        _normalize_manual_order(planning, old_day)
+    elif action == "day_cube_add":
+        if set(data) - {"date", "task_id", "minutes", "segment_id", "index"} or not {"date", "task_id", "minutes"} <= set(data):
+            raise ValidationError("day_cube_add: нужны date,task_id,minutes")
+        key = _builder_date(planning, data["date"])
+        task = next((task for task in planning["tasks"] if task["id"] == data["task_id"]), None)
+        if task is None:
+            raise ValidationError("day_cube_add: задача не найдена")
+        minutes = _int(data["minutes"], "day_cube_add.minutes", 15, 90)
+        if minutes not in (15, 30, 45, 60, 90):
+            raise ValidationError("day_cube_add: размер 15/30/45/60/90")
+        _materialize_manual_day(planning, key)
+        siblings = _manual_locks(planning, key)
+        index = _int(data.get("index", len(siblings)), "day_cube_add.index", 0, len(siblings))
+        cube_id = uuid4().hex
+        phase = ("review" if task.get("review_minutes", 0) and
+                 _remaining(planning)[task["id"]] <= task["review_minutes"] else "preparation")
+        lock = {"cube_id": cube_id, "task_id": task["id"], "date": key,
+                "minutes": minutes, "phase": phase, "title": task["title"],
+                "output": "Часть материала готова", "locked": True, "manual": True,
+                "floating": True, "start": None, "end": None, "order": index,
+                "is_remainder": False}
+        if data.get("segment_id") is not None:
+            lock["segment_id"] = identifier(data["segment_id"], "segment_id")
+        planning["locks"].append(lock)
+        siblings.insert(index, lock)
+        for order, item in enumerate(siblings):
+            item["order"] = order
+        affected.add(key)
+    else:
+        raise ValidationError("Неизвестное действие конструктора дня")
+    for key in sorted(affected):
+        _refresh_manual_day(planning, key)
+    return calculate(planning, reason=action)
+
+
+def apply_segment_action(planning, action, data):
+    planning = deepcopy(planning)
+    _ensure_segments(planning)
+    if not isinstance(data, dict):
+        raise ValidationError("segment data: требуется объект")
+    by_id = {segment["id"]: segment for segment in planning["task_segments"]}
+    if action == "segment_create":
+        if set(data) - {"task_id", "parent_id", "title", "minutes", "output", "steps"} or not {
+                "task_id", "title", "minutes"} <= set(data):
+            raise ValidationError("segment_create: неверные поля")
+        task_id = identifier(data["task_id"], "task_id")
+        if task_id not in {task["id"] for task in planning["tasks"]}:
+            raise ValidationError("segment_create: задача не найдена")
+        if data.get("parent_id") is not None:
+            raise ValidationError("segment_create.parent_id: только null")
+        minutes = _int(data["minutes"], "segment_create.minutes", 15, 300)
+        if minutes % 15:
+            raise ValidationError("segment_create: шаг 15 минут")
+        reserved_task = sum(_lock_reservation(planning, lock) for lock in planning.get("locks", [])
+                            if lock.get("manual") and lock["task_id"] == task_id)
+        if minutes > max(0, _remaining(planning)[task_id]-reserved_task):
+            raise ValidationError("Новый этап больше доступного остатка задачи")
+        title = data["title"]
+        output = data.get("output", "")
+        steps = data.get("steps", [])
+        candidate = {"id": "segment:" + uuid4().hex, "task_id": task_id,
+                     "parent_id": None, "title": title, "minutes": minutes,
+                     "output": output, "steps": steps, "origin": "manual"}
+        _validate_cube_detail({"title": title, "output": output or "Результат этапа",
+                               "steps": steps or ["Выполнить этап"]})
+        started = set(planning.get("segment_progress", {}))
+        started.update(entry["segment_id"] for entry in planning.get("completed_cubes", {}).values()
+                       if entry.get("segment_id") and (entry["percent"] or entry.get("actual_minutes")))
+        selected = {lock.get("segment_id") for lock in planning.get("locks", [])
+                    if lock.get("manual") and _lock_reservation(planning, lock)}
+        donors = [segment for segment in reversed(planning["task_segments"])
+                  if segment["task_id"] == task_id and segment["origin"] == "auto"
+                  and segment["id"] not in started and segment["id"] not in selected]
+        if sum(segment["minutes"] for segment in donors) < minutes:
+            raise ValidationError("Недостаточно не начатого объёма задачи для нового этапа")
+        left = minutes
+        for donor in donors:
+            take = min(left, donor["minutes"])
+            donor["minutes"] -= take
+            left -= take
+            if not donor["minutes"]:
+                planning["task_segments"].remove(donor)
+            if not left:
+                break
+        planning["task_segments"].append(candidate)
+        return calculate(planning, reason="segment_create")
+    if action == "segment_progress":
+        if set(data) != {"segment_id", "percent"}:
+            raise ValidationError("segment_progress: нужны segment_id,percent")
+        segment_id = identifier(data["segment_id"], "segment_id")
+        segment = by_id.get(segment_id)
+        if segment is None:
+            raise ValidationError("segment_progress: этап не найден")
+        percent = _int(data["percent"], "segment_progress.percent", 0, 100)
+        cube_credit = sum(round(entry["planned_minutes"]*entry["percent"]/100)
+                          for entry in planning.get("completed_cubes", {}).values()
+                          if entry.get("segment_id") == segment_id)
+        today = datetime.now(ZoneInfo(planning["settings"]["timezone"])).date()
+        first, last = _dates(planning["settings"])[0], _dates(planning["settings"])[-1]
+        report_day = min(last, max(first, today)).isoformat()
+        planning.setdefault("segment_progress", {})[segment_id] = {
+            "percent": percent, "cube_credit_at_report": min(segment["minutes"], cube_credit),
+            "date": report_day}
+        credit = _segment_effective_credits(planning)[segment_id]
+        eligible = max(0, segment["minutes"]-credit)
+        locks = [lock for lock in planning.get("locks", []) if lock.get("manual")
+                 and lock.get("segment_id") == segment_id and _lock_reservation(planning, lock)]
+        reserved = sum(lock["minutes"] for lock in locks)
+        released = []
+        for lock in sorted(locks, key=lambda row: (row["minutes"], row["date"], row.get("order", 0)),
+                           reverse=True):
+            if reserved <= eligible:
+                break
+            planning["locks"].remove(lock)
+            reserved -= lock["minutes"]
+            released.append({"cube_id": lock["cube_id"], "segment_id": segment_id,
+                             "date": lock["date"], "minutes": lock["minutes"],
+                             "reason": "segment_progress"})
+        for key in sorted({item["date"] for item in released}):
+            _normalize_manual_order(planning, key)
+            _refresh_manual_day(planning, key)
+        result = calculate(planning, reason="segment_progress")
+        result["result"]["released_reservations"] = released
+        return result
+    if action == "day_segment_add":
+        if set(data) - {"date", "segment_id", "minutes"} or not {"date", "segment_id"} <= set(data):
+            raise ValidationError("day_segment_add: неверные поля")
+        key = _builder_date(planning, data["date"])
+        segment_id = identifier(data["segment_id"], "segment_id")
+        segment = by_id.get(segment_id)
+        if segment is None:
+            raise ValidationError("day_segment_add: этап не найден")
+        credit = _segment_effective_credits(planning).get(segment_id, 0)
+        reserved = sum(_lock_reservation(planning, lock) for lock in planning.get("locks", [])
+                       if lock.get("manual") and lock.get("segment_id") == segment_id)
+        available = max(0, segment["minutes"]-credit-reserved)
+        minutes = data.get("minutes", min(300, (available // 15) * 15))
+        if type(minutes) is not int or not 15 <= minutes <= 300 or minutes % 15 or minutes > available:
+            raise ValidationError("day_segment_add: длительность 15..300 с шагом 15 в пределах остатка этапа")
+        _materialize_manual_day(planning, key)
+        sizes = []
+        left = minutes
+        for size in (90, 60, 45, 30, 15):
+            while left >= size:
+                sizes.append(size)
+                left -= size
+        if left:
+            raise ValidationError("day_segment_add: длительность не раскладывается")
+        order = len(_manual_locks(planning, key))
+        for size in sizes:
+            planning["locks"].append({
+                "cube_id": uuid4().hex, "task_id": segment["task_id"],
+                "segment_id": segment_id, "date": key, "minutes": size,
+                "phase": "preparation", "title": segment["title"],
+                "output": segment.get("output", ""), "locked": True,
+                "manual": True, "floating": True, "start": None, "end": None,
+                "order": order, "is_remainder": False,
+            })
+            order += 1
+        _refresh_manual_day(planning, key)
+        return calculate(planning, reason="day_segment_add")
+    raise ValidationError("Неизвестное действие этапа")
+
+
 def apply_action(planning, action, data):
     if not isinstance(data, dict):
         raise ValidationError("planning data: требуется объект")
+    if action in {"segment_create", "segment_progress", "day_segment_add"}:
+        return apply_segment_action(planning, action, data)
+    if action in {"day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
+                  "day_cube_move", "day_cube_resize"}:
+        return apply_day_builder(planning, action, data)
     planning = deepcopy(planning)
     allowed = {
         "cube_progress": {"cube_id", "percent", "actual_minutes"},
@@ -1103,10 +1890,18 @@ def apply_action(planning, action, data):
         percent = _int(data.get("percent"), "percent", 0, 100)
         existing = planning.setdefault("completed_cubes", {}).get(cube["id"], {})
         actual = _int(data.get("actual_minutes", existing.get("actual_minutes", 0)), "actual_minutes")
-        planning["completed_cubes"][cube["id"]] = {"task_id": cube["task_id"], "date": cube["date"],
-                                                      "planned_minutes": cube["minutes"], "percent": percent,
-                                                      "actual_minutes": actual}
+        planning["completed_cubes"][cube["id"]] = {
+            "task_id": cube["task_id"], "date": cube["date"],
+            "planned_minutes": cube["minutes"], "percent": percent,
+            "actual_minutes": actual,
+            **({"segment_id": cube["segment_id"]} if cube.get("segment_id") else {}),
+        }
         cube["progress_percent"], cube["actual_minutes"] = percent, actual
+        _refresh_result_remaining(planning)
+        if cube["date"] in planning.get("manual_days", {}):
+            _refresh_manual_day(planning, cube["date"])
+            planning["result"]["task_pool"] = _task_pool(
+                planning, planning["result"]["cubes"], _dates(planning["settings"]))
     elif action == "day_outcome":
         task_id = data.get("task_id")
         if task_id not in {task["id"] for task in planning["tasks"]}:
@@ -1129,6 +1924,11 @@ def apply_action(planning, action, data):
         entries[:] = [x for x in entries if (x["task_id"], x["date"]) != (task_id, day)]
         entries.append({"task_id": task_id, "date": day, "remaining_minutes": remaining,
                         "done": done, "note": note})
+        _refresh_result_remaining(planning)
+        if day in planning.get("manual_days", {}):
+            _refresh_manual_day(planning, day)
+            planning["result"]["task_pool"] = _task_pool(
+                planning, planning["result"]["cubes"], _dates(planning["settings"]))
         result = planning.get("result", {})
         possible = [x for x in result.get("days", []) if x["date"] > day and not x.get("rest_provisional")
                     and x.get("unused_capacity_minutes", 0) >= 60
@@ -1263,8 +2063,21 @@ def compact_status(snapshot):
             "next_cubes": [{"id": c.get("id"), "task_id": c.get("task_id"), "date": c.get("date"),
                             "start": c.get("start"), "end": c.get("end"), "title": c.get("title"),
                             "output": c.get("output"), "steps": c.get("steps", []),
+                            "floating": bool(c.get("floating")), "order": c.get("order"),
+                            "minutes": c.get("minutes"), "manual": bool(c.get("manual")),
+                            "segment_id": c.get("segment_id"),
                             "progress_percent": c.get("progress_percent")}
                            for c in result.get("cubes", []) if c.get("date") in next_dates][:16],
+            "task_pool": [{
+                "task_id": item["task_id"], "title": item["title"],
+                "remaining_minutes": item["remaining_minutes"],
+                "available_for_manual_minutes": item["available_for_manual_minutes"],
+                "segments": [{"id": segment["id"], "title": segment["title"],
+                              "minutes": segment["minutes"],
+                              "remaining_minutes": segment["remaining_minutes"],
+                              "progress_percent": segment["progress_percent"]}
+                             for segment in item.get("segments", [])[:3]],
+            } for item in result.get("task_pool", [])[:5]],
             "recovery_proposals": result.get("recovery_proposals"),
             "emergency_proposals": result.get("emergency_proposals", [])[:7],
             "weekly_reviews": [x for x in result.get("weekly_reviews", [])

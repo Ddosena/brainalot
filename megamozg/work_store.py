@@ -180,12 +180,16 @@ class WorkStore(SharedState):
         """
         from copy import deepcopy
         from datetime import date, timedelta
-        from .work_planning import apply_action, calculate, merge_calendar_refresh, validate_planning
+        from .work_planning import (apply_action, calculate, merge_calendar_refresh,
+                                    reconcile_segment_estimates, validate_planning)
         if not isinstance(command, dict) or set(command) != {"request_id", "expected_revision", "action", "data"}:
             raise ValidationError("planning: нужны request_id, expected_revision, action, data")
         action, data = command["action"], command["data"]
         if action not in {"import", "recalculate", "cube_progress", "day_outcome", "place_cube", "resource",
-                          "capacity_override", "weekly_review_done", "describe_cubes"}:
+                          "capacity_override", "weekly_review_done", "describe_cubes",
+                          "day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
+                          "day_cube_move", "day_cube_resize", "segment_create",
+                          "segment_progress", "day_segment_add"}:
             raise ValidationError("Неизвестное действие planning")
         if not isinstance(data, dict):
             raise ValidationError("planning.data: требуется объект")
@@ -242,6 +246,17 @@ class WorkStore(SharedState):
                     **planning.get("weekly_review_done", {}), **previous.get("weekly_review_done", {})}
                 planning["cube_details"] = {
                     **planning.get("cube_details", {}), **previous.get("cube_details", {})}
+                planning["manual_days"] = {
+                    **planning.get("manual_days", {}), **previous.get("manual_days", {})}
+                planning["prep_overrides"] = {
+                    **planning.get("prep_overrides", {}), **previous.get("prep_overrides", {})}
+                planning["prep_progress"] = {
+                    **planning.get("prep_progress", {}), **previous.get("prep_progress", {})}
+                if "task_segments" in previous:
+                    planning["task_segments"] = deepcopy(previous["task_segments"])
+                    planning["segment_baseline_remaining"] = deepcopy(previous["segment_baseline_remaining"])
+                    planning["segment_progress"] = deepcopy(previous.get("segment_progress", {}))
+                    reconcile_segment_estimates(planning, previous)
                 planning["history"] = previous.get("history", [])[-39:] + planning["history"][-1:]
                 if planning["completed_cubes"] or planning["day_outcomes"]:
                     planning["result"] = deepcopy(previous.get("result", planning["result"]))

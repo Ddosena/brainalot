@@ -178,6 +178,7 @@ class DesktopBridge:
                 "mode": self._host.mode, "widget_mode": self._host.widget_mode,
                 "topmost": self._host.topmost, "side": self._host.side,
                 "media_visible": self._host.media_visible,
+                "work_expanded": self._host._expanded_full_geometry is not None,
                 "double_click": double_click_settings(area.dpi)}
 
     def window_action(self, action, value=None):
@@ -629,6 +630,7 @@ class DesktopHost:
         self._popup_base = None
         self._popup_above = False
         self._compact_surface = None
+        self._expanded_full_geometry = None
 
     def _widget_size(self, mode):
         width, height = WIDGET_SIZES[mode]
@@ -749,7 +751,7 @@ class DesktopHost:
         window._brainalot_guarded = True
 
     def _remember_geometry(self, window, name):
-        if self._quitting or self._switching:
+        if self._quitting or self._switching or (name == "full" and self._expanded_full_geometry is not None):
             return
         mode = "full" if name == "full" else self.widget_mode
         if self.mode != mode:
@@ -957,6 +959,29 @@ class DesktopHost:
                 return self._widget_popup(value)
             if action == "widget_media":
                 return self._widget_media(value)
+            if action == "work_expand":
+                if type(value) is not bool:
+                    raise ValueError("work_expand requires a boolean")
+                if self.mode != "full":
+                    self.window_action("full")
+                expanded = self._expanded_full_geometry is not None
+                if value != expanded:
+                    if value:
+                        self._remember_geometry(self.full, "full")
+                        self._expanded_full_geometry = dict(native_rect(self.full))
+                        area = select_area(self._expanded_full_geometry, self._areas())
+                        rect = {"x": area.x, "y": area.y, "width": area.width, "height": area.height}
+                    else:
+                        rect = fit_geometry(self._expanded_full_geometry, self._areas(), FULL_SIZE, MINIMUM_SIZES["full"])
+                    self._switching = True
+                    try:
+                        set_native_rect(self.full, rect)
+                    finally:
+                        self._switching = False
+                    if not value:
+                        self._expanded_full_geometry = None
+                        self._remember_geometry(self.full, "full")
+                return {"ok": True, "expanded": value}
             if action == "topmost":
                 self.topmost = True
                 # pywebview's on_top setter writes WinForms.TopMost off the UI
@@ -990,6 +1015,9 @@ class DesktopHost:
                                                     + "{detail:" + json.dumps(action) + "}))")
                     self.mode = action
                     rect, minimum = self._rect(action, anchor)
+                    if action == "full" and self._expanded_full_geometry is not None:
+                        area = select_area(self._expanded_full_geometry, self._areas())
+                        rect = {"x": area.x, "y": area.y, "width": area.width, "height": area.height}
                     set_native_rect(target, rect, minimum)
                     self._sync_compact_surface()
                     self._show(target)  # show before hiding the old surface

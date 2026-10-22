@@ -237,6 +237,27 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     host.destroy()
 
 
+def test_work_expansion_restores_window_without_replacing_saved_size(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path, 8780, "test-token", lambda: None)
+    area = desktop.WorkArea(-1920, 0, 1920, 1040)
+    monkeypatch.setattr(host, "_areas", lambda: [area])
+    host.create_windows(Webview())
+    desktop.set_native_rect(host.full, {"x": -1700, "y": 80, "width": 484, "height": 900})
+    before = dict(desktop.native_rect(host.full))
+    assert host.window_action("work_expand", True) == {"ok": True, "expanded": True}
+    assert desktop.native_rect(host.full) == {"x": -1920, "y": 0, "width": 1920, "height": 1040}
+    host._remember_geometry(host.full, "full")
+    assert host.state.data["geometry"]["full"]["width"] == before["width"]
+    host.window_action("card")
+    host.window_action("full")
+    assert desktop.native_rect(host.full)["width"] == 1920
+    assert host.window_action("work_expand", False) == {"ok": True, "expanded": False}
+    assert desktop.native_rect(host.full) == before
+    with pytest.raises(ValueError):
+        host.window_action("work_expand", "true")
+    host.destroy()
+
+
 def test_old_saved_card_size_becomes_one_row_bar_at_same_place(tmp_path, monkeypatch):
     state = desktop.DesktopState(tmp_path)
     state.data["geometry"]["card"] = {"x": 100, "y": 200, "width": 388, "height": 154, "units": "physical", "dpi": 96}

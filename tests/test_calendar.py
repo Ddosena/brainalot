@@ -520,6 +520,16 @@ def test_events_merge_distinguish_ids_and_keep_good_feed_on_partial_failure(tmp_
 
 
 def test_timed_calendar_events_fill_the_day_summary_and_can_be_marked_did_not_happen(tmp_path, monkeypatch):
+    import megamozg.api as api_module
+
+    class FixtureDate(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 21)
+
+    # The picker uses a rolling +/-31-day window. Keep the clock aligned with
+    # this fixed September feed instead of letting the fixture expire in October.
+    monkeypatch.setattr(api_module, "date", FixtureDate)
     CalendarFeed(tmp_path).configure(URL)
     monkeypatch.setattr(CalendarFeed, "_download", lambda self, url: FEED)
     client = TestClient(create_app(tmp_path), base_url="http://127.0.0.1:8765")

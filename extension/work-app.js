@@ -9,7 +9,6 @@ import * as tabs from "./work-tabs.js";
 import { createCalendar } from "./work-calendar.js";
 import { createDrawer } from "./work-drawer.js";
 import { createBoard } from "./work-board.js";
-import { createInbox } from "./work-inbox.js";
 import { createPlanning } from "./work-planning.js";
 import { applyDocument, localeChange, syncLocale, t } from "./i18n.js";
 
@@ -70,7 +69,35 @@ const ctx = {
   toast,
 };
 
-let calendar, drawer, board, inbox, planning;
+let calendar, drawer, board, planning;
+let hostFullscreen = false, fullscreenRequest = null;
+
+function fullscreenLabel() {
+  const expanded = !!document.fullscreenElement || hostFullscreen;
+  const label = expanded ? t("Вернуть окно") : t("Развернуть");
+  const button = $("#work-fullscreen");
+  button.innerHTML = `${ic("fit", 14)} <span>${esc(label)}</span>`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", String(expanded));
+}
+
+async function toggleFullscreen() {
+  const expanded = !!document.fullscreenElement || hostFullscreen;
+  try {
+    if (window.parent !== window) {
+      const requestId = crypto.randomUUID?.() || store.uid();
+      fullscreenRequest = requestId;
+      window.parent.postMessage({ type: "brainalot-work-fullscreen-request", expanded: !expanded, request_id: requestId }, window.location.origin);
+      return;
+    }
+    if (expanded) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
+    fullscreenLabel();
+  } catch (error) {
+    toast(t("Не удалось изменить размер Work: {error}", { error: error.message }));
+  }
+}
 
 function setMode(mode) {
   ui.mode = mode;
@@ -258,6 +285,17 @@ function bindChrome() {
   $("#next").innerHTML = ic("chevR");
   $("#menu-btn").innerHTML = ic("dots");
   $("#add-task").innerHTML = `${ic("plus", 15)} ${t("Задача")}`;
+  $("#work-fullscreen").onclick = toggleFullscreen;
+  document.addEventListener("fullscreenchange", fullscreenLabel);
+  window.addEventListener("message", event => {
+    if (event.source !== window.parent || event.origin !== window.location.origin || event.data?.type !== "brainalot-work-fullscreen-result" ||
+        event.data.request_id !== fullscreenRequest) return;
+    fullscreenRequest = null;
+    if (event.data.ok) hostFullscreen = !!event.data.expanded;
+    else toast(t("Не удалось развернуть Work: {error}", { error: event.data.error || t("неизвестная ошибка") }));
+    fullscreenLabel();
+  });
+  fullscreenLabel();
 
   $("#prev").onclick = () => { ui.weekStart = D.addDays(ui.weekStart, -7); renderAll(); };
   $("#next").onclick = () => { ui.weekStart = D.addDays(ui.weekStart, 7); renderAll(); };
@@ -292,6 +330,7 @@ function bindChrome() {
   };
 
   document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && hostFullscreen) { e.preventDefault(); void toggleFullscreen(); return; }
     if (e.key !== "Escape" || board.isEditing()) return;
     if (ui.selectedId && !drawer.isEditingLink()) {
       document.activeElement?.blur?.();
@@ -393,7 +432,7 @@ async function main() {
     if (["error", "conflict"].includes(status)) {
       toast(error?.message || t("Не получилось сохранить — проверьте место на диске"));
       showWorkRecovery(status);
-    } else inbox?.snapshotSoon();
+    }
   });
   store.onRemoteChange(() => {
     if (!board.isEditing()) board.render();
@@ -404,15 +443,6 @@ async function main() {
   renderAll();
   board.render();
   checkPendingStop();
-
-  // Proposals from the work chats; the snapshot lets agents see what already exists.
-  if (globalThis.chrome?.runtime?.id) {
-    inbox = createInbox($("#inbox"), $("#inbox-toggle"), ctx);
-    inbox.snapshotSoon();
-    inbox.refresh();
-  } else {
-    $("#inbox-toggle").hidden = true;
-  }
 
   // Midnight passes while the tab is open: refresh "today" and the countdowns.
   let day = D.today();

@@ -142,7 +142,7 @@ def test_progress_replaces_credit_and_day_outcome_proposes_recovery(tmp_path):
     assert next(day for day in restored["result"]["days"] if day["date"] == cube["date"])["reported_actual_minutes"] == 37
 
 
-def test_invalid_lock_and_lesson_emergency_rejected_without_mutation(tmp_path):
+def test_invalid_lock_rejected_and_explicit_lesson_day_override_allowed(tmp_path):
     work = seed(tmp_path)
     snapshot = op(work, "import", "import", {"planning": planning()})
     cube = snapshot["state"]["planning"]["result"]["cubes"][0]
@@ -151,10 +151,11 @@ def test_invalid_lock_and_lesson_emergency_rejected_without_mutation(tmp_path):
         op(work, "lock-bad", "place_cube",
            {"cube_id": cube["id"], "date": "2027-01-04", "start": "11:00", "locked": True})
     assert work.read() == before
-    with pytest.raises(ValidationError):
-        op(work, "override-lesson", "capacity_override",
-           {"date": "2027-01-04", "minutes": 420, "reason": "test", "approved": True})
-    assert work.read() == before
+    lesson_override = op(work, "override-lesson", "capacity_override",
+                         {"date": "2027-01-04", "minutes": 420, "reason": "explicit", "approved": True})
+    lesson_day = next(d for d in lesson_override["state"]["planning"]["result"]["days"]
+                      if d["date"] == "2027-01-04")
+    assert lesson_day["day_limit_minutes"] == 420 and lesson_day["raised_load"] is True
     approved = op(work, "override-free", "capacity_override",
                   {"date": "2027-01-06", "minutes": 420, "reason": "explicit", "approved": True})
     day = next(d for d in approved["state"]["planning"]["result"]["days"] if d["date"] == "2027-01-06")
@@ -202,6 +203,8 @@ def test_calendar_refresh_is_read_only_and_preserves_category(tmp_path, monkeypa
 
     work = seed(tmp_path)
     snapshot = op(work, "import", "import", {"planning": planning()})
+    original_prep = next(day for day in snapshot["state"]["planning"]["result"]["days"]
+                         if day["date"] == "2027-01-04")["prep_cubes"][0]["id"]
     calls = []
     def read_events(_self, first, last, *, force=False, google_calendar=None):
         calls.append((first.isoformat(), last.isoformat(), force))
@@ -216,6 +219,9 @@ def test_calendar_refresh_is_read_only_and_preserves_category(tmp_path, monkeypa
     # An event without an occurrence_id keeps its original id as the match key.
     assert event["category"] == "lesson"
     assert refreshed["state"]["planning"]["calendar"]["source"] == "Brainalot Calendar read-only"
+    refreshed_prep = next(day for day in refreshed["state"]["planning"]["result"]["days"]
+                          if day["date"] == "2027-01-04")["prep_cubes"][0]["id"]
+    assert refreshed_prep == original_prep
 
 
 def test_live_override_is_three_hours_without_calendar_double_count(tmp_path):
