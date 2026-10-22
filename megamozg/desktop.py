@@ -554,13 +554,14 @@ class CompactSurface:
                     try: self.host.window_action("gesture_move")
                     finally: self._move_pending = False
                 elif action == "up":
-                    result = self.host.window_action("gesture_end") if item["button"] == 0 and not item["id"] else {}
-                    if item["moved"] or result.get("dragged"):
-                        self.last_click = None; continue
                     if item["id"]:
                         self.last_click = None
+                        # Small pointer drift is still a click when released on the same control.
                         if item["button"] == 0 and item["up_id"] == item["id"]: self._activate_control(item["id"])
                     else:
+                        result = self.host.window_action("gesture_end") if item["button"] == 0 else {}
+                        if item["moved"] or result.get("dragged"):
+                            self.last_click = None; continue
                         settings = double_click_settings()
                         rect = native_rect(self.window)
                         scale = select_area(rect,self.host._areas()).dpi/96

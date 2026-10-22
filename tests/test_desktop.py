@@ -472,7 +472,9 @@ def test_compact_cpu_surface_routes_buttons_keyboard_and_passive_double_clicks(m
     up(0); up(.2, x=12)  # Windows 4px double-click width at 150% DPI permits 3px.
     up(1,button=2); up(1.2,button=2)
     up(2,id="widget-run",up_id="widget-run")
-    up(3,id="widget-more",up_id="widget-more",moved=True)
+    up(3,id="widget-more",up_id="widget-more",moved=True)  # Pointer drift inside the same button is still a click.
+    up(4,id="widget-more",up_id=None,moved=True)  # Releasing outside the button does not click it.
+    up(5,moved=True)  # Dragging the passive surface remains gesture-only.
     surface._input.put(("key",{"key":"Tab","shift":False}))
     surface._input.put(("key",{"key":"Tab","shift":False}))
     surface._input.put(("key",{"key":"Return","shift":False}))
@@ -481,7 +483,7 @@ def test_compact_cpu_surface_routes_buttons_keyboard_and_passive_double_clicks(m
     surface._inputs()
     assert calls.count("bar") == 1 and calls.count("full") == 1
     assert len([script for script in scripts if '"widget-run")?.click()' in script]) == 2
-    assert not any('"widget-more")?.click()' in script for script in scripts)
+    assert len([script for script in scripts if '"widget-more")?.click()' in script]) == 1
     assert surface.focus_id == "widget-run"
     surface.boxes = [{"id":"widget-tab","x":0,"y":0,"w":84,"h":48}]
     assert surface._hit(10,10) is None  # A tab is passive for the mouse: single click must not expand.
