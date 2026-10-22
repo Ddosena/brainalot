@@ -32,11 +32,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from megamozg import __version__  # noqa: E402
+from megamozg.features import WORK_ENABLED  # noqa: E402
 
 BUILD = ROOT / "build"
 APP = ROOT / "dist" / "app" / "Brainalot"
 RELEASES = ROOT / "dist" / "releases"
 PACK_ID = "BrainalotApp"  # Velopack installs into %LOCALAPPDATA%\BrainalotApp; data lives in ...\Brainalot
+RELEASE_CHANNEL = "win-work" if WORK_ENABLED else "win"
 EXTENSION_SKIP = {"tests", "dev", "package.json", "node_modules"}
 
 
@@ -216,7 +218,8 @@ def velopack() -> None:
                     "--mainExe", "Brainalot.exe", "--packTitle", "Brainalot", "--packAuthors", "Brainalot",
                     "--icon", str(ROOT / "packaging" / "brand" / "brainalot.ico"),
                     "--instLicense", str(legal_root(ROOT) / "LICENSE"),
-                    "--shortcuts", "StartMenuRoot", "--framework", "webview2", "--runtime", "win-x64", "--outputDir", str(RELEASES)], check=True, cwd=ROOT)
+                    "--shortcuts", "StartMenuRoot", "--framework", "webview2", "--runtime", "win-x64",
+                    "--channel", RELEASE_CHANNEL, "--outputDir", str(RELEASES)], check=True, cwd=ROOT)
     for item in previous_packages:
         item.unlink(missing_ok=True)
     prune_release_feeds()
@@ -224,7 +227,17 @@ def velopack() -> None:
 
 def prune_release_feeds() -> None:
     """Do not publish update-feed links to build inputs removed after packing."""
-    feed_path = RELEASES / "releases.win.json"
+    feed_path = RELEASES / f"releases.{RELEASE_CHANNEL}.json"
+    legacy_name = "RELEASES" if RELEASE_CHANNEL == "win" else f"RELEASES-{RELEASE_CHANNEL}"
+    # vpk may reconstruct indexes for an older package in another channel.
+    # This artifact directory belongs only to the selected edition.
+    for other in RELEASES.glob("releases.*.json"):
+        if other.name != feed_path.name:
+            other.unlink()
+    for other in RELEASES.iterdir():
+        is_legacy_feed = other.name == "RELEASES" or other.name.startswith("RELEASES-")
+        if other.is_file() and is_legacy_feed and other.name != legacy_name:
+            other.unlink()
     feed = json.loads(feed_path.read_text(encoding="utf-8"))
     def present(name: str) -> bool:
         return isinstance(name, str) and Path(name).name == name and (RELEASES / name).is_file()
@@ -233,7 +246,7 @@ def prune_release_feeds() -> None:
                for item in feed["Assets"]):
         raise RuntimeError("Update feed is missing the current full package")
     feed_path.write_text(json.dumps(feed, separators=(",", ":")) + "\n", encoding="utf-8")
-    legacy = RELEASES / "RELEASES"
+    legacy = RELEASES / legacy_name
     if legacy.exists():
         rows = [line for line in legacy.read_text(encoding="utf-8").splitlines()
                 if len(line.split()) == 3 and present(line.split()[1])]
@@ -256,8 +269,9 @@ def extension_zip() -> Path:
 def checksums() -> None:
     lines = []
     for item in sorted(RELEASES.iterdir()):
-        # assets.win.json is vpk's local upload manifest, not a published asset.
-        if item.is_file() and item.name not in {"SHA256SUMS.txt", "assets.win.json"}:
+        # The channel-specific assets JSON is a local upload manifest, not a release asset.
+        private_manifest = item.name.startswith("assets.") and item.name.endswith(".json")
+        if item.is_file() and item.name != "SHA256SUMS.txt" and not private_manifest:
             lines.append(f"{hashlib.sha256(item.read_bytes()).hexdigest()}  {item.name}")
     (RELEASES / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

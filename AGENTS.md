@@ -1,5 +1,10 @@
 # Brainalot agent contract
 
+This checkout is the Work edition (`codex/work`). The independent edition without
+Work is `codex/no-work`; `main` remains on that stable line. Do not merge Work
+into it without the owner's explicit request. Work uses `work-v*` prereleases
+and the `win-work` update channel; the ordinary edition uses `v*` and `win`.
+
 Brainalot is a local Markdown library with a shared Python CLI. Personal data lives
 under `data/` and must never be committed, uploaded, or copied into source files.
 

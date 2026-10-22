@@ -12,8 +12,8 @@ def _fake_velopack():
     calls = []
 
     def source(kind):
-        def create(url):
-            calls.append((kind, url))
+        def create(url, **options):
+            calls.append((kind, url, options))
             return (kind, url)
         return create
 
@@ -30,6 +30,35 @@ def test_default_updates_use_public_github_release_source(monkeypatch):
     module, calls = _fake_velopack()
     assert app._update_manager(module) == ("github", "https://github.com/Ddosena/brainalot")
     assert calls[-1] == ("manager", ("github", "https://github.com/Ddosena/brainalot"))
+    assert calls[0][2] == {"prerelease": True}
+
+
+def test_non_work_build_ignores_work_prereleases(monkeypatch):
+    monkeypatch.delenv("BRAINALOT_UPDATE_URL", raising=False)
+    monkeypatch.setattr(app.features, "WORK_ENABLED", False)
+    module, calls = _fake_velopack()
+    app._update_manager(module)
+    assert calls[0][2] == {"prerelease": False}
+
+
+@pytest.mark.parametrize("channel", ["win", "win-work"])
+def test_release_directory_keeps_only_its_edition_feed(monkeypatch, tmp_path, channel):
+    import json
+    from scripts import build_release
+    monkeypatch.setattr(build_release, "RELEASES", tmp_path)
+    monkeypatch.setattr(build_release, "RELEASE_CHANNEL", channel)
+    package = tmp_path / "current.nupkg"
+    package.write_bytes(b"package")
+    feed = {"Assets": [{"Version": build_release.__version__, "Type": "Full", "FileName": package.name}]}
+    for name in ("win", "win-work"):
+        (tmp_path / f"releases.{name}.json").write_text(json.dumps(feed), encoding="utf-8")
+        legacy = "RELEASES" if name == "win" else "RELEASES-win-work"
+        (tmp_path / legacy).write_text("HASH current.nupkg 7\n", encoding="utf-8")
+    build_release.prune_release_feeds()
+    assert [p.name for p in tmp_path.glob("releases.*.json")] == [f"releases.{channel}.json"]
+    legacy_names = [p.name for p in tmp_path.iterdir() if p.name == "RELEASES" or p.name.startswith("RELEASES-")]
+    assert legacy_names == ["RELEASES" if channel == "win" else "RELEASES-win-work"]
+    assert package.read_bytes() == b"package"
 
 
 def test_http_override_uses_http_source(monkeypatch):

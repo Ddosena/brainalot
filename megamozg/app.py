@@ -17,13 +17,13 @@ import time
 from urllib.request import Request, urlopen
 import webbrowser
 
-from . import __version__, integrate, paths
+from . import __version__, features, integrate, paths
 from .runtime import Service, pick_port, port_free, read_runtime, serves_root, setup_logging
 
 _log = logging.getLogger("brainalot.app")
 MUTEX_NAME = "Local\\Brainalot.App"
 # GitHub releases are the default feed. BRAINALOT_UPDATE_URL points to a Velopack HTTP feed
-# (releases.win.json and packages), for example when a mirror is needed.
+# (releases.<installed-channel>.json and packages), for example for a mirror.
 UPDATE_REPOSITORY = "https://github.com/Ddosena/brainalot"
 UPDATE_EVERY = 6 * 3600
 
@@ -35,7 +35,9 @@ def _update_manager(velopack):
             raise ValueError("BRAINALOT_UPDATE_URL must be an HTTP(S) Velopack feed URL")
         source = velopack.HttpSource(feed_url.strip())
     else:
-        source = velopack.GithubSource(UPDATE_REPOSITORY)
+        # Work releases are prereleases on their own Velopack win-work channel.
+        # The installed package determines the channel; never switch it here.
+        source = velopack.GithubSource(UPDATE_REPOSITORY, prerelease=features.WORK_ENABLED)
     return velopack.UpdateManager(source)
 
 

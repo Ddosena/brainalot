@@ -9,6 +9,7 @@ from scripts import build_release
 
 
 def test_release_feed_does_not_advertise_removed_previous_build_inputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_release, "RELEASE_CHANNEL", "win")
     monkeypatch.setattr(build_release, "RELEASES", tmp_path)
     current = f"BrainalotApp-{build_release.__version__}-full.nupkg"
     (tmp_path / current).write_bytes(b"current package")
@@ -76,6 +77,7 @@ def test_cleanup_target_cannot_escape_dist_app(tmp_path, monkeypatch):
 
 
 def test_previous_nupkg_is_available_to_pack_then_removed_from_release_assets(tmp_path, monkeypatch):
+    monkeypatch.setattr(build_release, "RELEASE_CHANNEL", "win")
     releases = tmp_path / "dist" / "releases"
     releases.mkdir(parents=True)
     previous = releases / "BrainalotApp-0.1.37-full.nupkg"
@@ -106,6 +108,7 @@ def test_release_checksums_cover_downloads_without_private_upload_manifest(tmp_p
     (tmp_path / "BrainalotApp-win-Setup.exe").write_bytes(b"installer")
     (tmp_path / "releases.win.json").write_bytes(b"feed")
     (tmp_path / "assets.win.json").write_bytes(b"local vpk upload instructions")
+    (tmp_path / "assets.win-work.json").write_bytes(b"local Work upload instructions")
     build_release.checksums()
     rows = (tmp_path / "SHA256SUMS.txt").read_text().splitlines()
     assert {line.split("  ", 1)[1] for line in rows} == {"BrainalotApp-win-Setup.exe", "releases.win.json"}

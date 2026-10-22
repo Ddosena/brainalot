@@ -1,10 +1,10 @@
 name: release
 
-# A tag v0.1.39 builds the Windows installer, the update packages and the Chrome Web Store zip,
-# and publishes them as a GitHub release. Brainalot.exe checks this repository's releases for updates.
+# Work has its own tags, prereleases and update channel. Stable no-Work releases
+# remain on codex/no-work (and main) with the original win channel.
 on:
   push:
-    tags: ["v*"]
+    tags: ["work-v*"]
 
 permissions:
   contents: write
@@ -34,7 +34,7 @@ jobs:
         shell: python
         run: |
           import os, megamozg
-          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("work-v")
           assert tag == megamozg.__version__, (tag, megamozg.__version__)
       - name: Build tools
         run: |
@@ -43,11 +43,11 @@ jobs:
       # Signing: add the certificate here (vpk pack --signParams or --azureTrustedSignFile) before selling.
       - name: Download the previous release (for delta updates)
         continue-on-error: true
-        run: vpk download github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases
+        run: vpk download github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases --channel win-work --pre
       - name: Build the release
         run: python scripts/build_release.py
       - name: Publish
-        run: vpk upload github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases --publish --releaseName "Brainalot ${{ github.ref_name }}" --tag ${{ github.ref_name }}
+        run: vpk upload github --repoUrl ${{ github.server_url }}/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --outputDir dist/releases --channel win-work --pre --publish --releaseName "Brainalot Work ${{ github.ref_name }}" --tag ${{ github.ref_name }}
       - name: Attach the Chrome Web Store zip and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
