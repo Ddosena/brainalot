@@ -6,6 +6,7 @@
 <title>Brainalot · Work</title>
 <link rel="icon" href="icons/icon-32.png">
 <link rel="stylesheet" href="work.css">
+<link rel="stylesheet" href="work-planning.css">
 <link rel="stylesheet" href="time-ui.css">
 <style>
 html[data-work-enabled="false"] body > :not(#work-paused):not(script) { display: none !important; }
@@ -44,8 +45,13 @@ html[data-work-enabled="true"] #work-paused { display: none !important; }
     <input type="file" id="import-file" accept="application/json,.json" hidden>
   </div>
 </header>
+<nav class="work-mode-tabs" id="work-mode-tabs" aria-label="Режим Work">
+  <button type="button" id="mode-plan" aria-controls="planning-root" aria-selected="false">План</button>
+  <button type="button" id="mode-projects" aria-controls="cal-wrap" aria-selected="true">Проекты и доска</button>
+</nav>
 <div class="banner" id="banner" hidden></div>
 <section class="inbox" id="inbox" hidden></section>
+<main class="planning-root" id="planning-root" hidden></main>
 <section class="cal-wrap" id="cal-wrap"><div class="cal" id="calendar"></div></section>
 <div class="splitter" id="splitter" title="Потяните, чтобы поменять высоту календаря" data-i18n-attr="title"></div>
 <section class="board-wrap" id="board-wrap"></section>

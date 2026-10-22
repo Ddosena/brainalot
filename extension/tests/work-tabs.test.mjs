@@ -113,9 +113,14 @@ test("closing a workspace window leaves a pick-up note once; other windows are i
   assert.deepEqual(f.session.get(WS_KEY), {});
 });
 
-test("the Work button cannot open or focus Work while the release gate is closed", async () => {
+test("the enabled Work button opens once and then focuses the existing Work tab", async () => {
   const f = fixture();
-  await assert.rejects(openWorkPage(f.chrome), /Work временно отключён/);
-  assert.equal(f.tabs.length, 1);
-  assert.deepEqual(f.calls.created, []);
+  const opened = await openWorkPage(f.chrome);
+  assert.equal(opened.reused, false);
+  assert.equal(f.tabs.length, 2);
+  assert.deepEqual(f.calls.created, ["chrome-extension://mmm/work.html"]);
+  const reused = await openWorkPage(f.chrome);
+  assert.equal(reused.reused, true);
+  assert.equal(reused.tabId, opened.tabId);
+  assert.equal(f.tabs.length, 2);
 });

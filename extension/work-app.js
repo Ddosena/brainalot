@@ -10,11 +10,12 @@ import { createCalendar } from "./work-calendar.js";
 import { createDrawer } from "./work-drawer.js";
 import { createBoard } from "./work-board.js";
 import { createInbox } from "./work-inbox.js";
+import { createPlanning } from "./work-planning.js";
 import { applyDocument, localeChange, syncLocale, t } from "./i18n.js";
 
 const $ = s => document.querySelector(s);
 const THEME_KEY = "panel:theme";
-const ui = { weekStart: D.mondayOf(D.today()), days: 7, selectedId: null, editingProject: null, focusProject: false };
+const ui = { weekStart: D.mondayOf(D.today()), days: 7, selectedId: null, editingProject: null, focusProject: false, mode: "projects" };
 
 function newItem(fields) {
   return {
@@ -69,7 +70,17 @@ const ctx = {
   toast,
 };
 
-let calendar, drawer, board, inbox;
+let calendar, drawer, board, inbox, planning;
+
+function setMode(mode) {
+  ui.mode = mode;
+  document.body.classList.toggle("plan-mode", mode === "plan");
+  $("#planning-root").hidden = mode !== "plan";
+  $("#mode-plan").setAttribute("aria-selected", String(mode === "plan"));
+  $("#mode-projects").setAttribute("aria-selected", String(mode === "projects"));
+  if (mode === "plan") planning?.render();
+  else { calendar?.render(); board?.render(); }
+}
 
 function renderHeader() {
   const today = D.today();
@@ -95,8 +106,8 @@ function renderHeader() {
 
 function renderAll() {
   renderHeader();
-  calendar.render();
-  drawer.render();
+  if (ui.mode === "plan") planning?.render();
+  else { calendar.render(); drawer.render(); }
   document.body.classList.toggle("drawer-open", !!ui.selectedId);
 }
 
@@ -355,9 +366,24 @@ async function main() {
   calendar = createCalendar($("#calendar"), ctx);
   drawer = createDrawer($("#drawer"), ctx);
   board = createBoard($("#board-wrap"), ctx);
+  planning = createPlanning($("#planning-root"), {
+    get state() { return store.get(); },
+    action: store.planningAction,
+    pendingDraft: store.getPendingPlanningDraft,
+    retryDraft: store.retryPlanningDraft,
+    discardDraft: store.discardPlanningDraft,
+    openWorkspace: item => openWorkspace(item),
+    toast,
+  });
+  $("#mode-plan").onclick = () => setMode("plan");
+  $("#mode-projects").onclick = () => setMode("projects");
+  setMode(st.planning ? "plan" : "projects");
   bindChrome();
 
+  let hadPlanning = !!st.planning;
   store.subscribe(meta => {
+    if (!hadPlanning && store.get()?.planning) { hadPlanning = true; setMode("plan"); }
+    if (meta.from === "remote" && ui.mode === "plan") { renderHeader(); planning.remoteChanged(); return; }
     if (meta.from === "board" || meta.from === "quiet") return;
     if (meta.from === "drawer") { renderHeader(); calendar.render(); return; }
     renderAll();
@@ -371,6 +397,7 @@ async function main() {
   });
   store.onRemoteChange(() => {
     if (!board.isEditing()) board.render();
+    if (ui.mode === "plan") return;
     if (!document.activeElement?.closest?.("#drawer, .lane-label")) renderAll();
   });
 

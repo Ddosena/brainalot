@@ -13,6 +13,7 @@ const copy = value => structuredClone(value);
 const pageId = crypto.randomUUID?.() || uid();
 const lockKey = "work-canvas:migration-lock";
 const draftPrefix = "draft:";
+const planningDraftPrefix = "planning-draft:";
 const channel = typeof document !== "undefined" && "BroadcastChannel" in globalThis ? new BroadcastChannel("work-canvas") : null;
 let dbPromise;
 function db() {
@@ -65,6 +66,18 @@ async function draftRecords() {
     t.onerror = () => reject(t.error);
   });
 }
+async function planningDraftRecords() {
+  const database = await db();
+  return new Promise((resolve, reject) => {
+    const t = database.transaction(["kv"], "readonly"), kv = t.objectStore("kv");
+    const keys = kv.getAllKeys(), values = kv.getAll();
+    t.oncomplete = () => resolve(keys.result.map((key, i) => [key, values.result[i]])
+      .filter(([key]) => typeof key === "string" && key.startsWith(planningDraftPrefix))
+      .map(([key, value]) => ({ ...value, key }))
+      .sort((a, b) => (b.created || 0) - (a.created || 0)));
+    t.onerror = () => reject(t.error);
+  });
+}
 const draftKey = (owner, requestId) => `${draftPrefix}${owner}:${requestId}`;
 async function snapshotLegacy(saveBackup = false) {
   const database = await db();
@@ -112,6 +125,7 @@ function client() {
 
 let state = null, revision = 0, initialized = false;
 let images = new Map(), timer = null, loadPromise = null, pending = Promise.resolve(), dirty = 0, unresolved = false, committing = false, committingDraftKey = null;
+let planningPending = null, planningBusy = false;
 let statusCb, remoteCb, migrationCb, pollTimer, migrationLease, remoteMigrationUntil = 0, migrationExpiryTimer;
 let selectedDraftKey = null, supersedesDraftKey = null, lastStatus = null;
 const subs = new Set();
@@ -176,25 +190,29 @@ async function fetchImage(meta) {
   if (bytes.byteLength !== meta.size || await sha256(bytes) !== meta.blob) throw new Error(`Work image corrupt: ${meta.id}`);
   return new Blob([bytes], { type: meta.mime || "application/octet-stream" });
 }
-async function accept(remote, announce = false) {
+async function accept(remote, announce = false, protectLocal = false) {
   if (!remote.initialized || !remote.state) throw new Error("Work server returned empty state");
+  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
   const fetched = new Map();
   for (const meta of remote.images || []) fetched.set(meta.id, await fetchImage(meta));
+  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
   await tx(["kv", "canonical-images"], "readwrite", t => {
     t.objectStore("kv").put({ revision: remote.revision, state: remote.state }, "canonical-cache");
     const img = t.objectStore("canonical-images"); img.clear();
     for (const [id, blob] of fetched) img.put(blob, id);
   });
+  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
   state = copy(remote.state); revision = remote.revision; images = fetched; initialized = true;
   unresolved = false; selectedDraftKey = null;
   if (announce) broadcast();
   notify({ from: "remote" }); remoteCb?.();
+  return true;
 }
 function nonempty(snapshot) {
   return snapshot.images.length > 0 || JSON.stringify(snapshot.state) !== JSON.stringify(emptyState());
 }
 
-async function commit(next, imageMap, expected, requestId = crypto.randomUUID?.() || uid(), beforeCommit, fixedKey) {
+async function commit(next, imageMap, expected, requestId = crypto.randomUUID?.() || uid(), beforeCommit, fixedKey, restoreImport = false) {
   const entries = [...imageMap];
   const selectedAtStart = fixedKey === undefined ? selectedDraftKey : fixedKey;
   const key = selectedAtStart && (await read(selectedAtStart))?.request_id === requestId
@@ -202,14 +220,18 @@ async function commit(next, imageMap, expected, requestId = crypto.randomUUID?.(
   const oldKeyToDelete = supersedesDraftKey;
   if (committing) committingDraftKey = key;
   if (selectedDraftKey === selectedAtStart) selectedDraftKey = key;
-  await put(key, { owner: pageId, state: copy(next), images: entries, expected_revision: expected, request_id: requestId, created: Date.now() });
+  await put(key, { owner: pageId, state: copy(next), images: entries, expected_revision: expected,
+    request_id: requestId, restore_import: restoreImport, created: Date.now() });
   const { api, readImage } = client();
   const prepared = await prepareCommit(api, next, entries);
   if (beforeCommit) {
     try { await beforeCommit(); }
     catch (error) { await del(key); selectedDraftKey = null; throw error; }
   }
-  const receipt = await api("/api/work/commit", "POST", { request_id: requestId, expected_revision: expected, ...prepared });
+  const receipt = await api("/api/work/commit", "POST", {
+    request_id: requestId, expected_revision: expected, ...prepared,
+    ...(restoreImport ? { restore_import: true } : {}),
+  });
   if (receipt.revision !== expected + 1) throw new Error("Work commit revision receipt mismatch");
   const hashes = new Map(prepared.images.map(row => [row.id, row.blob]));
   await verifyCommit(api, readImage, receipt, next, entries, hashes);
@@ -312,6 +334,10 @@ export function update(fn, meta = {}) {
 export async function flush() {
   clearTimeout(timer); timer = null;
   await load();
+  if (planningPending) {
+    await planningPending;
+    return dirty ? flush() : undefined;
+  }
   if (unresolved) throw new Error("Resolve the unconfirmed Work draft before saving");
   if (committing) {
     await pending;
@@ -325,12 +351,96 @@ export async function flush() {
       const expected = revision;
       const draft = batchDraftKey ? await read(batchDraftKey) : null;
       if (draft && draft.expected_revision !== expected) throw Object.assign(new Error("Work draft revision conflict"), { status: 409 });
-      await commit(next, imgs, expected, draft?.request_id, undefined, batchDraftKey);
+      await commit(next, imgs, expected, draft?.request_id, undefined, batchDraftKey,
+        draft?.restore_import === true);
       if (dirty === batch) dirty = 0;
       else { dirty -= batch; timer ??= setTimeout(() => { void flush().catch(() => {}); }, 0); }
     } catch (error) { unresolved = true; status(error?.status === 409 ? "conflict" : "error", error); throw error; }
   }).finally(() => { committing = false; committingDraftKey = null; });
   return pending;
+}
+export async function getPendingPlanningDraft() {
+  const draft = (await planningDraftRecords())[0];
+  return draft ? { key: draft.key, action: draft.body?.action, created: draft.created,
+    expected_revision: draft.body?.expected_revision } : null;
+}
+async function sendPlanningDraft(draft) {
+  if (planningPending) throw new Error("Planning save is already in progress");
+  const operation = (async () => {
+    try {
+      const remote = await client().api("/api/work/planning", "POST", draft.body);
+      if (!remote?.initialized || !remote.state || !remote.state.planning ||
+          remote.revision !== draft.body.expected_revision + 1) {
+        throw new Error("Planning response is not a confirmed Work revision");
+      }
+      // The planning endpoint changes only state.planning. Local board, drawer,
+      // and image edits made during the request stay in memory and flush at the
+      // new revision; the canonical server snapshot remains cached separately.
+      await put("canonical-cache", { revision: remote.revision, state: copy(remote.state) });
+      await del(draft.key);
+      if (dirty) state.planning = copy(remote.state.planning);
+      else state = copy(remote.state);
+      revision = remote.revision;
+      initialized = true;
+      broadcast(); if (!dirty) status("saved");
+      notify({ from: "planning" }); remoteCb?.();
+      return remote;
+    } catch (error) {
+      // Validation failures are definitive: the service did not apply the
+      // request, so the user may correct fields and submit a fresh one.
+      if (error?.status === 422) await del(draft.key);
+      status(error?.status === 409 ? "planning-conflict" : "planning-error", error);
+      throw error;
+    }
+  })();
+  planningPending = operation.finally(() => {
+    planningPending = null;
+    if (dirty) timer ??= setTimeout(() => { void flush().catch(() => {}); }, 0);
+  });
+  return planningPending;
+}
+export async function planningAction(action, data = {}) {
+  if (planningBusy) throw new Error("Planning save is already in progress");
+  planningBusy = true;
+  try {
+    await load(); writable();
+    if (planningPending) await planningPending;
+    await flush(); writable();
+    if ((await planningDraftRecords()).length) throw new Error("Unconfirmed planning action: retry the saved request first");
+    const requestId = crypto.randomUUID?.() || uid();
+    const key = `${planningDraftPrefix}${pageId}:${requestId}`;
+    const draft = { key, created: Date.now(), body: {
+      request_id: requestId, expected_revision: revision, action, data: copy(data),
+    } };
+    await put(key, { created: draft.created, body: draft.body });
+    return await sendPlanningDraft(draft);
+  } finally { planningBusy = false; }
+}
+export async function retryPlanningDraft() {
+  if (planningBusy) throw new Error("Planning save is already in progress");
+  planningBusy = true;
+  try {
+    await load();
+    if (locked() || migrationLease) throw new Error("Work migration in progress");
+    if (planningPending) return await planningPending;
+    const draft = (await planningDraftRecords())[0];
+    if (!draft?.body) throw new Error("No recoverable planning request");
+    return await sendPlanningDraft(draft);
+  } finally { planningBusy = false; }
+}
+export async function discardPlanningDraft() {
+  await load();
+  if (planningBusy || planningPending) throw new Error("Planning save is still in progress");
+  if (dirty) await flush();
+  if (unresolved || selectedDraftKey) throw new Error("Resolve the Work draft before discarding the planning request");
+  const draft = (await planningDraftRecords())[0];
+  if (!draft) return false;
+  const remote = await client().api("/api/work/state");
+  if (!remote?.initialized || !remote.state) throw new Error("Cannot refresh Work before discarding the request");
+  await accept(remote, true);
+  await del(draft.key);
+  status("saved");
+  return true;
 }
 export async function replace(next) {
   writable(); state = copy(next); dirty++; notify({ from: "replace" });
@@ -339,8 +449,14 @@ export async function replace(next) {
 // JSON import replaces both halves of the Work snapshot in one server CAS commit.
 export async function replaceWithImages(next, pairs) {
   await load(); writable();
+  await flush(); writable();
   const replacement = new Map(pairs);
   if (replacement.size !== pairs.length) throw new Error("Duplicate Work image ID");
+  const requestId = crypto.randomUUID?.() || uid();
+  const key = draftKey(pageId, requestId);
+  await put(key, { owner: pageId, state: copy(next), images: [...replacement],
+    expected_revision: revision, request_id: requestId, restore_import: true, created: Date.now() });
+  selectedDraftKey = key;
   state = copy(next); images = replacement; dirty++;
   notify({ from: "replace" });
   return flush();
@@ -372,14 +488,14 @@ export async function imgPut(id, blob) {
 export async function imgAll() { await load(); return [...images]; }
 
 async function checkRemote() {
-  if (dirty || migrationLease || locked()) return;
+  if (dirty || planningPending || migrationLease || locked() || (await planningDraftRecords()).length) return;
   if (selectedDraftKey) {
     if (await read(selectedDraftKey)) return;
     selectedDraftKey = null; unresolved = false;
   }
   try {
     const remote = await client().api("/api/work/state");
-    if (remote.initialized && remote.revision > revision) await accept(remote);
+    if (!planningBusy && !planningPending && !dirty && remote.initialized && remote.revision > revision) await accept(remote, false, true);
   } catch { /* Retain the last verified state until the next poll. */ }
 }
 if (channel) channel.onmessage = event => {
@@ -439,7 +555,7 @@ export async function retryDraft({ expectedRevision, state: resolvedState } = {}
     supersedesDraftKey = oldKey;
     await put(selectedDraftKey, {
       owner: pageId, state: copy(state), images: [...images], expected_revision: revision,
-      request_id: requestId, created: Date.now(),
+      request_id: requestId, restore_import: draft.restore_import === true, created: Date.now(),
     });
   } else {
     selectedDraftKey = oldKey;

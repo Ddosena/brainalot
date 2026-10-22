@@ -204,8 +204,12 @@ def run(root: Path) -> int:
                         target = output / f"{name}.png"
                         _screenshot(host.full, target)
                         report["screenshots"][name] = str(target)
-                report["work_disabled"] = not _js(host.full, "!document.querySelector('[data-view=work]').hidden")
+                report["work_enabled"] = bool(_js(host.full, "!document.querySelector('[data-view=work]').hidden"))
                 host.open_page("work.html")
+                _until(lambda: "work.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
+                _until(lambda: _js(host.full, "document.getElementById('desktop-content')?.contentDocument?.documentElement?.dataset?.workEnabled") == "true")
+                report["work_loaded"] = True
+                host.open_page("panel.html")
                 _until(lambda: "panel.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 state = _request(port, token, "/api/time/state")
                 if peer:
@@ -338,7 +342,7 @@ def run(root: Path) -> int:
         if service:
             service.stop()
         report["ok"] = (not report.get("fatal") and len(report["views"]) == 3
-                        and report.get("work_disabled") is True
+                        and report.get("work_enabled") is True and report.get("work_loaded") is True
                         and len(report["widget"]) == 2
                         and not report["errors"]
                         and report.get("time_start") == "running"

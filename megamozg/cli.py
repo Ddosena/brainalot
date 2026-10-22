@@ -128,6 +128,18 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--agent", default="agent", help="Кто предлагает: codex или claude")
     listing_proposals = work_commands.add_parser("proposals", help="Предложения и их статус")
     listing_proposals.add_argument("--status", default="pending", choices=["pending", "accepted", "rejected", "all"])
+    plan = work_commands.add_parser("plan", help="Локальный план Work без чтения корпуса курсов")
+    plan_commands = plan.add_subparsers(dest="plan_command", required=True, parser_class=Parser)
+    plan_commands.add_parser("status", help="Компактное состояние, риски и ближайшие дни")
+    plan_import = plan_commands.add_parser("import", help="Слить planning seed с текущим Work через CAS")
+    plan_import.add_argument("--file", type=Path, required=True)
+    plan_replan = plan_commands.add_parser("replan", help="Явно пересчитать оставшийся план")
+    plan_replan.add_argument("--from", dest="from_date")
+    plan_replan.add_argument("--reason", default="agent")
+    plan_replan.add_argument("--refresh-calendar", action="store_true")
+    plan_command = plan_commands.add_parser("command", help="Типизированная команда Work planning с CAS и request_id")
+    plan_command.add_argument("--file", type=Path, required=True,
+                              help="JSON {request_id,expected_revision,action,data}; тот же контракт, что у API")
     return parser
 
 
@@ -138,6 +150,29 @@ def _chats_command(root: Path, args) -> dict:
     from . import telegram_chats
     from .chats import ChatStore
     from .work_inbox import WorkInbox
+    if args.command == "work" and args.work_command == "plan":
+        from uuid import uuid4
+        from .work_store import WorkStore
+        from .work_planning import compact_status
+        work = WorkStore(root)
+        snapshot = work.read()
+        if args.plan_command == "status":
+            return compact_status(snapshot)
+        if args.plan_command == "command":
+            command = json.loads(_read_input(None, args.file, "JSON команды Work planning"))
+            return compact_status(work.planning_operation(command))
+        if args.plan_command == "import":
+            imported = json.loads(_read_input(None, args.file, "JSON planning seed"))
+            planning = imported.get("planning", imported) if isinstance(imported, dict) else imported
+            data = {"planning": planning}
+            action = "import"
+        else:
+            data = {"reason": args.reason, "refresh_calendar": args.refresh_calendar}
+            if args.from_date:
+                data["from_date"] = args.from_date
+            action = "recalculate"
+        return compact_status(work.planning_operation({"request_id": uuid4().hex,
+            "expected_revision": snapshot["revision"], "action": action, "data": data}))
 
     store = ChatStore(root)
     if args.command == "chats":

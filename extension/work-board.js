@@ -6,6 +6,7 @@ import { t } from "./i18n.js";
 import { uid, imgGet, imgPut } from "./work-store.js";
 
 const NOTE_COLORS = ["yellow", "pink", "green", "blue", "violet", "white"];
+const DEFAULT_VIEW = { x: 40, y: 28, z: 1 };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const isTyping = n => n && (n.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(n.tagName));
 
@@ -39,7 +40,26 @@ export function createBoard(root, ctx) {
   let act = null;
   let lastColor = "yellow";
 
-  const cur = () => ctx.state.boards.find(b => b.id === ctx.state.view.board) || ctx.state.boards[0];
+  const cur = () => {
+    const st = ctx.state;
+    // Older Work snapshots may have a board without view, or no boards yet.
+    // Fill only missing structure; keep existing notes and unknown fields.
+    if (!Array.isArray(st.boards)) st.boards = [];
+    if (!st.boards.length) st.boards.push({ id: "general", items: [] });
+    if (!st.view || typeof st.view !== "object") st.view = {};
+    const board = st.boards.find(b => b.id === st.view.board) || st.boards[0];
+    if (!st.view.board) st.view.board = board.id;
+    return board;
+  };
+  const currentView = () => {
+    const board = cur(), old = board.view;
+    if (!old || !Number.isFinite(old.x) || !Number.isFinite(old.y) || !Number.isFinite(old.z) || old.z <= 0) {
+      board.view = { ...old, x: Number.isFinite(old?.x) ? old.x : DEFAULT_VIEW.x,
+        y: Number.isFinite(old?.y) ? old.y : DEFAULT_VIEW.y,
+        z: Number.isFinite(old?.z) && old.z > 0 ? old.z : DEFAULT_VIEW.z };
+    }
+    return board.view;
+  };
   const find = id => cur().items.find(i => i.id === id);
   const save = () => ctx.update(null, { from: "board" });
 
@@ -51,6 +71,7 @@ export function createBoard(root, ctx) {
   }
 
   function renderTabs() {
+    cur();
     tabsEl.innerHTML = ctx.state.boards.map(b => {
       const p = b.project && ctx.state.projects.find(x => x.id === b.project);
       const name = p ? p.name : t("Общая");
@@ -65,7 +86,7 @@ export function createBoard(root, ctx) {
   }
 
   function applyView() {
-    const v = cur().view;
+    const v = currentView();
     world.style.transform = `translate(${v.x}px, ${v.y}px) scale(${v.z})`;
     const g = 24 * v.z;
     boardEl.style.backgroundSize = `${g}px ${g}px`;
@@ -108,7 +129,7 @@ export function createBoard(root, ctx) {
 
   function toWorld(cx, cy) {
     const r = boardEl.getBoundingClientRect();
-    const v = cur().view;
+    const v = currentView();
     return { x: (cx - r.left - v.x) / v.z, y: (cy - r.top - v.y) / v.z };
   }
 
@@ -227,7 +248,7 @@ export function createBoard(root, ctx) {
     const onHandle = e.target.classList.contains("bi-rs");
     if (n && n.dataset.id === editingId && !onHandle) return;
     finishEdit();
-    const v = cur().view;
+    const v = currentView();
     if (!n || e.button === 1) {
       select(null);
       act = { mode: "pan", x0: e.clientX, y0: e.clientY, vx: v.x, vy: v.y, moved: false };
@@ -255,7 +276,7 @@ export function createBoard(root, ctx) {
     const dx = e.clientX - act.x0, dy = e.clientY - act.y0;
     if (!act.moved && Math.hypot(dx, dy) < 3) return;
     act.moved = true;
-    const v = cur().view;
+    const v = currentView();
     if (act.mode === "pan") {
       v.x = act.vx + dx;
       v.y = act.vy + dy;
@@ -305,7 +326,7 @@ export function createBoard(root, ctx) {
   let viewTimer = null;
   boardEl.addEventListener("wheel", e => {
     e.preventDefault();
-    const v = cur().view;
+    const v = currentView();
     const r = boardEl.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
     const z = clamp(v.z * Math.exp(-e.deltaY * 0.0015), 0.2, 3);

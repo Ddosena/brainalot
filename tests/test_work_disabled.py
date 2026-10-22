@@ -11,6 +11,12 @@ from megamozg.time_tracking import TimeStore
 from megamozg.work_store import WorkStore
 
 
+@pytest.fixture(autouse=True)
+def paused_release_gate(monkeypatch):
+    # Regression coverage for the retained emergency pause switch. The release enables Work.
+    monkeypatch.setattr("megamozg.features.WORK_ENABLED", False)
+
+
 def test_paused_work_routes_and_tasks_preserve_data(tmp_path):
     store = Store(tmp_path)
     note = store.capture("Library task", kind="task")

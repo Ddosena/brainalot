@@ -344,8 +344,13 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.post("/api/work/commit")
     async def work_commit(request: Request):
-        data = await payload(request, {"request_id", "expected_revision", "state_blob", "images"})
+        data = await payload(request, {"request_id", "expected_revision", "state_blob", "images", "restore_import"})
         return await run_in_threadpool(work.commit, data)
+
+    @app.post("/api/work/planning")
+    async def work_planning(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "action", "data"})
+        return await run_in_threadpool(work.planning_operation, data)
 
     @app.get("/api/work/images/{image_id}")
     def work_image(image_id: str):

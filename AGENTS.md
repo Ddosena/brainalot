@@ -16,6 +16,12 @@ When acting as the user's librarian:
 
 Useful commands:
 
+For Work progress, weekly planning, and rescheduling, read
+`docs/work-planning-agent-runbook.md`. Start with `mmm work plan status`, not the
+whole conversation or course archive. Save partial completion and actual time
+separately. Use typed planning commands with revision/request IDs, preserve
+locked cubes, and include lessons, live webinars and weekly review in the day cap.
+
 ```powershell
 .venv\Scripts\python.exe -m megamozg dashboard
 .venv\Scripts\python.exe -m megamozg list

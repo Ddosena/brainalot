@@ -6,30 +6,23 @@ import { WORK_ENABLED, WORK_PAUSED_MESSAGE, browserActionAllowed, workCommandDis
 
 const source = file => readFile(new URL(`../${file}`, import.meta.url), "utf8");
 
-test("Work entry cannot load its old app or migrate IndexedDB while paused", async () => {
-  assert.equal(WORK_ENABLED, false);
+test("Work is enabled and keeps the conditional pause loader", async () => {
+  assert.equal(WORK_ENABLED, true);
   const page = await source("work.html");
   assert.match(page, /<script type="module" src="work-paused\.js"><\/script>/);
   assert.doesNotMatch(page, /<script[^>]+src="work-app\.js"/);
   assert.match(page, /Ваши задачи, доски и изображения сохранены/);
-  const prior = { chrome: globalThis.chrome, document: globalThis.document, indexedDB: globalThis.indexedDB };
-  try {
-    globalThis.chrome = { storage: { local: { get: async () => ({}) } } };
-    globalThis.document = { documentElement: { dataset: {} }, querySelectorAll: () => [] };
-    Object.defineProperty(globalThis, "indexedDB", { configurable: true, get() { throw new Error("Work data was opened"); } });
-    await import(`../work-paused.js?gate=${Date.now()}`);
-  } finally {
-    globalThis.chrome = prior.chrome;
-    globalThis.document = prior.document;
-    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: prior.indexedDB, writable: true });
-  }
+  const loader = await source("work-paused.js");
+  assert.ok(loader.includes('if (WORK_ENABLED)'));
+  assert.ok(loader.includes('await import("./work-app.js")'));
 });
 
-test("old Work and chat commands are blocked before they reach the service", async () => {
+test("Work is available and the retained pause helpers still protect data", async () => {
   assert.match(WORK_PAUSED_MESSAGE, /сохранены/);
   for (const type of ["work-snapshot", "work-proposals", "work-proposal-resolve", "chats-status",
     "chats-sync", "chats-remove", "chat-setup", "chat-connect"]) {
-    assert.equal(workCommandDisabled(type), true, type);
+    assert.equal(workCommandDisabled(type), false, type);
+    assert.equal(workCommandDisabled(type, false), true, type);
   }
   assert.equal(workCommandDisabled("capture"), false);
   const worker = await source("background.js");
@@ -39,7 +32,8 @@ test("old Work and chat commands are blocked before they reach the service", asy
   assert.match(worker, /brainalot-chat-stop/);
   assert.equal(browserActionAllowed("active-tab"), true);
   for (const action of ["open-workspace", "stop-workspace", "capture-workspace", "chat-setup", "chat-connect"]) {
-    assert.equal(browserActionAllowed(action), false, action);
+    assert.equal(browserActionAllowed(action), true, action);
+    assert.equal(browserActionAllowed(action, false), false, action);
   }
   const desktop = await source("desktop.html");
   assert.match(desktop, /data-view="work" hidden/);
