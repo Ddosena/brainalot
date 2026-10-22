@@ -50,6 +50,20 @@ export function builderDaySummary(day, allCubes, completed = {}, budget = 300) {
     unused_capacity_minutes: available }, selected, completed, budget) };
 }
 
+export async function preserveTimedCubeBeforeSegment(planning, segmentId, { timerState, stopTimer, recordedMinutes, action }) {
+  const active = (planning?.result?.cubes || []).find(cube => cube.segment_id === segmentId &&
+    ["running", "paused"].includes(timerState(cube)?.status));
+  if (!active) return false;
+  await stopTimer(active);
+  const recorded = Math.max(0, Math.round(numeric(await recordedMinutes(active))));
+  const saved = Math.max(0, numeric(planning?.completed_cubes?.[active.id]?.actual_minutes ?? active.actual_minutes));
+  if (recorded > saved) {
+    const percent = numeric(planning?.completed_cubes?.[active.id]?.percent ?? active.progress_percent);
+    await action("cube_progress", { cube_id: active.id, percent, actual_minutes: recorded });
+  }
+  return true;
+}
+
 export function taskRemaining(task, planning) {
   const canonical = (planning?.result?.tasks || []).find(row => row.id === task.id || row.task_id === task.id);
   if (canonical?.remaining_minutes != null) return Math.max(0, numeric(canonical.remaining_minutes));
@@ -98,10 +112,11 @@ export function createPlanning(root, ctx) {
     pending = await ctx.pendingDraft();
     render();
   }
-  async function run(action, data) {
+  async function run(action, data, before = null) {
     if (busy || pending) return;
     busy = true; error = ""; message = t("Сохраняем в Work…"); render();
     try {
+      if (before) await before();
       const response = await ctx.action(action, data);
       const released = response?.state?.planning?.result?.released_reservations?.length || 0;
       message = released ? t("Этап обновлён; {count} свободных кубиков возвращено в пул.", { count: released }) :
@@ -587,15 +602,10 @@ export function createPlanning(root, ctx) {
     if (action === "save-segment-progress") {
       if (!selectedSegmentId) return;
       const percent = Number(root.querySelector("#plan-segment-percent")?.value);
-      if (percent === 100) {
-        const active = (p.result?.cubes || []).find(item => item.segment_id === selectedSegmentId &&
-          ["running", "paused"].includes(cubeTimerState(item).status));
-        if (active) {
-          try { await stopCubeTimer(active); }
-          catch (cause) { error = t("Сначала остановите таймер: {error}", { error: cause.message }); render(); return; }
-        }
-      }
-      return run("segment_progress", { segment_id: selectedSegmentId, percent });
+      return run("segment_progress", { segment_id: selectedSegmentId, percent }, percent === 100 ?
+        () => preserveTimedCubeBeforeSegment(p, selectedSegmentId, {
+          timerState: cubeTimerState, stopTimer: stopCubeTimer, recordedMinutes: recordedCubeMinutes, action: ctx.action,
+        }) : null);
     }
     if (action === "create-segment") {
       const title = root.querySelector("#plan-new-segment-title")?.value.trim();

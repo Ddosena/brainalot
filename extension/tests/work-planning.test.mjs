@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { daySummary, builderDaySummary, taskRemaining, clampDate } from "../work-planning.js";
+import { daySummary, builderDaySummary, taskRemaining, clampDate, preserveTimedCubeBeforeSegment } from "../work-planning.js";
 
 test("day totals keep calendar, planned, credited and actual time distinct", () => {
   const day = { date: "2030-03-04", fixed_minutes: 105 };
@@ -44,6 +44,53 @@ test("builder energy excludes unselected AUTO forecast and keeps a 45-minute ope
   assert.deepEqual(filled.selected.map(c => c.id), ["manual"]);
   assert.equal(filled.total, 300);
   assert.equal(filled.free, 0);
+});
+
+test("segment 100 saves measured cube minutes before releasing unstarted reservations", async () => {
+  const planning = { result: { cubes: [{ id: "cube", segment_id: "stage", minutes: 90,
+    progress_percent: 0, actual_minutes: 0, manual: true }] }, completed_cubes: {} };
+  const calls = [];
+  let running = true, reserved = true;
+  const action = async (name, data) => {
+    calls.push(name);
+    if (name === "cube_progress") planning.completed_cubes.cube = { percent: data.percent, actual_minutes: data.actual_minutes };
+    if (name === "segment_progress") {
+      if (!planning.completed_cubes.cube?.actual_minutes) reserved = false;
+    }
+  };
+  await preserveTimedCubeBeforeSegment(planning, "stage", {
+    timerState: () => ({ status: running ? "running" : "idle" }),
+    stopTimer: async () => { running = false; calls.push("stop"); },
+    recordedMinutes: async () => 20,
+    action,
+  });
+  await action("segment_progress", { segment_id: "stage", percent: 100 });
+  assert.deepEqual(calls, ["stop", "cube_progress", "segment_progress"]);
+  assert.deepEqual(planning.completed_cubes.cube, { percent: 0, actual_minutes: 20 });
+  assert.equal(reserved, true);
+
+  // An older or shorter timer result must never overwrite a larger saved fact.
+  planning.completed_cubes.cube.actual_minutes = 25;
+  running = true;
+  calls.length = 0;
+  await preserveTimedCubeBeforeSegment(planning, "stage", {
+    timerState: () => ({ status: running ? "paused" : "idle" }),
+    stopTimer: async () => { running = false; calls.push("stop"); },
+    recordedMinutes: async () => 20,
+    action,
+  });
+  assert.deepEqual(calls, ["stop"]);
+  assert.equal(planning.completed_cubes.cube.actual_minutes, 25);
+
+  running = true;
+  calls.length = 0;
+  await assert.rejects(preserveTimedCubeBeforeSegment(planning, "stage", {
+    timerState: () => ({ status: running ? "running" : "idle" }),
+    stopTimer: async () => { running = false; calls.push("stop"); },
+    recordedMinutes: async () => 30,
+    action: async name => { calls.push(name); throw new Error("CAS conflict"); },
+  }), /CAS conflict/);
+  assert.deepEqual(calls, ["stop", "cube_progress"]);
 });
 
 function browserStorage() {

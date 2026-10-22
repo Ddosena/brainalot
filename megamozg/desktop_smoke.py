@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
 from pathlib import Path
 import time
@@ -206,11 +208,27 @@ def run(root: Path) -> int:
                         _screenshot(host.full, target)
                         report["screenshots"][name] = str(target)
                 report["work_enabled"] = bool(_js(host.full, "!document.querySelector('[data-view=work]').hidden"))
+                # This owned test profile has no Chrome migration. Initialize a
+                # synthetic Work explicitly before testing its operational UI.
+                work = _request(port, token, "/api/work/state")
+                if not work["initialized"]:
+                    document = {"version": 1, "projects": [{"id": "native-course", "name": "Native planning course", "color": "teal"}],
+                                "items": [], "boards": [{"id": "general", "view": {"x": 40, "y": 28, "z": 1}, "items": []}],
+                                "view": {"board": "general", "days": 7}}
+                    raw = json.dumps(document).encode("utf-8")
+                    digest = hashlib.sha256(raw).hexdigest()
+                    _request(port, token, f"/api/work/blobs/{digest}/chunks", {
+                        "index": 0, "total": 1, "content_base64": base64.b64encode(raw).decode("ascii")})
+                    _request(port, token, "/api/work/commit", {
+                        "request_id": "desktop-smoke-work-init", "expected_revision": work["revision"], "state_blob": digest, "images": []})
                 host.open_page("work.html")
                 _until(lambda: "work.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 _until(lambda: _js(host.full, "document.getElementById('desktop-content')?.contentDocument?.documentElement?.dataset?.workEnabled") == "true")
                 report["work_loaded"] = True
+                report["work_expansion_stage"] = "waiting_for_button"
+                report["work_expansion_initial"] = _js(host.full, """(() => {const f=document.getElementById('desktop-content');const d=f?.contentDocument;return {ready:d?.readyState,button:!!d?.getElementById('work-fullscreen'),text:d?.body?.innerText?.slice(0,900)}})()""")
                 _until(lambda: _js(host.full, "!!document.getElementById('desktop-content')?.contentDocument?.getElementById('work-fullscreen')?.onclick"))
+                report["work_expansion_stage"] = "waiting_for_parent_expansion"
                 before_work = native_rect(host.full)
                 _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').click()")
                 _until(lambda: _js(host.full, "document.body.classList.contains('work-expanded')"))
@@ -218,13 +236,16 @@ def run(root: Path) -> int:
                 area = select_area(expanded_work, host._areas())
                 if abs(expanded_work["width"] - area.width) > 2 or abs(expanded_work["height"] - area.height) > 2:
                     raise RuntimeError("Work did not expand to monitor work area")
+                report["work_expansion_stage"] = "waiting_for_child_acknowledgement"
                 _until(lambda: _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').getAttribute('aria-pressed')") == "true")
                 _js(host.full, "document.getElementById('desktop-content').contentDocument.getElementById('work-fullscreen').click()")
+                report["work_expansion_stage"] = "waiting_for_restore"
                 _until(lambda: not _js(host.full, "document.body.classList.contains('work-expanded')"))
                 restored_work = native_rect(host.full)
                 if any(abs(restored_work[key] - before_work[key]) > 2 for key in ("x", "y", "width", "height")):
                     raise RuntimeError("Work did not restore its previous window bounds")
                 report["work_expansion"] = {"before": before_work, "expanded": expanded_work, "restored": restored_work}
+                report["work_expansion_stage"] = "verified"
                 host.open_page("panel.html")
                 _until(lambda: "panel.html" in (_js(host.full,"document.getElementById('desktop-content')?.src") or ""))
                 state = _request(port, token, "/api/time/state")
@@ -331,7 +352,6 @@ def run(root: Path) -> int:
                 report["lifetime_totals"] = _request(port, token, "/api/time/totals")
                 _js(host.widget, "document.getElementById('widget-run').click(); true")
                 _until(lambda: _request(port, token, "/api/time/state")["status"] == "paused")
-                from .desktop_geometry import native_rect
                 report["native"] = {"full": {"rect": native_rect(host.full),
                     "topmost": bool(host.full.native.TopMost), "frameless": str(host.full.native.FormBorderStyle)},
                     "widget": {"rect": native_rect(host.widget), "topmost": bool(host.widget.native.TopMost)}}
