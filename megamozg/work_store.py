@@ -22,6 +22,9 @@ class WorkStore(SharedState):
             db.execute("CREATE TABLE IF NOT EXISTS work_blobs (hash TEXT PRIMARY KEY, body BLOB NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS work_chunks (hash TEXT, idx INTEGER, total INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(hash,idx))")
             db.execute("CREATE TABLE IF NOT EXISTS work_versions (revision INTEGER PRIMARY KEY, created INTEGER NOT NULL, state_blob TEXT NOT NULL, images TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS work_cube_deletes (request_id TEXT PRIMARY KEY, command TEXT NOT NULL, status TEXT NOT NULL, note_id TEXT, note_version TEXT, operation_id TEXT, state_blob TEXT NOT NULL, images TEXT NOT NULL, error TEXT)")
+        from .work_delete import recover
+        recover(self)
 
     @staticmethod
     def _hash(value):
@@ -90,8 +93,28 @@ class WorkStore(SharedState):
                     state=state, images=json.loads(row["images"]))
 
     def read(self):
+        from .work_delete import recover, metadata
+        recover(self)
         with self.db() as db:
-            return self._read(db)
+            result = self._read(db)
+            state = metadata(db)
+            if state is not None:
+                result["deletion_state"] = state
+            return result
+
+    @staticmethod
+    def _guard_deletions(previous, incoming, *, allow_remaining_epoch=False):
+        before = (previous or {}).get("cube_deletions", {})
+        after = (incoming or {}).get("cube_deletions", {})
+        if before != after:
+            raise ConflictError("Нельзя восстановить или изменить удалённые этапы обычным импортом/восстановлением Work")
+        if not allow_remaining_epoch and (previous or {}).get("remaining_epochs", {}) != (incoming or {}).get("remaining_epochs", {}):
+            raise ConflictError("Нельзя изменить базу остатка обычным восстановлением Work")
+        for cube_id in before:
+            old = previous.get("constructor", {}).get("cubes", {}).get(cube_id)
+            new = (incoming or {}).get("constructor", {}).get("cubes", {}).get(cube_id)
+            if old != new:
+                raise ConflictError("История удалённого этапа защищена от изменения")
 
     def _validate(self, db, digest, images):
         self._hash(digest)
@@ -158,7 +181,10 @@ class WorkStore(SharedState):
         return descriptors
 
     def commit(self, command):
+        from .work_delete import recover, ensure_writable
+        recover(self)
         with self.db() as db:
+            ensure_writable(db)
             if "restore_import" in command and type(command["restore_import"]) is not bool:
                 raise ValidationError("restore_import: требуется bool")
             old = self.receipt(db, "work", command)
@@ -170,6 +196,7 @@ class WorkStore(SharedState):
             descriptors = self._validate(db, command.get("state_blob"), command.get("images"))
             incoming = json.loads(self._blob(db, command["state_blob"]))
             previous = json.loads(self._blob(db, current["state_blob"])) if current else {}
+            self._guard_deletions(previous.get("planning"), incoming.get("planning"))
             # A round trip of read-time defaults is not a planning edit.
             from .work_planning import project_task_importance
             for document in (incoming, previous):
@@ -195,6 +222,10 @@ class WorkStore(SharedState):
         if not isinstance(command, dict) or set(command) != {"request_id", "expected_revision", "action", "data"}:
             raise ValidationError("planning: нужны request_id, expected_revision, action, data")
         action, data = command["action"], command["data"]
+        from .work_delete import delete_cube, recover, ensure_writable
+        if action == "cube_delete":
+            return delete_cube(self, command)
+        recover(self)
         if action not in {"import", "recalculate", "cube_progress", "day_outcome", "place_cube", "resource",
                           "capacity_override", "weekly_review_done", "describe_cubes",
                           "day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
@@ -205,6 +236,7 @@ class WorkStore(SharedState):
         if not isinstance(data, dict):
             raise ValidationError("planning.data: требуется объект")
         with self.db() as db:
+            ensure_writable(db)
             old = self.receipt(db, "work", command)
             if old is not None:
                 return old
@@ -244,6 +276,16 @@ class WorkStore(SharedState):
                 })
                 existing_items.add(item_id)
             previous = state.get("planning")
+            previous_deletions = (previous or {}).get("cube_deletions", {})
+            previous_epochs = (previous or {}).get("remaining_epochs", {})
+            if "remaining_epochs" in planning and planning["remaining_epochs"] != previous_epochs:
+                raise ConflictError("remaining_epochs: служебное поле")
+            if previous_epochs:
+                planning["remaining_epochs"] = deepcopy(previous_epochs)
+            if "cube_deletions" in planning and planning["cube_deletions"] != previous_deletions:
+                raise ConflictError("cube_deletions меняется только через cube_delete")
+            if previous_deletions:
+                planning["cube_deletions"] = deepcopy(previous_deletions)
             previous_monthly = previous.get("monthly_plan") if isinstance(previous, dict) else None
             if "monthly_plan" in planning and planning["monthly_plan"] != previous_monthly:
                 raise ValidationError("План месяца согласуется только через monthly_plan_approve")
@@ -266,6 +308,13 @@ class WorkStore(SharedState):
                 outcomes = {(x["task_id"], x["date"]): x for x in planning["day_outcomes"]}
                 outcomes.update({(x["task_id"], x["date"]): x for x in previous.get("day_outcomes", [])})
                 planning["day_outcomes"] = list(outcomes.values())
+                from .work_planning import latest_remaining_baseline
+                for task in planning["tasks"]:
+                    tid = task["id"]
+                    latest = latest_remaining_baseline(planning, tid)
+                    if latest and latest != latest_remaining_baseline(previous, tid):
+                        epochs = planning.setdefault("remaining_epochs", {})
+                        epochs[tid] = epochs.get(tid, 0)+1
                 locks = {x["cube_id"]: x for x in planning["locks"]}
                 locks.update({x["cube_id"]: x for x in previous.get("locks", [])})
                 planning["locks"] = list(locks.values())
@@ -378,9 +427,11 @@ class WorkStore(SharedState):
                                       allow_new=action != "import")
             _refresh_constructor_result(planning)
         state["planning"] = planning
+        self._guard_deletions(allocation_baseline, planning, allow_remaining_epoch=action in {"day_outcome", "import"})
         encoded_state = encoded(state).encode("utf-8")
         digest = hashlib.sha256(encoded_state).hexdigest()
         with self.db() as db:
+            ensure_writable(db)
             old = self.receipt(db, "work", command)
             if old is not None:
                 return old
@@ -397,7 +448,10 @@ class WorkStore(SharedState):
             return {"revisions": [dict(r) for r in db.execute("SELECT revision,created FROM work_versions ORDER BY revision DESC")]}
 
     def restore(self, command):
+        from .work_delete import recover, ensure_writable
+        recover(self)
         with self.db() as db:
+            ensure_writable(db)
             old = self.receipt(db, "work_restore", command)
             if old is not None:
                 return old
@@ -408,6 +462,9 @@ class WorkStore(SharedState):
             target = self._version(db, command["revision"])
             if target is None:
                 raise NotFoundError("Версия Work не найдена")
+            previous = json.loads(self._blob(db, current["state_blob"])) if current else {}
+            incoming = json.loads(self._blob(db, target["state_blob"]))
+            self._guard_deletions(previous.get("planning"), incoming.get("planning"))
             db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (current["revision"] + 1, int(time.time()*1000),
                        target["state_blob"], target["images"]))
             return self.remember(db, "work_restore", command, self._read(db))

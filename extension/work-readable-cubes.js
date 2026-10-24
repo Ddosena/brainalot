@@ -2,6 +2,7 @@ import {esc} from './work-icons.js';
 import {renderAwardArt} from './work-trophy-art.js';
 import {validImportanceScore} from './importance-score.js';
 import {t} from './i18n.js';
+import {isDeletedCube} from './work-deletions.js';
 export const READABLE_LAYOUTS=[{id:'compact',label:t("Компактные блоки"),width:84,height:59}];
 export const normalizeOrbitHalf=value=>value==='morning'?'morning':'afternoon';
 export const orbitHalfAt=minutes=>typeof minutes==='number'&&Number.isFinite(minutes)&&minutes>=0&&minutes<1440?(minutes<720?'morning':'afternoon'):null;
@@ -39,7 +40,7 @@ export function fullCubeInfo(c,{importance=0,typeLabel=t("Задача")}={}){
   const lines=[String(c.title||typeLabel),readableSource(c,typeLabel),t('План: {plan} мин · Готовность: {percent}% · Факт: {actual} мин · Важность: {importance}/5',{plan,percent,actual,importance:validImportance(importance)?importance:0})];
   const output=String(c.output||'').trim(),comment=String(c.comment||'').trim();if(output&&output.length<=200)lines.push(t('Результат: {output}',{output}));if(comment&&comment.length<=200)lines.push(t('Комментарий: {comment}',{comment}));
   const steps=Array.isArray(c.steps)?c.steps:[],resources=c.resource_drafts||c,groups=Array.isArray(resources.groups)?resources.groups:[],links=[...(Array.isArray(resources.links)?resources.links:[]),...groups.flatMap(group=>Array.isArray(group.links)?group.links:[])].filter(link=>link&&(link.title||link.url));
-  if(steps.length||links.length)lines.push([steps.length?t('Шагов: {count}',{count:steps.length}):'',links.length?t('Материалов: {count}',{count:links.length}):''].filter(Boolean).join(' · '));return lines.filter(Boolean).join('\n');
+  if(steps.length||links.length)lines.push([steps.length?t('Шагов: {count}',{count:steps.length}):'',links.length?t('Материалов: {count}',{count:links.length}):''].filter(Boolean).join(' · '));if(c.allocation_stale)lines.push(t('Предложение устарело. Пересчитайте план перед выбором.'));return lines.filter(Boolean).join('\n');
 }
 const numberOrder=value=>typeof value==='number'&&Number.isFinite(value)?value:null;
 export function orderSourceCubes(cubes,segments=[]){
@@ -60,7 +61,7 @@ export function approvedMonthlyFuture(cube,planning,date){
 }
 export function sourcePools({planning={},date,taskIds=[],cubes=[],selectedIds=[],hiddenIds=[],restoredIds=[]}){
   const selected=new Set(selectedIds);for(const cube of cubes)if(selected.has(cube.id)||selected.has(cubeKey(cube)))selected.add(cubeKey(cube));const isSelected=c=>selected.has(c.id)||selected.has(cubeKey(c));const hidden=new Set(hiddenIds),restored=new Set(restoredIds),map=new Map();
-  for(const cube of cubes){const key=cubeKey(cube);if(!key||hidden.has(cube.id)||hidden.has(key))continue;const prior=map.get(key);if(prior&&prior.id===key&&cube.id!==key)continue;map.set(key,{...prior,...cube});}
+  for(const cube of cubes){const key=cubeKey(cube);if(!key||isDeletedCube(planning,cube)||hidden.has(cube.id)||hidden.has(key))continue;const prior=map.get(key);if(prior&&prior.id===key&&cube.id!==key)continue;map.set(key,{...prior,...cube});}
   const all=[...map.values()],chosen=[...new Set(taskIds)],chosenSet=new Set(chosen),kept=all.filter(c=>c.task_id&&(!c.kind||c.kind==='task')&&!chosenSet.has(c.task_id)&&!approvedMonthlyFuture(c,planning,date)&&(isSelected(c)||restored.has(c.id)||((Number(c.progress_percent)>0||Number(c.actual_minutes)>0)&&(!c.report_date||c.report_date===date))));
   const groupIds=[...chosen,...new Set(kept.map(c=>c.task_id))],keptIds=new Set(kept.map(cubeKey));
   const chains=groupIds.map(taskId=>({task_id:taskId,title:planning.tasks?.find(t=>t.id===taskId)?.title||all.find(c=>c.task_id===taskId)?.taskTitle||t("Задача"),retained:!chosenSet.has(taskId),cubes:orderSourceCubes(all.filter(c=>c.task_id===taskId&&(!c.kind||c.kind==='task')&&(chosenSet.has(taskId)||keptIds.has(cubeKey(c)))),planning.task_segments||[])}));

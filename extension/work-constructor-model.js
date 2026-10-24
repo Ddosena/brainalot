@@ -1,5 +1,6 @@
 import {readableCardDimensions} from "./work-readable-cubes.js";
 import {sourceImportance} from "./work-source-importance.js";
+import {isDeletedCube} from './work-deletions.js';
 import { t, localeTag } from "./i18n.js";
 export const START=480, END=1320;
 const number=value=>Number.isFinite(Number(value))?Number(value):0;
@@ -88,7 +89,7 @@ export const TYPES={task:t("Работа"),research:t("Исследование"
 export const COLORS={task:"#77adc8",research:"#77adc8",practice:"#75bcb1",slides:"#b1a1d1",script:"#c9ac83",prep:"#9bc9b5",calendar:"#c4b18c",weekly_review:"#aabcc7",brainalot:"#b6b8d0"};
 export function constructorModel(planning,date,dashboard={}){
   const result=planning.result||{},read=result.constructor||{},canonical=planning.constructor||{},day=read.days?.[date],legacyDay=result.days?.find(d=>d.date===date)||{date},initialized=!!day?.initialized;
-  const tasks=planning.tasks||[],segments=planning.task_segments||[],persisted=read.cubes||[],byId=new Map(persisted.map(c=>[c.id,c]));
+  const tasks=planning.tasks||[],segments=planning.task_segments||[],persisted=(read.cubes||[]).filter(cube=>!isDeletedCube(planning,cube)),byId=new Map(persisted.map(c=>[c.id,c]));
   const decorate=c=>{const task=tasks.find(t=>t.id===c.task_id),segment=segments.find(s=>s.id===c.segment_id),report=planning.completed_cubes?.[c.id]||{};return {...c,importance_score:sourceImportance(c,planning,dashboard),minutes:number(c.minutes),title:c.title||task?.title||"",output:c.output||"",steps:c.steps||[],comment:c.comment||"",progress_percent:c.progress_percent??report.percent??0,actual_minutes:c.actual_minutes??report.actual_minutes??0,taskTitle:task?.title||"",course:task?.course||"",segmentTitle:segment?.title||"",type:typeOf(c,segment),...normalizeResources(c)};};
   let selected,possible,events,summary;
   if(initialized){
@@ -96,7 +97,7 @@ export function constructorModel(planning,date,dashboard={}){
     possible=(day.possible_cube_ids||[]).map(id=>byId.get(id)).filter(Boolean).map(decorate);
     events=day.events||[];summary={budget:day.budget_minutes??300,selected:day.selected_minutes??0,fixed:day.fixed_minutes??0,total:day.total_work_minutes??0,actual:day.actual_minutes??0,credited:day.credited_minutes??0,free:day.available_minutes??0,over:day.over_cap_minutes??0};
   }else{
-    selected=(result.cubes||[]).filter(c=>c.date===date&&(c.manual||c.locked||number(c.progress_percent)>0||number(c.actual_minutes)>0||number(planning.completed_cubes?.[c.id]?.percent)>0||number(planning.completed_cubes?.[c.id]?.actual_minutes)>0)).map(c=>decorate({...c,kind:"task",selected_date:date}));
+    selected=(result.cubes||[]).filter(c=>!isDeletedCube(planning,c)&&c.date===date&&(c.manual||c.locked||number(c.progress_percent)>0||number(c.actual_minutes)>0||number(planning.completed_cubes?.[c.id]?.percent)>0||number(planning.completed_cubes?.[c.id]?.actual_minutes)>0)).map(c=>decorate({...c,kind:"task",selected_date:date}));
     // A future day may not be initialized yet, while its weekly proposals already
     // exist canonically. Project them without converting the day or charging work.
     possible=(day?.possible_cube_ids||[]).map(id=>byId.get(id)).filter(Boolean).map(decorate);
@@ -109,7 +110,7 @@ export function constructorModel(planning,date,dashboard={}){
     summary={budget:legacyDay.budget_minutes??legacyDay.day_limit_minutes??planning.settings?.day_limit_minutes??300,selected:legacyDay.builder_selected_minutes??selected.reduce((s,c)=>s+c.minutes,0),fixed:legacyDay.fixed_minutes||0,total:legacyDay.builder_total_work_minutes??legacyDay.total_work_minutes??0,actual:legacyDay.reported_actual_minutes??selected.reduce((s,c)=>s+c.actual_minutes,0),credited:selected.reduce((s,c)=>s+c.minutes*c.progress_percent/100,0),free:legacyDay.builder_available_minutes??legacyDay.unused_capacity_minutes??0,over:legacyDay.builder_over_cap_minutes||0};
   }
   const sources=[["today",t("Сегодня")],["backlog_week",t("На неделе")],["week",t("Ближайшие дни")]].flatMap(([key,label])=>(dashboard[key]||[]).filter(n=>n.kind==="task"&&n.status!=="done").map(n=>decorate({id:"brainalot-"+n.id,kind:"brainalot",source_ref:n.id,title:n.title,minutes:60,output:"",steps:[],comment:"",links:[],groups:[],sourceLabel:label,type:"brainalot",candidate:true})));
-  const used=new Set([...selected,...possible,...persisted.filter(c=>c.kind==="brainalot")].map(c=>c.kind+":"+c.source_ref));for(const source of sources)if(!used.has(source.kind+":"+source.source_ref)&&!day?.hidden_cube_ids?.includes(source.id)){possible.push(source);used.add(source.kind+":"+source.source_ref);}
+  const used=new Set([...selected,...possible,...persisted.filter(c=>c.kind==="brainalot")].map(c=>c.kind+":"+c.source_ref));for(const source of sources)if(!isDeletedCube(planning,source)&&!used.has(source.kind+":"+source.source_ref)&&!day?.hidden_cube_ids?.includes(source.id)){possible.push(source);used.add(source.kind+":"+source.source_ref);}
   const hidden=(day?.hidden_cube_ids||[]).map(id=>byId.get(id)).filter(Boolean).map(decorate),main=day?.main_task_id||legacyDay.focus_task_id||tasks[0]?.id||null,priority=legacyDay.focus_task_id||null;
   return {date,initialized,main,priority,goal:day?.goal||"",positions:day?.positions||canonical.days?.[date]?.positions||{},selected,possible,hidden,events,summary,tasks,segments,pool:result.task_pool||[],all:persisted.map(decorate)};
 }

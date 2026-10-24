@@ -327,6 +327,9 @@ class TimeStore:
             if row["revision"] != expected:
                 raise ConflictError("Таймер изменился в другом окне. Показано актуальное состояние")
             task = body.get("task") if action in {"start", "switch_task"} else json.loads(row["task"]) if row["task"] else None
+            if action in {"start", "resume", "switch_task"}:
+                from .work_delete import guard_timer_target
+                guard_timer_target(self.db_path.parent.parent, task)
             if not features.WORK_ENABLED and action in {"start", "switch_task", "resume"} and task and task.get("source") == "work":
                 raise ValidationError(features.WORK_PAUSED_MESSAGE)
             if action == "start" and "backfill_from" in body:

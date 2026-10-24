@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 from . import API_VERSION, __version__
 from .core import ConflictError, NotFoundError, Store, ValidationError
+from .work_delete import DeleteStateError
 from .calendar import CalendarFeed
 from .dictation_service import DictationService
 from .google_calendar_api import GoogleCalendarApi
@@ -110,6 +111,8 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.exception_handler(ConflictError)
     async def conflict_handler(_, exc):
+        if isinstance(exc, DeleteStateError):
+            return JSONResponse({"detail": str(exc), "delete_result": exc.delete_result}, status_code=exc.status_code)
         return JSONResponse({"detail": str(exc)}, status_code=409)
 
     @app.exception_handler(NotFoundError)

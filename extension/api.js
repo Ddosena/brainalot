@@ -22,9 +22,13 @@ if (globalThis.chrome?.storage?.local) {
 }
 
 export class ApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, payload = null) {
     super(message);
     this.status = status;
+    // Preserve typed operation status even when HTTP reports pending/conflict.
+    const detail=payload?.detail&&typeof payload.detail==='object'?payload.detail:payload;
+    if(detail?.delete_result)this.delete_result=structuredClone(detail.delete_result);
+    if(detail?.deletion_state)this.deletion_state=structuredClone(detail.deletion_state);
   }
 }
 
@@ -62,7 +66,7 @@ export async function requestApi(path, { token, port, method = "GET", body, fetc
         : response.status === 409
           ? t("Запись уже изменилась. Обновите список перед повторной правкой.")
           : t("Сервис вернул ошибку {status}.", {status: response.status});
-      throw new ApiError(typeof data?.detail === "string" ? translateServerMessage(data.detail) : fallback, response.status);
+      throw new ApiError(typeof data?.detail === "string" ? translateServerMessage(data.detail) : fallback, response.status, data);
     }
     if (data === null) throw new ApiError(t("Сервис вернул непонятный ответ."));
     const etag = response.headers?.get?.("ETag");

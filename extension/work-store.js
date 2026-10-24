@@ -2,6 +2,8 @@
 // a durable draft; it is never deleted as part of migration.
 import { createConnection } from "./connection.js";
 import { prepareCommit, verifyCommit, sha256 } from "./work-sync.js";
+import {normalizeDeletionState} from './work-deletions.js';
+import {t} from './i18n.js';
 
 export const uid = () => (crypto.randomUUID?.() || Math.random().toString(36).slice(2) + Date.now().toString(36)).replace(/-/g, "").slice(0, 10);
 export const emptyState = () => ({
@@ -126,6 +128,7 @@ function client() {
 let state = null, revision = 0, initialized = false;
 let images = new Map(), timer = null, loadPromise = null, pending = Promise.resolve(), dirty = 0, unresolved = false, committing = false, committingDraftKey = null;
 let planningPending = null, planningBusy = false;
+let deletionState=normalizeDeletionState();
 let statusCb, remoteCb, migrationCb, pollTimer, migrationLease, remoteMigrationUntil = 0, migrationExpiryTimer;
 let selectedDraftKey = null, supersedesDraftKey = null, lastStatus = null;
 const subs = new Set();
@@ -134,6 +137,19 @@ const notify = meta => subs.forEach(fn => fn(meta));
 const broadcast = () => channel?.postMessage({ from: pageId, revision });
 export const get = () => state;
 export const getRevision = () => revision;
+export const getDeletionState=()=>copy(deletionState);
+const deletionBlocked=()=>deletionState.pending.length>0;
+function absorbDeletionState(value,announce=true){
+  let next;
+  if(value&&Object.hasOwn(value,'deletion_state'))next=normalizeDeletionState(value.deletion_state);
+  else if(value?.delete_result?.status==='pending')next={...deletionState,pending:[copy(value.delete_result)]};
+  else if(value?.delete_result?.status==='conflict')next={pending:[],conflicts:[copy(value.delete_result)]};
+  else if(value?.initialized)next=normalizeDeletionState();
+  if(!next||JSON.stringify(next)===JSON.stringify(deletionState))return false;
+  deletionState=next;
+  if(announce){notify({from:'deletion'});remoteCb?.();}
+  return true;
+}
 export const isInitialized = () => initialized;
 export const subscribe = fn => { subs.add(fn); return () => subs.delete(fn); };
 export const onSaveStatus = fn => { statusCb = fn; if (lastStatus) fn(lastStatus.kind, lastStatus.error); };
@@ -166,11 +182,12 @@ function scheduleMigrationExpiry() {
     void checkRemote();
   }
 }
-export const isWritable = () => initialized && !unresolved && !locked() && !migrationLease;
+export const isWritable = () => initialized && !unresolved && !locked() && !migrationLease&&!deletionBlocked();
 function writable() {
   if (locked() || migrationLease) throw new Error("Work migration in progress");
   if (!initialized) throw new Error("Work is not initialized");
   if (unresolved) throw new Error("Resolve the unconfirmed Work draft first");
+  if(deletionBlocked())throw new Error(t('Удаление ещё выполняется. Другие изменения Work временно приостановлены.'));
 }
 function migrationLock() {
   if (locked()) throw new Error("Another Work tab is migrating");
@@ -192,16 +209,17 @@ async function fetchImage(meta) {
 }
 async function accept(remote, announce = false, protectLocal = false) {
   if (!remote.initialized || !remote.state) throw new Error("Work server returned empty state");
-  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
+  absorbDeletionState(remote,false);
+  if (protectLocal && (dirty || unresolved || selectedDraftKey || planningBusy || planningPending || remote.revision <= revision)) return false;
   const fetched = new Map();
   for (const meta of remote.images || []) fetched.set(meta.id, await fetchImage(meta));
-  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
+  if (protectLocal && (dirty || unresolved || selectedDraftKey || planningBusy || planningPending || remote.revision <= revision)) return false;
   await tx(["kv", "canonical-images"], "readwrite", t => {
     t.objectStore("kv").put({ revision: remote.revision, state: remote.state }, "canonical-cache");
     const img = t.objectStore("canonical-images"); img.clear();
     for (const [id, blob] of fetched) img.put(blob, id);
   });
-  if (protectLocal && (dirty || planningBusy || planningPending || remote.revision <= revision)) return false;
+  if (protectLocal && (dirty || unresolved || selectedDraftKey || planningBusy || planningPending || remote.revision <= revision)) return false;
   state = copy(remote.state); revision = remote.revision; images = fetched; initialized = true;
   unresolved = false; selectedDraftKey = null;
   if (announce) broadcast();
@@ -228,10 +246,11 @@ async function commit(next, imageMap, expected, requestId = crypto.randomUUID?.(
     try { await beforeCommit(); }
     catch (error) { await del(key); selectedDraftKey = null; throw error; }
   }
-  const receipt = await api("/api/work/commit", "POST", {
+  let receipt;
+  try{receipt=await api("/api/work/commit", "POST", {
     request_id: requestId, expected_revision: expected, ...prepared,
     ...(restoreImport ? { restore_import: true } : {}),
-  });
+  });}catch(error){absorbDeletionState(error);throw error;}
   if (receipt.revision !== expected + 1) throw new Error("Work commit revision receipt mismatch");
   const hashes = new Map(prepared.images.map(row => [row.id, row.blob]));
   await verifyCommit(api, readImage, receipt, next, entries, hashes);
@@ -278,6 +297,7 @@ export function load() {
     const canonicalImages = await snapshotCanonicalImages();
     try {
       const remote = await client().api("/api/work/state");
+      absorbDeletionState(remote);
       if (remote.initialized) {
         if (draft) {
           selectedDraftKey = draft.key;
@@ -344,6 +364,7 @@ export async function flush() {
     return dirty ? flush() : undefined;
   }
   if (!initialized || !dirty) return;
+  writable();
   const batch = dirty, next = copy(state), imgs = new Map(images), batchDraftKey = selectedDraftKey;
   committing = true; committingDraftKey = batchDraftKey;
   pending = Promise.resolve().then(async () => {
@@ -369,6 +390,10 @@ async function sendPlanningDraft(draft) {
   const operation = (async () => {
     try {
       const remote = await client().api("/api/work/planning", "POST", draft.body);
+      if(draft.body.action==='cube_delete'&&remote?.delete_result?.status!=='complete'){
+        const error=new Error(t('Удаление ещё не подтверждено сервером. Проверьте состояние.'));
+        error.status=503;error.delete_result=remote?.delete_result;throw error;
+      }
       if (!remote?.initialized || !remote.state || !remote.state.planning ||
           remote.revision !== draft.body.expected_revision + 1) {
         throw new Error("Planning response is not a confirmed Work revision");
@@ -376,6 +401,8 @@ async function sendPlanningDraft(draft) {
       // The planning endpoint changes only state.planning. Local board, drawer,
       // and image edits made during the request stay in memory and flush at the
       // new revision; the canonical server snapshot remains cached separately.
+      absorbDeletionState(remote);
+      if(draft.body.action==='cube_delete'&&remote.revision<revision){await del(draft.key);status('saved');notify({from:'remote'});remoteCb?.();return remote;}
       await put("canonical-cache", { revision: remote.revision, state: copy(remote.state) });
       await del(draft.key);
       if (dirty) state.planning = copy(remote.state.planning);
@@ -386,9 +413,10 @@ async function sendPlanningDraft(draft) {
       notify({ from: "planning" }); remoteCb?.();
       return remote;
     } catch (error) {
+      absorbDeletionState(error);
       // Validation failures are definitive: the service did not apply the
       // request, so the user may correct fields and submit a fresh one.
-      if (error?.status === 422) await del(draft.key);
+      if (error?.status === 422||draft.body.action==='cube_delete'&&error?.status===409){await del(draft.key);if(draft.body.action==='cube_delete')notify({from:'deletion'});}
       status(error?.status === 409 ? "planning-conflict" : "planning-error", error);
       throw error;
     }
@@ -437,6 +465,8 @@ export async function discardPlanningDraft() {
   if (!draft) return false;
   const remote = await client().api("/api/work/state");
   if (!remote?.initialized || !remote.state) throw new Error("Cannot refresh Work before discarding the request");
+  absorbDeletionState(remote);
+  if(draft.body?.action==='cube_delete')throw new Error(t('Статус удаления пока не подтверждён. Проверьте состояние или повторите исходный запрос.'));
   await accept(remote, true);
   await del(draft.key);
   status("saved");
@@ -487,15 +517,20 @@ export async function imgPut(id, blob) {
 }
 export async function imgAll() { await load(); return [...images]; }
 
+export async function refreshRemote(){await checkRemote();return getDeletionState();}
 async function checkRemote() {
-  if (dirty || planningPending || migrationLease || locked() || (await planningDraftRecords()).length) return;
+  if(planningPending||migrationLease||locked())return;
+  const drafts=await planningDraftRecords(),deleting=drafts.length===1&&drafts[0].body?.action==='cube_delete';
+  if((dirty||drafts.length)&&!deleting&&!deletionBlocked())return;
   if (selectedDraftKey) {
-    if (await read(selectedDraftKey)) return;
-    selectedDraftKey = null; unresolved = false;
+    if(await read(selectedDraftKey)){if(!deletionBlocked())return;}
+    else {selectedDraftKey=null;unresolved=false;}
   }
   try {
     const remote = await client().api("/api/work/state");
+    absorbDeletionState(remote);
     if (!planningBusy && !planningPending && !dirty && remote.initialized && remote.revision > revision) await accept(remote, false, true);
+    if(deleting&&!planningBusy&&!planningPending&&!deletionBlocked())await sendPlanningDraft(drafts[0]);
   } catch { /* Retain the last verified state until the next poll. */ }
 }
 if (channel) channel.onmessage = event => {

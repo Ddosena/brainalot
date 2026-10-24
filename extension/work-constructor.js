@@ -11,7 +11,8 @@ import { renderDayOrbit,currentDayPosition } from "./work-day-orbit.js";
 import {normalizeOrbitHalf,orbitHalfAt,validPlanMonth,approvedMonthlyPlan,prioritizeSourcePools,sourceImportanceControl,fullCubeInfo,sourcePools,sourceCardContents,setReadableLayout,readableLayout,readableCardContents,compactCardMinutes,readableSource} from "./work-readable-cubes.js";
 
 
-import {sourceImportance as canonicalSourceImportance,sourceImportanceTarget,saveSourceImportance} from "./work-source-importance.js";
+import {sourceImportance as canonicalSourceImportance,sourceImportanceTarget,saveSourceImportance,sourceNote} from "./work-source-importance.js";
+import {isDeletedCube,normalizeDeletionState,confirmedCubeDelete} from './work-deletions.js';
 
 const safe=value=>esc(String(value??"")),copy=value=>structuredClone(value);
 const uid=()=>("cube-"+(crypto.randomUUID?.()||Date.now()+"-"+Math.random())).replace(/[^a-zA-Z0-9:-]/g,"");
@@ -27,7 +28,7 @@ export function constructorPatch(base,draft,latest,dirty){
 }
 export function weekProposals(planning,start){
   const end=shiftDate(start,6),exempt=new Set((planning.result?.tasks||[]).filter(t=>t.scope_exempt).map(t=>t.id)),saved=planning.result?.constructor?.cubes||Object.values(planning.constructor?.cubes||{}),blueprints=new Set(saved.flatMap(c=>[c.blueprint_ref,c.id?.startsWith("planned-")?c.id.slice(8):c.id]).filter(Boolean));
-  return [...saved.filter(c=>c.planned_date>=start&&c.planned_date<=end&&(!exempt.has(c.task_id)||c.selected_date||c.progress_percent>0||c.actual_minutes>0)),...(planning.result?.cubes||[]).filter(c=>!exempt.has(c.task_id)&&!c.manual&&!c.locked&&c.date>=start&&c.date<=end&&!blueprints.has(c.id)).map(c=>({...c,id:"planned-"+c.id,blueprint_ref:c.id,kind:"task",planned_date:c.date,candidate:true,progress_percent:0,actual_minutes:0}))];
+  return [...saved.filter(c=>c.planned_date>=start&&c.planned_date<=end&&(!exempt.has(c.task_id)||c.selected_date||c.progress_percent>0||c.actual_minutes>0)),...(planning.result?.cubes||[]).filter(c=>!exempt.has(c.task_id)&&!c.manual&&!c.locked&&c.date>=start&&c.date<=end&&!blueprints.has(c.id)).map(c=>({...c,id:"planned-"+c.id,blueprint_ref:c.id,kind:"task",planned_date:c.date,candidate:true,progress_percent:0,actual_minutes:0}))].filter(cube=>!isDeletedCube(planning,cube));
 }
 export function groupWeekCubes(cubes){const groups=new Map();for(const cube of cubes){const key=JSON.stringify([cube.planned_date,cube.task_id||cube.kind+":"+cube.source_ref]);if(!groups.has(key))groups.set(key,{key,date:cube.planned_date,task_id:cube.task_id,cubes:[]});groups.get(key).cubes.push(cube);}return [...groups.values()];}
 export async function releaseTrayDrop({applySelection,snapshot,cache,key,id,position,awake,render}){
@@ -66,8 +67,17 @@ export function createWorkConstructor(root,ctx){
   function setPoolPinned(value){poolPins.set(selectedDate,value);try{preferences.setItem('brainalot.work.pool.v1:'+selectedDate,JSON.stringify({pinned:value}));}catch{}render();}
   function requirePoolEditing(){if(poolPinned())throw new Error(t('Пул закреплён. Нажмите «Изменить пул», чтобы изменить состав.'));}
   let selectedDate=null,mode="day",historyMonth=null,historyPath=[],weekStart=null,weekKey=null,stage=null,hours=2,search="",busy=0,error="",notice="",pending=null,dashboard={},dashboardError="",serial=Promise.resolve(),popup=null,popupObserver=null,popupFrame=0,saveTimer=null,drag=null,suppressClick=0,disposed=false,resizeTimer=null,positionTimer=null,lastUndo=null;
+  let deleteIntent=null,deleteBusy=false;
   const popupBases=new Map(),popupConflicts=new Map(),dirtyFields=new Map(),drafts=new Map(),geometries=new Map(),localPositions=new Map(),localPositionWidths=new Map(),physics=new Map(),pendingBlocks=new Set(),returned=new Map(),scrolls={tasks:0,week:0,catalog:0},positionChanges=new Map(),sourceScrolls=new Map();
   const planning=()=>ctx.state?.planning;
+  const deletionState=()=>normalizeDeletionState(ctx.deletionState?.());
+  const deletionFrozen=()=>deletionState().pending.length>0;
+  const popupDeleted=()=>!!popup&&isDeletedCube(planning(),getPopupCube()||{id:popup.id});
+  const deletedMessage=()=>t('Кубик уже удалён. Ваш черновик сохранён для просмотра.');
+  function requireMutableCube(cube){
+    if(deletionFrozen())throw new Error(t('Удаление ещё выполняется. Другие изменения Work временно приостановлены.'));
+    if(cube&&isDeletedCube(planning(),cube))throw new Error(deletedMessage());
+  }
   const taskChoices=new Map(),knownTimerIds=new Set(),activeEffects=new Set(),enqueuePopupSave=createKeyedSaveQueue(),completionClaims=createCompletionClaims();let taskChangeSerial=Promise.resolve(),goalEditor=null,shelfStyle='rail',orbitShowDate=false;
   try{const options=JSON.parse(preferences.getItem('brainalot.work.constructor.options.v1')||'{}');if(SHELF_STYLES.some(([id])=>id===options.shelfStyle))shelfStyle=options.shelfStyle;orbitShowDate=!!options.orbitShowDate;}catch{}
   function persistOptions(){try{preferences.setItem('brainalot.work.constructor.options.v1',JSON.stringify({shelfStyle,orbitShowDate}));}catch{notice=t('Настройки доступны до закрытия этой вкладки.');}}
@@ -101,7 +111,7 @@ export function createWorkConstructor(root,ctx){
   function activeTasks(){const p=planning()||{},rows=p.result?.tasks||[];return (p.tasks||[]).filter(task=>!task.scope_exempt&&!rows.find(r=>r.id===task.id)?.scope_exempt);}
   function futureCandidates(){
     const p=planning()||{},saved=p.result?.constructor?.cubes||[],used=new Set(saved.flatMap(c=>[c.id,c.blueprint_ref].filter(Boolean)));
-    return [...saved.filter(c=>c.kind==='task'||c.task_id&&!c.kind),...(p.result?.cubes||[]).filter(c=>!used.has(c.id)&&!c.manual&&!c.locked&&c.task_id&&c.date>selectedDate).map(c=>({...c,id:'planned-'+c.id,blueprint_ref:c.id,kind:'task',planned_date:c.date,candidate:true,progress_percent:0,actual_minutes:0}))].map(decorated);
+    return [...saved.filter(c=>c.kind==='task'||c.task_id&&!c.kind),...(p.result?.cubes||[]).filter(c=>!used.has(c.id)&&!c.manual&&!c.locked&&c.task_id&&c.date>selectedDate).map(c=>({...c,id:'planned-'+c.id,blueprint_ref:c.id,kind:'task',planned_date:c.date,candidate:true,progress_percent:0,actual_minutes:0}))].filter(cube=>!isDeletedCube(p,cube)).map(decorated);
   }
   function virtualTasks(){
     const p=planning()||{},m=model(),existing=new Set([...m.selected,...m.possible,...m.hidden,...futureCandidates().filter(c=>!c.report_date&&(!c.planned_date||c.planned_date>=selectedDate))].map(c=>c.task_id+':'+c.segment_id)),list=[];
@@ -112,7 +122,7 @@ export function createWorkConstructor(root,ctx){
         list.push(decorated({id:'pool:'+entry.task_id+':'+(segment?.id||'main'),kind:'task',task_id:entry.task_id,...(segment?{segment_id:segment.id}:{}),minutes:Math.min(60,Math.floor(available/5)*5),title:segment?.title||entry.title,output:segment?.output||'',steps:segment?.steps||[],comment:'',candidate:true,links:[],groups:[]}));
       }
     }
-    return list;
+    return list.filter(cube=>!isDeletedCube(p,cube));
   }
   function possible(){
     const m=model(),priority=returned.get(selectedDate)||[],raw=[...m.possible,...virtualTasks()],overrides=new Set(taskChoice().restoredCubeIds||[]),list=uniqueTaskCubes([...taskPoolChange(raw,taskChoice().taskIds,taskProtection()).included,...raw.filter(c=>overrides.has(c.id))]),ids=new Set();
@@ -128,14 +138,23 @@ export function createWorkConstructor(root,ctx){
     if(!p){root.innerHTML='<div class="work-constructor cc-empty"><h2>'+safe(t("План пока не загружен"))+'</h2><p>'+safe(t("Проекты, доска, заметки и изображения сохраняются."))+'</p></div>';return;}
     selectedDate??=todayIn(p.settings?.timezone);weekStart??=nextMonday(selectedDate);historyMonth??=selectedDate.slice(0,7);const m=model();
     root.innerHTML='<div class="work-constructor" data-testid="work-constructor" data-work-style="'+safe(workStyle)+'" data-card-layout="'+readableLayout()+'">'+
-      '<nav class="cc-tabs"><button data-action="mode-day" aria-selected="'+(mode==='day')+'">'+safe(t('День'))+'</button><button data-action="mode-week" aria-selected="'+(mode==='week')+'">'+safe(t('Неделя'))+'</button><button data-action="mode-month" aria-selected="'+(mode==='month')+'">'+safe(t('История'))+'</button><span class="cc-save-state" role="status">'+safe(error||notice||(busy?t('Сохраняем…'):''))+'</span></nav>'+(pending?'<section class="cc-warning" role="alert">'+safe(t('Изменение не подтверждено.'))+' <button data-action="retry">'+safe(t('Повторить'))+'</button><button data-action="discard">'+safe(t('Отменить запрос'))+'</button></section>':'')+
+      '<nav class="cc-tabs"><button data-action="mode-day" aria-selected="'+(mode==='day')+'">'+safe(t('День'))+'</button><button data-action="mode-week" aria-selected="'+(mode==='week')+'">'+safe(t('Неделя'))+'</button><button data-action="mode-month" aria-selected="'+(mode==='month')+'">'+safe(t('История'))+'</button><span class="cc-save-state" role="status">'+safe(error||notice||(busy?t('Сохраняем…'):''))+'</span></nav>'+deletionBanner()+(pending?'<section class="cc-warning" role="alert">'+safe(t('Изменение не подтверждено.'))+' <button data-action="retry">'+safe(t('Повторить'))+'</button>'+(pending.action==='cube_delete'?'<button data-action="deletion-check">'+safe(t('Проверить состояние'))+'</button>':'<button data-action="discard">'+safe(t('Отменить запрос'))+'</button>')+'</section>':'')+
       (mode==="day"?goalsHtml()+'<div class="cc-results-row">'+pedestalShelf(planning(),selectedDate,pendingBlocks,shelfStyle)+awardsPanel(planning(),selectedDate)+'</div>'+timelineHtml(m)+(!m.initialized?'<section class="cc-warning"><strong>'+safe(t("Этот день ещё использует прежний план"))+'</strong><p>'+safe(t("Включите конструктор явно: существующие уроки, выбранные кубики и факты сохранятся. Подготовки станут предложениями до выбора."))+'</p><button class="cc-primary" data-action="initialize" data-testid="initialize-constructor">'+safe(t("Включить конструктор для этого дня"))+'</button></section>':"")+dayHtml(m):mode==="week"?goalsHtml()+weekHtml():goalsHtml()+monthHtml(planning(),historyMonth,historyPath))+'</div>';
     const host=$('.work-constructor'),goals=$('.cc-goal-strip');if(host&&goals)host.style.setProperty('--cc-goal-height',Math.ceil(goals.getBoundingClientRect().height)+'px');if(host&&$('.cc-timeline-panel'))host.style.setProperty('--cc-timeline-height',Math.ceil($('.cc-timeline-panel').getBoundingClientRect().height)+'px');
     for(const [selector,key] of [[".cc-task-strip","tasks"],[".cc-week-scroll","week"]])if($(selector)){const el=$(selector);el.style.scrollBehavior="auto";el.scrollLeft=scrolls[key];el.style.scrollBehavior="";}
     for(const el of root.querySelectorAll('[data-source-scroll]')){const saved=sourceScrolls.get(el.dataset.sourceScroll);if(saved){el.scrollLeft=saved.x;el.scrollTop=saved.y;}}
     if(focusKey){const target=[...root.querySelectorAll("[data-focus-key]")].find(el=>el.dataset.focusKey===focusKey);target?.focus({preventScroll:true});try{if(selection&&target?.matches?.("input,textarea")&&target?.setSelectionRange)target.setSelectionRange(...selection);}catch{}}
     mountPhysics();bindWheel();if(popup)renderPopup();updateTimers();scheduleOrbitClock();
+    if(deletionFrozen()||deleteBusy)for(const element of root.querySelectorAll('button,input,textarea,select'))if(!readAction(element.dataset?.action)&&!['date','history-month','search'].includes(element.dataset?.field))element.disabled=true;
   }
+  function deletionBanner(){
+    const state=deletionState();
+    const detail=rows=>rows.filter(row=>typeof row.error==='string'&&row.error).map(row=>'<p>'+safe(row.error)+'</p>').join('');
+    if(state.pending.length)return '<section class="cc-warning" role="status">'+safe(t('Удаление ещё выполняется. Другие изменения Work временно приостановлены.'))+detail(state.pending)+' <button data-action="deletion-check">'+safe(t('Проверить состояние'))+'</button></section>';
+    if(state.conflicts.length)return '<section class="cc-warning" role="alert">'+safe(t('Удаление не выполнено. Обновите данные перед новой попыткой.'))+detail(state.conflicts)+' <button data-action="deletion-check">'+safe(t('Обновить данные'))+'</button></section>';
+    return '';
+  }
+  function readAction(name){return ['mode-day','mode-week','mode-month','previous','next','today','preview-date','week-prev','week-next','week-task','month-goal','month-day','month-root','month-path','inspect','history-inspect','trophy-inspect','orbit-half','orbit-now','popup-close','delete-cancel','deletion-check','retry','discard','refresh-dashboard','resources-open'].includes(name);}
   function goalsHtml(){
     const p=planning()||{},week=mode==='week'?weekStart:monday(selectedDate),goals=p.result?.constructor?.goals||[];
     return '<section class="cc-goal-strip cc-goals-readable" aria-label="'+safe(t('Цели дня и недели'))+'">'+[['day',selectedDate,t('Цель дня')],['week',week,t('Цель недели')]].map(([scope,date,label])=>{
@@ -155,7 +174,7 @@ export function createWorkConstructor(root,ctx){
   function completedForDay(){return historyCubes(planning()).filter(c=>Number(c.progress_percent)>=100&&(c.report_date||c.selected_date||c.planned_date)===selectedDate).map(decorated);}
   function sourceCardHtml(c,selectedIds){
     const done=Number(c.progress_percent)>=100,on=selectedIds.has(c.id),type=c.type||typeOf(c),source=readableSource(c,TYPES[type]||TYPES.task),tooltip=[c.title,source,t('План')+' '+minutes(c.minutes),c.planned_date?dateLabel(c.planned_date):''].filter(Boolean).join(' · ');
-    return '<article class="rc-source-card '+(on?'is-taken ':'')+(done?'is-done':'')+'" data-row-id="'+safe(c.id)+'" '+(pendingBlocks.has(c.id)?'style="visibility:hidden"':'')+'><button class="rc-source-open" data-action="'+(done?'history-inspect':'inspect')+'" data-id="'+safe(c.id)+'" data-ccube="'+safe(c.id)+'" data-tray="'+(done?'history':on?'selected':'possible')+'" data-focus-key="source-'+safe(c.id)+'" data-ctooltip="'+safe(tooltip)+'">'+sourceCardContents(c,{typeLabel:TYPES[type]||TYPES.task,selected:on,done,source})+'</button><div class="rc-source-footer">'+importanceControl(c)+(done?'':'<button class="rc-source-take" data-action="'+(on?'return':'select')+'" data-id="'+safe(c.id)+'" data-focus-key="take-'+safe(c.id)+'" '+(poolPinned()?'disabled':'')+' aria-label="'+safe((on?t('Вернуть'):t('Взять в день'))+' · '+c.title)+'">'+ic(on?'check':'plus')+'<span>'+safe(on?t('Вернуть'):t('Взять'))+'</span></button>')+'</div></article>';
+    return '<article class="rc-source-card '+(on?'is-taken ':'')+(done?'is-done':'')+'" data-row-id="'+safe(c.id)+'" '+(pendingBlocks.has(c.id)?'style="visibility:hidden"':'')+'><button class="rc-source-open" data-action="'+(done?'history-inspect':'inspect')+'" data-id="'+safe(c.id)+'" data-ccube="'+safe(c.id)+'" data-tray="'+(done?'history':on?'selected':'possible')+'" data-focus-key="source-'+safe(c.id)+'" data-ctooltip="'+safe(tooltip)+'">'+sourceCardContents(c,{typeLabel:TYPES[type]||TYPES.task,selected:on,done,source})+'</button><div class="rc-source-footer">'+importanceControl(c)+(done?'':'<button class="rc-source-take" data-action="'+(on?'return':'select')+'" data-id="'+safe(c.id)+'" data-focus-key="take-'+safe(c.id)+'" '+(poolPinned()||c.allocation_stale?'disabled':'')+' aria-label="'+safe((on?t('Вернуть'):t('Взять в день'))+' · '+c.title)+'">'+ic(on?'check':'plus')+'<span>'+safe(on?t('Вернуть'):t('Взять'))+'</span></button>')+'</div></article>';
   }
   function monthPlanDraft(){
     if(!monthlyDraft){const plan=approvedMonthlyPlan(planning());monthlyDraft={month:plan?.month||selectedDate.slice(0,7),taskIds:[...(plan?.task_ids||[])]};}
@@ -213,8 +232,10 @@ export function createWorkConstructor(root,ctx){
   function commit(action,data,{quiet=false}={}){
     const operation=serial.catch(()=>{}).then(async()=>{
       if(disposed)return;if(await ctx.pendingDraft?.())throw new Error(t("Сначала разрешите неподтверждённый запрос Work."));
+      const payload=typeof data==='function'?data():data;
+      requireMutableCube(payload?.cube_id?(find(payload.cube_id)||{id:payload.cube_id}):null);
       busy++;error="";if(!quiet)notice=t("Сохраняем в Work…");
-      try{const response=await ctx.action(action,typeof data==="function"?data():data);if(!quiet)notice=t("Изменение сохранено в Work");return response;}
+      try{const response=await ctx.action(action,payload);if(!quiet)notice=t("Изменение сохранено в Work");return response;}
       catch(cause){error=cause.status===409?t("Данные изменились. Запрос сохранён для безопасного повтора."):t("Не удалось сохранить: {error}",{error:cause.message});throw cause;}
       finally{busy--;pending=await ctx.pendingDraft?.().catch(()=>null);if(!quiet)render();}
     });serial=operation;return operation;
@@ -226,19 +247,49 @@ export function createWorkConstructor(root,ctx){
     const data={cube_id:cube.id,...cubeCommand(cube)},resource=resourcesForSave(cube);
     Object.assign(data,resource);return commit("constructor_cube",data,{quiet});
   }
-  function getPopupCube(){return popup?find(popup.id):null;}
+  function getPopupCube(){return popup?find(popup.id)||drafts.get(popup.id):null;}
   function openPopup(id,element,tray){
     if(Date.now()<suppressClick)return;hideTooltip();const c=find(id);if(!c)return;const existing=drafts.get(id);closePopup();const r=element.getBoundingClientRect();
-    popup={id,tray,anchor:{left:r.left,right:r.right,top:r.top,bottom:r.bottom}};if(!dirtyFields.get(id)?.size)popupBases.set(id,copy(c));drafts.set(id,existing||{...copy(c),...resourcesForEdit(c)});renderPopup();document.querySelector("[data-constructor-popup] h2")?.focus({preventScroll:true});
+    deleteIntent=null;popup={id,tray,anchor:{left:r.left,right:r.right,top:r.top,bottom:r.bottom}};if(!dirtyFields.get(id)?.size)popupBases.set(id,copy(c));drafts.set(id,existing||{...copy(c),...resourcesForEdit(c)});renderPopup();document.querySelector("[data-constructor-popup] h2")?.focus({preventScroll:true});
   }
-  function closePopup(save=true){if(save&&popup&&drafts.has(popup.id))void savePopup().catch(()=>{});popupObserver?.disconnect();popupObserver=null;cancelAnimationFrame(popupFrame);popupFrame=null;document.querySelector("[data-constructor-popup]")?.remove();popup=null;}
+  function closePopup(save=true){if(save&&popup&&!popupDeleted()&&!deletionFrozen()&&!deleteBusy&&drafts.has(popup.id))void savePopup().catch(()=>{});popupObserver?.disconnect();popupObserver=null;cancelAnimationFrame(popupFrame);popupFrame=null;document.querySelector("[data-constructor-popup]")?.remove();popup=null;deleteIntent=null;}
+  function canDelete(c){return !['history','trophy'].includes(popup?.tray)&&['task','brainalot'].includes(c.kind||'task')&&!isDeletedCube(planning(),c);}
+  function deleteControls(c){
+    if(!canDelete(c))return '';
+    const disabled=deleteBusy||poolPinned()||deletionFrozen();
+    if(deleteIntent?.id!==c.id)return '<div class="cc-popup-actions"><button data-action="delete-ask" '+(disabled?'disabled':'')+'>'+safe(t('Удалить кубик'))+'</button></div>';
+    const text=deleteIntent.noteId?t('Удалить задание Brainalot «{title}» и его кубик?',{title:deleteIntent.title}):t('Удалить кубик этапа «{title}»? Задача «{task}» и остальные этапы сохранятся.',{title:deleteIntent.title,task:c.taskTitle||t('Работа')});
+    return '<section class="cc-warning" role="group" aria-label="'+safe(t('Подтверждение удаления'))+'"><p>'+safe(text)+'</p><div class="cc-popup-actions"><button data-action="delete-confirm" '+(disabled?'disabled':'')+'>'+safe(deleteBusy?t('Удаляем…'):t('Удалить'))+'</button><button data-action="delete-cancel" '+(deleteBusy?'disabled':'')+'>'+safe(t('Отмена'))+'</button></div></section>';
+  }
+  async function askDelete(){
+    requirePoolEditing();const c=getPopupCube();requireMutableCube(c);if(!c||!canDelete(c)||deleteBusy)return;
+    let note=null;if(c.kind==='brainalot'){await refreshDashboard();if(dashboardError)throw new Error(dashboardError);note=sourceNote(c,dashboard);if(!note?.version)throw new Error(t('Исходная задача недоступна. Обновите предложения Brainalot.'));}
+    if(!popup||popup.id!==c.id)return;
+    deleteIntent={id:c.id,noteId:note?.id||null,noteVersion:note?.version,title:note?.title||c.title};renderPopup();
+  }
+  async function deleteConfirmed(){
+    requirePoolEditing();const intent=deleteIntent,c=getPopupCube();requireMutableCube(c);if(!intent||intent.id!==c?.id||deleteBusy)return;
+    deleteBusy=true;render();
+    try{
+      await confirmedCubeDelete({cubeId:intent.id,noteVersion:intent.noteVersion,saveDraft:()=>savePopup(),readCurrent:()=>{
+        const current=find(intent.id);return current&&!isDeletedCube(planning(),current)?current:null;
+      },stopAndMeasure:async cube=>{
+        if(canonical(cube.id)||cubeTimerState(cube).status!=='idle'||knownTimerIds.has(cube.id))await stopAndMeasure(cube);
+      },commit:(name,data)=>commit(name,data,{quiet:true})});
+      drafts.delete(intent.id);dirtyFields.delete(intent.id);popupBases.delete(intent.id);popupConflicts.delete(intent.id);
+      if(popup?.id===intent.id)closePopup(false);notice=t('Кубик удалён. Сохранённые факты остались в истории.');error='';await refreshDashboard();
+    }catch(cause){
+      if(cause.status===409){deleteIntent=null;if(intent.noteId)await refreshDashboard();}
+      throw cause;
+    }finally{deleteBusy=false;if(!disposed)render();}
+  }
   function popupHtml(c){
     if(popup.tray==="history")return historyPopupHtml(c);const selected=isSelected(c.id),week=popup.tray==="week",type=c.type||typeOf(c),locked=["calendar","weekly_review"].includes(c.kind),min=c.kind==="prep"?0:5,max=c.kind==="prep"?120:240,timer=cubeTimerState(c);
     return '<header><span>'+safe(TYPES[type]||TYPES.task)+" · "+safe(week?t("Подготовка недели"):selected?t("Выбран в день"):t("Возможный кубик"))+'</span><button data-action="popup-close" aria-label="'+safe(t("Закрыть"))+'">'+ic("close")+'</button></header><h2 tabindex="-1">'+safe(c.title)+'</h2><p class="cc-popup-context">'+safe(c.taskTitle||c.sourceLabel||"")+(c.segmentTitle?" → "+safe(c.segmentTitle):"")+'</p>'+importanceControl(c)+'<label class="cc-range">'+safe(t("Длительность"))+'<b data-popup-duration>'+safe(minutes(c.minutes))+'</b><input type="range" data-popup-field="minutes" min="'+min+'" max="'+max+'" step="5" value="'+c.minutes+'" '+(locked?"disabled":"")+' aria-label="'+safe(t("Длительность кубика"))+'"></label><label class="cc-range">'+safe(t("Готовность"))+'<b data-popup-percent>'+formatReadiness(c.progress_percent)+'%</b><input type="range" data-popup-field="progress_percent" min="0" max="100" step="5" value="'+(c.progress_percent||0)+'" aria-label="'+safe(t("Готовность кубика"))+'"></label><label class="cc-actual">'+safe(t("Факт, мин"))+'<input type="number" data-popup-field="actual_minutes" min="0" max="100000" value="'+Math.round(c.actual_minutes||0)+'"></label>'+
       (week?'<label>'+safe(t("Дата подготовки"))+'<input type="date" data-popup-field="planned_date" value="'+safe(c.planned_date)+'"></label><p>'+safe(t("Появится в возможных"))+" "+safe(dateLabel(c.planned_date,true))+'</p>':"")+
       (selected?'<section class="cc-popup-timer"><div><b data-timer>'+formatTime(timer.remaining_ms)+'</b><span data-timer-status>'+safe(timer.status)+'</span></div><div><button data-action="timer-start">'+safe(t("Приступить"))+'</button><button data-action="timer-pause">'+safe(t("Пауза"))+'</button><button data-action="timer-stop">'+safe(t("Стоп"))+'</button><button data-action="done">'+safe(t("Готово"))+'</button></div><small>'+safe(t("Время не меняет готовность. Следующий кубик запускается вручную."))+'</small></section>':"")+
-      '<div class="cc-popup-actions">'+(week?'<button class="cc-primary" data-action="preview-date" data-date="'+safe(c.planned_date)+'">'+safe(t("Посмотреть в плане"))+" "+safe(dateLabel(c.planned_date))+'</button>':selected?'<button data-action="return" data-id="'+safe(c.id)+'">'+safe(t("В возможные"))+'</button><button data-action="'+(c.start==null?"on-timeline":"float")+'" data-id="'+safe(c.id)+'">'+safe(c.start==null?t("На шкалу"):t("В россыпь"))+'</button>':'<button class="cc-primary" data-action="select" data-id="'+safe(c.id)+'">'+safe(t("В день"))+'</button>')+(!week?'<button data-action="hide" data-id="'+safe(c.id)+'">'+safe(t("Не сегодня"))+'</button>':"")+'</div>'+resourcesHtml(c)+
-      '<details class="cc-popup-details" data-fold="details"><summary>'+safe(t("Подробности"))+'</summary><label>'+safe(t("Название"))+'<input data-popup-field="title" maxlength="300" value="'+safe(c.title)+'"></label><label>'+safe(t("Шаги"))+'<textarea data-popup-field="steps" rows="2">'+safe((c.steps||[]).join("\n"))+'</textarea></label><label>'+safe(t("Ожидаемый результат"))+'<textarea data-popup-field="output" rows="2">'+safe(c.output)+'</textarea></label><label>'+safe(t("Комментарий агенту"))+'<textarea data-popup-field="comment" rows="2">'+safe(c.comment)+'</textarea></label></details><p class="cc-popup-save" data-popup-save>'+safe(popupConflicts.has(c.id)?t("Поле изменилось в другой вкладке. Черновик сохранён — выберите нужную версию."):t("Изменения сохраняются в Work"))+'</p>'+(popupConflicts.has(c.id)?'<div class="cc-popup-actions"><button data-action="popup-latest">'+safe(t("Взять актуальную версию"))+'</button><button data-action="popup-overwrite">'+safe(t("Сохранить мой вариант"))+'</button></div>':'');
+      '<div class="cc-popup-actions">'+(week?'<button class="cc-primary" data-action="preview-date" data-date="'+safe(c.planned_date)+'">'+safe(t("Посмотреть в плане"))+" "+safe(dateLabel(c.planned_date))+'</button>':selected?'<button data-action="return" data-id="'+safe(c.id)+'">'+safe(t("В возможные"))+'</button><button data-action="'+(c.start==null?"on-timeline":"float")+'" data-id="'+safe(c.id)+'">'+safe(c.start==null?t("На шкалу"):t("В россыпь"))+'</button>':'<button class="cc-primary" data-action="select" data-id="'+safe(c.id)+'" '+(c.allocation_stale?'disabled':'')+'>'+safe(t("В день"))+'</button>')+(!week?'<button data-action="hide" data-id="'+safe(c.id)+'">'+safe(t("Не сегодня"))+'</button>':"")+'</div>'+resourcesHtml(c)+
+      '<details class="cc-popup-details" data-fold="details"><summary>'+safe(t("Подробности"))+'</summary><label>'+safe(t("Название"))+'<input data-popup-field="title" maxlength="300" value="'+safe(c.title)+'"></label><label>'+safe(t("Шаги"))+'<textarea data-popup-field="steps" rows="2">'+safe((c.steps||[]).join("\n"))+'</textarea></label><label>'+safe(t("Ожидаемый результат"))+'<textarea data-popup-field="output" rows="2">'+safe(c.output)+'</textarea></label><label>'+safe(t("Комментарий агенту"))+'<textarea data-popup-field="comment" rows="2">'+safe(c.comment)+'</textarea></label></details><p class="cc-popup-save" data-popup-save>'+safe(popupConflicts.has(c.id)?t("Поле изменилось в другой вкладке. Черновик сохранён — выберите нужную версию."):t("Изменения сохраняются в Work"))+'</p>'+(popupConflicts.has(c.id)?'<div class="cc-popup-actions"><button data-action="popup-latest">'+safe(t("Взять актуальную версию"))+'</button><button data-action="popup-overwrite">'+safe(t("Сохранить мой вариант"))+'</button></div>':'')+deleteControls(c);
   }
   function resourcesHtml(c){
     const list=c.links||[],groups=c.groups||[],count=list.length+groups.reduce((n,g)=>n+(g.links||[]).length,0);
@@ -256,7 +307,11 @@ export function createWorkConstructor(root,ctx){
   function schedulePopupPosition(){if(popupFrame)return;popupFrame=requestAnimationFrame(()=>{popupFrame=null;positionPopup();});}
   function renderPopup(){
     const c=getPopupCube();if(!c){closePopup(false);return;}const old=document.querySelector("[data-constructor-popup]"),active=document.activeElement,focus=old?.contains(active)?{...active.dataset}:null,start=active?.selectionStart,end=active?.selectionEnd,scroll=old?.scrollTop||0,folds=Object.fromEntries([...(old?.querySelectorAll("[data-fold]")||[])].map(el=>[el.dataset.fold,el.open]));
-    old?.remove();const el=document.createElement("aside");el.className="cc-popup work-constructor";el.dataset.constructorPopup="";el.dataset.testid="cube-popup";el.setAttribute("role","dialog");el.setAttribute("aria-label",c.title);el.innerHTML=popupHtml(c);document.body.append(el);
+    old?.remove();const el=document.createElement("aside");el.className="cc-popup work-constructor";el.dataset.constructorPopup="";el.dataset.testid="cube-popup";el.setAttribute("role","dialog");el.setAttribute("aria-label",c.title);el.innerHTML=(popupDeleted()?'<p class="cc-warning" role="status">'+safe(deletedMessage())+'</p>':'')+popupHtml(c);document.body.append(el);
+    if(popupDeleted()||deletionFrozen()||deleteBusy)for(const control of el.querySelectorAll('input,textarea,select,button')){
+      if(['popup-close','deletion-check','delete-cancel'].includes(control.dataset?.action)&&!deleteBusy)continue;
+      if(control.matches?.('textarea,input[type=text],input:not([type])'))control.readOnly=true;else control.disabled=true;
+    }
     for(const fold of el.querySelectorAll("[data-fold]"))fold.open=!!folds[fold.dataset.fold];
     if(focus){const target=[...el.querySelectorAll("input,textarea,select")].find(n=>Object.entries(focus).every(([key,value])=>n.dataset[key]===value));target?.focus({preventScroll:true});try{if(typeof start==="number")target?.setSelectionRange(start,end);}catch{}}
     el.scrollTop=scroll;popupObserver?.disconnect();if(typeof ResizeObserver!=="undefined"){popupObserver=new ResizeObserver(schedulePopupPosition);popupObserver.observe(el);}positionPopup();updateTimers();
@@ -267,6 +322,7 @@ export function createWorkConstructor(root,ctx){
   }
   async function savePopupNow(id,tray){
     if(disposed)return;const draft=drafts.get(id);if(!draft||!dirtyFields.get(id)?.size)return;const sent=JSON.stringify(draft),dirty=new Set(dirtyFields.get(id)||[]),c={...find(id),...copy(draft)};let celebration=null;
+    requireMutableCube(c);
     try{
       if(tray!=="week"&&!model().initialized)await ensureDay();
       const base=popupBases.get(id)||copy(c),metadataDirty=[...dirty].some(key=>fields.includes(key)||key==="resources");
@@ -341,7 +397,8 @@ export function createWorkConstructor(root,ctx){
   }
   const awakeIds=new Set();
   function queuePositions(tray,key,positions){
-    const known=Object.fromEntries(Object.entries(positions).filter(([id])=>planning()?.constructor?.cubes?.[id]));if(!Object.keys(known).length)return;
+    if(deletionFrozen()||deleteBusy)return;
+    const known=Object.fromEntries(Object.entries(positions).filter(([id])=>planning()?.constructor?.cubes?.[id]&&!isDeletedCube(planning(),{id})));if(!Object.keys(known).length)return;
     const canonicalPositions=tray==="week"?Object.fromEntries(Object.keys(known).map(id=>[id,planning()?.constructor?.cubes?.[id]?.week_position])):planning()?.constructor?.days?.[selectedDate]?.positions?.[tray]||{};
     const changed=Object.entries(known).some(([id,p])=>{const old=canonicalPositions[id];return !old||Math.abs(old.x-p.x)>.75||Math.abs(old.y-p.y)>.75||Math.abs(old.angle-p.angle)>.75;});
     if(!changed||tray!=="week"&&!model().initialized)return;
@@ -349,7 +406,8 @@ export function createWorkConstructor(root,ctx){
   }
   async function flushPositions(){
     const changes=[...positionChanges.values()];positionChanges.clear();
-    try{for(const change of changes)if(change.tray==="week"){for(const [id,position] of Object.entries(change.positions))await commit("constructor_cube",{cube_id:id,week_position:position},{quiet:true});}else await commit("constructor_day",{date:change.date,positions:{[change.tray]:change.positions}},{quiet:true});}catch{positionChanges.clear();}
+    if(deletionFrozen()||deleteBusy)return;
+    try{for(const change of changes){const positions=Object.fromEntries(Object.entries(change.positions).filter(([id])=>!isDeletedCube(planning(),{id})));if(!Object.keys(positions).length)continue;if(change.tray==="week"){for(const [id,position] of Object.entries(positions))await commit("constructor_cube",{cube_id:id,week_position:position},{quiet:true});}else await commit("constructor_day",{date:change.date,positions:{[change.tray]:positions}},{quiet:true});}}catch{positionChanges.clear();}
   }
   function bindWheel(){const strip=$(".cc-task-strip");strip?.addEventListener("wheel",event=>{if(Math.abs(event.deltaX)>Math.abs(event.deltaY)||strip.scrollWidth<=strip.clientWidth)return;const next=clamp(strip.scrollLeft+event.deltaY,0,strip.scrollWidth-strip.clientWidth);if(next!==strip.scrollLeft){event.preventDefault();strip.scrollLeft=next;}},{passive:false});}
   const snapSlot=(id,duration,desired)=>nearestPlanningSlot(planning(),occupied(id),duration,desired);
@@ -406,6 +464,12 @@ export function createWorkConstructor(root,ctx){
   }
   async function action(button,event){
     const name=button.dataset.action,id=button.dataset.id||popup?.id,c=id?find(id):null;
+    if((deleteBusy||deletionFrozen())&&!readAction(name))throw new Error(t('Удаление ещё выполняется. Другие изменения Work временно приостановлены.'));
+    if(!readAction(name)&&c)requireMutableCube(c);
+    if(name==='deletion-check'){await ctx.refreshWork?.();await refreshPending();await refreshDashboard();return;}
+    if(name==='delete-ask')return askDelete();
+    if(name==='delete-confirm')return deleteConfirmed();
+    if(name==='delete-cancel'){deleteIntent=null;renderPopup();return;}
     if(["mode-day","mode-week","mode-month"].includes(name)){closePopup();mode=name==="mode-day"?"day":name==="mode-week"?"week":"month";render();return;}
     if(name==="previous"||name==="next"||name==="today"||name==="preview-date"){closePopup();selectedDate=name==="today"?todayIn(planning()?.settings?.timezone):name==="preview-date"?button.dataset.date:shiftDate(selectedDate,name==="previous"?-1:1);mode="day";error="";render();return;}
     if(name==="goal-close")return commit("constructor_goal_status",{scope:button.dataset.scope,date:button.dataset.goalDate,status:button.dataset.status});
@@ -468,6 +532,7 @@ export function createWorkConstructor(root,ctx){
   function reportError(cause){error=cause?.message||String(cause);toast(error);render();}
   function handleInput(event){
     const el=event.target;if(!root.contains(el)&&!el.closest("[data-constructor-popup]"))return;
+    if(deletionFrozen()||deleteBusy||popupDeleted())return;
     if(el.dataset.field==="search"){search=el.value;render();return;}
     if(el.dataset.field==="energy"){const label=$("[data-energy]");if(label)label.textContent=el.value;return;}
     if(!popup)return;
@@ -485,6 +550,7 @@ export function createWorkConstructor(root,ctx){
   }
   function handleChange(event){
     const el=event.target;if(!root.contains(el)&&!el.closest("[data-constructor-popup]"))return;
+    if((deletionFrozen()||deleteBusy||popupDeleted())&&!['date','history-month','search'].includes(el.dataset.field))return;
     if(el.dataset.field==='month-plan-month'){const draft=monthPlanDraft(),plan=approvedMonthlyPlan(planning());draft.month=el.value;draft.taskIds=plan?.month===el.value?[...plan.task_ids]:[];render();return;}
     if(el.dataset.field==='month-plan-task'){const draft=monthPlanDraft();draft.taskIds=el.checked?[...new Set([...draft.taskIds,el.dataset.task])]:draft.taskIds.filter(id=>id!==el.dataset.task);render();return;}
     if(el.dataset.field==='source-importance'){const c=find(el.dataset.id)||historyCubes(planning(),{includeArchived:true}).find(cube=>cube.id===el.dataset.id);if(c)void changeSourceImportance(c,Number(el.value)).catch(reportError);return;}
@@ -499,6 +565,7 @@ export function createWorkConstructor(root,ctx){
   }
   function cleanupDrag(){const orbit=$(".cc-orbit-host");if(orbit&&!disposed)orbit.innerHTML=orbitHtml(model());if(drag?.source){drag.source.style.opacity="";drag.source.classList.remove("is-resizing");}drag?.ghost?.remove();drag=null;$(".cc-snap")?.remove();for(const el of root.querySelectorAll(".is-drop"))el.classList.remove("is-drop");}
   function pointerDown(event){
+    if(deletionFrozen()||deleteBusy)return;
     if(event.button!==0||!root.contains(event.target))return;const element=event.target.closest("[data-ccube]");if(!element||element.dataset.tray==="week"||!writable())return;
     const c=find(element.dataset.ccube);if(!c||Number(c.progress_percent)>=100||poolPinned()&&!isSelected(c.id))return;
     if(event.target.closest("[data-timeline-resize]")){
@@ -579,7 +646,13 @@ export function createWorkConstructor(root,ctx){
     const cube=event.target.closest?.("[data-ccube]");if(cube&&["Enter"," "].includes(event.key)){event.preventDefault();openPopup(cube.dataset.ccube,cube,cube.dataset.tray);}
   }
   function updateTimers(){const c=getPopupCube(),el=document.querySelector("[data-constructor-popup]");if(!c||!el)return;const state=cubeTimerState(c),clockEl=el.querySelector("[data-timer]"),status=el.querySelector("[data-timer-status]");if(clockEl)clockEl.textContent=formatTime(state.remaining_ms);if(status)status.textContent=(state.status==="running"?t("Идёт работа"):state.status==="paused"?t("Пауза"):state.status==="finished"?t("Время вышло"):t("Не запущен"));}
-  function remoteChanged(){if(!monthlyEditorOpen)monthlyDraft=null;if(document.activeElement?.closest?.("[data-constructor-popup]")){notice=t("Work обновился. Ваш ввод сохранён в редакторе.");return;}render();}
+  function remoteChanged(){
+    void Promise.resolve(ctx.pendingDraft?.()).then(next=>{if(!disposed&&JSON.stringify(next||null)!==JSON.stringify(pending)){pending=next||null;render();}}).catch(()=>{});
+    if(!monthlyEditorOpen)monthlyDraft=null;
+    if(popupDeleted()){clearTimeout(saveTimer);deleteIntent=null;notice=deletedMessage();render();return;}
+    if(deletionFrozen()||deletionState().conflicts.length){clearTimeout(saveTimer);render();return;}
+    if(document.activeElement?.closest?.("[data-constructor-popup]")){notice=t("Work обновился. Ваш ввод сохранён в редакторе.");return;}render();
+  }
   function outerDown(event){if(popup&&!event.target.closest("[data-constructor-popup]")&&!event.target.closest("[data-ccube]"))closePopup();}
   function toggle(event){if(event.target.matches?.("[data-month-plan-editor]"))monthlyEditorOpen=event.target.open;if(event.target.matches?.(".rc-task-choice"))taskPanelOpen=event.target.open;if(event.target.closest?.("[data-constructor-popup]"))schedulePopupPosition();}
   function resize(){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{snapshotPhysics();localPositions.clear();localPositionWidths.clear();render();positionPopup();},140);}

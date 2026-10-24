@@ -371,8 +371,8 @@ class Store:
                 # Keep pending failures visible and retry them on the next command.
                 continue
 
-    def _operation(self, db, note_id, kind, changes, reverses=None):
-        op_id = uuid4().hex
+    def _operation(self, db, note_id, kind, changes, reverses=None, *, operation_id=None):
+        op_id = operation_id or uuid4().hex
         db.execute("INSERT INTO operations (id,note_id,kind,changes,status,created,reverses) VALUES (?,?,?,?,?,?,?)",
                    (op_id, note_id, kind, json_text(changes), "pending", self.clock().isoformat(), reverses))
         db.commit()  # Durable intent precedes the first filesystem mutation.
@@ -761,31 +761,59 @@ class Store:
             return {"operation_id": operation_id,
                     "notes": [self._find(note_id) for note_id in ordered_ids]}
 
-    def delete(self, note_id, expected_version):
+    def _delete_changes(self, note_id, expected_version):
+        """Preflight shared by ordinary deletion and the narrow Work coordinator."""
+        note = self._find(note_id)
+        if not expected_version or note["version"] != expected_version:
+            raise ConflictError("Заметка уже изменена. Обновите список и повторите решение")
+        main_before = self._content(note["path"])
+        if digest(main_before) != expected_version:
+            raise ConflictError("Заметка изменилась во время чтения")
+        linked = [other for other in self._scan()[0] if other["id"] != note_id and
+                  (other.get("context_id") == note_id or other.get("source_capture_id") == note_id)]
+        if linked:
+            titles = ", ".join(other["title"] for other in linked[:3])
+            suffix = "" if len(linked) <= 3 else " и ещё " + str(len(linked) - 3)
+            raise ConflictError("Нельзя удалить запись: на неё ссылаются " + titles + suffix)
+        changes = [dict(path=note["path"], before=main_before, after=None)]
+        original_path = f"9 Система/Оригиналы/{note_id}.md"
+        original_before = self._content(original_path)
+        if original_before is not None:
+            changes.append(dict(path=original_path, before=original_before, after=None))
+        return changes
+
+    def delete(self, note_id, expected_version, *, operation_id=None, _coordinated=False):
         """Remove a note and its source copy through one reversible operation."""
+        if not _coordinated and operation_id is None:
+            from .work_delete import delete_linked_note
+            linked = delete_linked_note(self.root, note_id, expected_version)
+            if linked is not None:
+                return linked
         with self.lock, self._db() as db:
             self._recover(db)
-            note = self._find(note_id)
-            if not expected_version or note["version"] != expected_version:
-                raise ConflictError("Заметка уже изменена. Обновите список и повторите решение")
-
-            main_before = self._content(note["path"])
-            if digest(main_before) != expected_version:
-                raise ConflictError("Заметка изменилась во время чтения")
-
-            linked = [other for other in self._scan()[0] if other["id"] != note_id and
-                      (other.get("context_id") == note_id or other.get("source_capture_id") == note_id)]
-            if linked:
-                titles = ", ".join(other["title"] for other in linked[:3])
-                suffix = "" if len(linked) <= 3 else " и ещё " + str(len(linked) - 3)
-                raise ConflictError("Нельзя удалить запись: на неё ссылаются " + titles + suffix)
-
-            changes = [dict(path=note["path"], before=main_before, after=None)]
-            original_path = f"9 Система/Оригиналы/{note_id}.md"
-            original_before = self._content(original_path)
-            if original_before is not None:
-                changes.append(dict(path=original_path, before=original_before, after=None))
-            operation_id = self._operation(db, note_id, "delete", changes)
+            if operation_id is not None:
+                if not isinstance(operation_id, str) or not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+                    raise ValidationError("Некорректный ID операции удаления")
+                previous = db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+                if previous is not None:
+                    changes = json.loads(previous["changes"])
+                    if (previous["kind"] != "delete" or previous["note_id"] != note_id
+                            or not changes or digest(changes[0]["before"]) != expected_version):
+                        raise ConflictError("ID операции удаления уже использован")
+                    if previous["status"] == "pending":
+                        self._apply(db, previous)
+                    elif previous["status"] != "applied":
+                        raise ConflictError(previous["error"] or "Удаление конфликтует с внешней правкой")
+                    if any(self._content(change["path"]) != change["after"] for change in changes):
+                        raise ConflictError("Удалённая запись была восстановлена или изменена")
+                    if any(note["id"] == note_id for note in self._scan()[0]):
+                        raise ConflictError("Удалённая запись появилась в другом файле")
+                    return {"id": note_id, "deleted": True, "operation_id": operation_id}
+            if not _coordinated:
+                from .work_delete import guard_library_delete
+                guard_library_delete(self.root, note_id)
+            changes = self._delete_changes(note_id, expected_version)
+            operation_id = self._operation(db, note_id, "delete", changes, operation_id=operation_id)
             return {"id": note_id, "deleted": True, "operation_id": operation_id}
 
     def list_notes(self, *, validate_cached=False):
@@ -967,6 +995,9 @@ class Store:
                 raise ConflictError("Эту операцию нельзя отменить автоматически")
             if db.execute("SELECT 1 FROM operations WHERE reverses=? AND status IN ('applied','pending')", (operation_id,)).fetchone():
                 raise ConflictError("Эта операция уже отменена")
+            if op["kind"] == "delete":
+                from .work_delete import guard_note_undo
+                guard_note_undo(self.root, operation_id)
             changes = json.loads(op["changes"])
             for c in changes:
                 if self._content(c["path"]) != c["after"]:

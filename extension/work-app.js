@@ -397,8 +397,14 @@ async function main() {
   const freeze = blocked => {
     for (const child of [...document.body.children]) if (child !== timeHost) child.inert = blocked;
   };
-  store.onMigrationChange(blocked => freeze(blocked || !store.isWritable()));
-  if (!store.isWritable()) showWorkRecovery("conflict");
+  store.onMigrationChange(blocked => freeze(blocked || !store.isWritable()&&!store.getDeletionState().pending.length));
+  if (!store.isWritable()&&!store.getDeletionState().pending.length) showWorkRecovery("conflict");
+  const applyDeletionGate=()=>{
+    const blocked=store.getDeletionState().pending.length>0;
+    for(const selector of ['#cal-wrap','#board-wrap']){const element=$(selector);if(element)element.inert=blocked;}
+    if($('#drawer'))$('#drawer').inert=blocked||!ui.selectedId;
+    for(const selector of ['#add-task','#import-file','[data-act="import"]']){const element=$(selector);if(element)element.disabled=blocked;}
+  };
   const st = store.get();
   ui.days = st.view?.days || 7;
   if (st.view?.calH) $("#cal-wrap").style.height = `${st.view.calH}px`;
@@ -410,6 +416,8 @@ async function main() {
     get state() { return store.get(); },
     action: store.planningAction,
     pendingDraft: store.getPendingPlanningDraft,
+    deletionState: store.getDeletionState,
+    refreshWork: store.refreshRemote,
     retryDraft: store.retryPlanningDraft,
     discardDraft: store.discardPlanningDraft,
     openWorkspace: item => openWorkspace(item),
@@ -424,6 +432,8 @@ async function main() {
 
   let hadPlanning = !!st.planning;
   store.subscribe(meta => {
+    applyDeletionGate();
+    if(meta.from==='deletion'){planning.remoteChanged();return;}
     if (!hadPlanning && store.get()?.planning) { hadPlanning = true; setMode("plan"); }
     if (meta.from === "remote" && ui.mode === "plan") { renderHeader(); planning.remoteChanged(); return; }
     if (meta.from === "board" || meta.from === "quiet") return;
@@ -444,6 +454,7 @@ async function main() {
   });
 
   renderAll();
+  applyDeletionGate();
   board.render();
   checkPendingStop();
 

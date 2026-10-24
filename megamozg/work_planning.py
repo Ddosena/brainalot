@@ -82,6 +82,8 @@ def reconcile_segment_estimates(planning, previous):
     active.update(entry["segment_id"] for entry in planning.get("completed_cubes", {}).values()
                   if entry.get("segment_id") and (entry["percent"] or entry.get("actual_minutes")))
     active.update(lock.get("segment_id") for lock in planning.get("locks", []) if lock.get("segment_id"))
+    active.update(cube.get("segment_id") for cid, cube in planning.get("constructor", {}).get("cubes", {}).items()
+                  if cid in planning.get("cube_deletions", {}) and cube.get("segment_id"))
     for task_id in list(baseline):
         if task_id not in current_tasks:
             if any(segment["task_id"] == task_id and segment["id"] in active
@@ -518,6 +520,7 @@ def validate_planning(planning, state=None):
         raise ValidationError("planning.history: максимум 40")
     if not isinstance(planning.get("result", {}), dict):
         raise ValidationError("planning.result: требуется объект")
+    _validate_cube_deletions(planning)
     _validate_constructor(planning)
     exemptions = planning.get("scope_exemptions", {})
     if not isinstance(exemptions, dict):
@@ -858,7 +861,7 @@ def _segment_effective_credits(planning):
     return credits
 
 
-def _remaining(planning):
+def _remaining_before_deletions(planning):
     segments = {segment["id"]: segment for segment in planning.get("task_segments", [])}
     if not segments:
         return _remaining_unsegmented(planning)
@@ -897,6 +900,75 @@ def _remaining(planning):
         remaining[task_id] = max(0, remaining[task_id] - (effective-part["effective"]))
         part["effective"] = effective
     return remaining
+
+
+def latest_remaining_baseline(planning, task_id):
+    entries = [entry for entry in planning.get("day_outcomes", []) if entry["task_id"] == task_id
+               and (entry.get("remaining_minutes") is not None or entry.get("done"))]
+    if not entries:
+        return None
+    latest = max(entries, key=lambda entry: entry["date"])
+    return latest["date"], latest.get("remaining_minutes"), latest.get("done", False)
+
+
+def _retired_minutes(planning, *, by_segment=False, active_only=True):
+    retired = defaultdict(int)
+    for record in planning.get("cube_deletions", {}).values():
+        cube = planning.get("constructor", {}).get("cubes", {}).get(record["cube_id"], {})
+        key = cube.get("segment_id") if by_segment else cube.get("task_id")
+        epoch = planning.get("remaining_epochs", {}).get(cube.get("task_id"), 0)
+        if cube.get("kind") == "task" and key and (not active_only or record.get("remaining_epoch", 0) == epoch):
+            retired[key] += record["retired_minutes"]
+    return retired
+
+
+def _remaining(planning):
+    # Cancellation is not completion credit: reports and percentages stay untouched.
+    retired = _retired_minutes(planning)
+    return {tid: max(0, amount-retired[tid]) for tid, amount in _remaining_before_deletions(planning).items()}
+
+
+def deleted_cube(planning, cube_id, blueprint_ref=None):
+    records = planning.get("cube_deletions", {})
+    aliases = {value for value in (cube_id, blueprint_ref) if isinstance(value, str)}
+    if isinstance(cube_id, str) and cube_id.startswith("planned-"):
+        aliases.add(cube_id[len("planned-"):])
+    aliases.discard(None)
+    return cube_id in records or any(record.get("blueprint_ref") in aliases for record in records.values())
+
+
+def _validate_cube_deletions(planning):
+    records = planning.get("cube_deletions", {})
+    if not isinstance(records, dict) or len(records) > 10000:
+        raise ValidationError("cube_deletions: требуется map до10000")
+    cubes = planning.get("constructor", {}).get("cubes", {})
+    epochs = planning.get("remaining_epochs", {})
+    task_ids = {task["id"] for task in planning.get("tasks", [])}
+    if not isinstance(epochs, dict) or any(tid not in task_ids for tid in epochs):
+        raise ValidationError("remaining_epochs: требуется map известных задач")
+    for epoch in epochs.values():
+        _int(epoch, "remaining epoch", 0)
+    fields = {"cube_id", "request_id", "deleted_at", "blueprint_ref", "retired_minutes", "selected_date", "remaining_epoch"}
+    for cube_id, record in records.items():
+        if not isinstance(record, dict) or set(record) != fields or record["cube_id"] != cube_id:
+            raise ValidationError("cube_deletions: неверные поля")
+        cube = cubes.get(cube_id)
+        if not isinstance(cube, dict) or cube.get("kind") not in {"task", "brainalot"}:
+            raise ValidationError("cube_deletions: отсутствует исторический кубик")
+        _int(cube.get("minutes"), "deleted cube minutes", 1, 1440)
+        identifier(record["request_id"], "delete request_id")
+        _int(record["retired_minutes"], "retired_minutes", 0, cube["minutes"])
+        _int(record["remaining_epoch"], "deleted remaining_epoch", 0, epochs.get(cube.get("task_id"), 0))
+        if record["blueprint_ref"] is not None:
+            identifier(record["blueprint_ref"], "deleted blueprint_ref")
+        if record["selected_date"] is not None:
+            _day(record["selected_date"], "deleted selected_date")
+        try:
+            stamp = datetime.fromisoformat(record["deleted_at"])
+            if stamp.tzinfo is None or stamp.utcoffset() != timedelta(0):
+                raise ValueError()
+        except (ValueError, TypeError) as exc:
+            raise ValidationError("deleted_at: требуется время UTC") from exc
 
 
 def _priority(task, remaining, day, settings):
@@ -1106,9 +1178,11 @@ def _task_pool(planning, cubes, days):
             auto_future[cube["task_id"]] += cube["minutes"]
     actual_remaining = _remaining(planning)
     credits = _segment_effective_credits(planning)
+    retired = _retired_minutes(planning, by_segment=True)
     segments_by_task = defaultdict(list)
     for segment in planning.get("task_segments", []):
-        remaining_segment = max(0, segment["minutes"]-credits.get(segment["id"], 0))
+        remaining_segment = min(actual_remaining[segment["task_id"]], max(
+            0, segment["minutes"]-credits.get(segment["id"], 0)-retired[segment["id"]]))
         if remaining_segment <= 0:
             continue
         segments_by_task[segment["task_id"]].append({
@@ -1136,10 +1210,12 @@ def _task_pool(planning, cubes, days):
 
 def _refresh_result_remaining(planning):
     actual = _remaining(planning)
+    cancelled = _retired_minutes(planning, active_only=False)
     for task in planning.get("result", {}).get("tasks", []):
         task["remaining_minutes"] = actual.get(task["id"], 0)
         task["active_remaining_minutes"] = 0 if _scope_exempt(planning, task["id"]) else task["remaining_minutes"]
         task["scope_exempt"] = _scope_exempt(planning, task["id"])
+        task["cancelled_minutes"] = cancelled[task["id"]]
 
 
 def calculate(planning, *, from_date=None, reason="recalculate"):
@@ -1156,7 +1232,8 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                       if start > requested else None)
     ledger = _ledger(planning, days)
     old = planning.get("result", {})
-    old_cubes = [deepcopy(c) for c in old.get("cubes", []) if c.get("date", "") < start.isoformat()]
+    old_cubes = [deepcopy(c) for c in old.get("cubes", []) if c.get("date", "") < start.isoformat()
+                 and not deleted_cube(planning, c["id"], c["id"])]
     old_days = [deepcopy(d) for d in old.get("days", []) if d.get("date", "") < start.isoformat()]
     reported_cube_by_day = defaultdict(list)
     for entry in planning.get("completed_cubes", {}).values():
@@ -1364,10 +1441,15 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                         if is_early_secondary:
                             early_weekly[week] += available
                         available = 0
+        if early_cube and deleted_cube(planning, early_cube["id"], early_cube["id"]):
+            early_cube = None
         if early_cube:
             placed.append(early_cube)
             remaining[early_cube["task_id"]] -= 60
             early_weekly[week] += 60
+        for blocked in [cube for cube in placed if deleted_cube(planning, cube["id"], cube["id"])]:
+            remaining[blocked["task_id"]] += blocked["minutes"]
+        placed = [cube for cube in placed if not deleted_cube(planning, cube["id"], cube["id"])]
         cubes.extend(placed)
         planned = sum(x["minutes"] for x in locks) + sum(x["minutes"] for x in placed)
         secondary_exception = priority_active and focus and task_by_id[focus]["course"] == planning["settings"].get("priority_course") and any(
@@ -1429,6 +1511,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
         active_demand = 0 if exempt else demand
         deficit = max(0, active_demand-assigned)
         record = {**task, "remaining_minutes": demand,
+                  "cancelled_minutes": _retired_minutes(planning, active_only=False)[tid],
                   "active_remaining_minutes": active_demand, "scope_exempt": exempt,
                   "scheduled_by_due_minutes": assigned, "deficit_by_due_minutes": deficit,
                   "remaining_at_horizon_minutes": 0 if exempt else remaining[tid]}
@@ -1859,6 +1942,8 @@ def apply_segment_action(planning, action, data):
         _validate_cube_detail({"title": title, "output": output or "Результат этапа",
                                "steps": steps or ["Выполнить этап"]})
         started = set(planning.get("segment_progress", {}))
+        started.update(cube.get("segment_id") for cid, cube in planning.get("constructor", {}).get("cubes", {}).items()
+                       if cid in planning.get("cube_deletions", {}) and cube.get("segment_id"))
         started.update(entry["segment_id"] for entry in planning.get("completed_cubes", {}).values()
                        if entry.get("segment_id") and (entry["percent"] or entry.get("actual_minutes")))
         selected = {lock.get("segment_id") for lock in planning.get("locks", [])
@@ -2120,7 +2205,7 @@ def _validate_constructor(planning):
                 raise ValidationError("constructor source_ref: источник уже представлен")
             source_ids.add((kind, ref))
         minutes = _int(cube.get("minutes"), "constructor minutes", 0 if kind == "prep" else 1, 1440 if kind == "calendar" else 240)
-        if kind in {"task", "brainalot"} and (minutes < 5 or minutes % 5):
+        if kind in {"task", "brainalot"} and (minutes < 5 or minutes % 5) and not deleted_cube(planning, cube_id):
             raise ValidationError("constructor minutes: 5..240 шаг5")
         if kind == "prep" and (minutes > 120 or minutes % 5) or kind == "weekly_review" and minutes != 60:
             raise ValidationError("constructor source minutes: неверная длительность")
@@ -2305,6 +2390,11 @@ def _constructor_cube_update(planning, data):
     if set(data)-allowed or "cube_id" not in data:
         raise ValidationError("constructor_cube: неверные поля")
     cube_id = identifier(data["cube_id"], "cube_id")
+    if deleted_cube(planning, cube_id, data.get("blueprint_ref")):
+        raise ValidationError("Кубик удалён; повторное создание запрещено")
+    if data.get("blueprint_ref") and any(row["id"] == data["blueprint_ref"] and row.get("allocation_stale")
+                                         for row in planning.get("result", {}).get("cubes", [])):
+        raise ValidationError("Прогноз этапа устарел после удаления; явно пересчитайте план или нарежьте остаток")
     ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
     previous = ctor["cubes"].get(cube_id)
     cube = deepcopy(previous) if previous else {"id": cube_id, "minutes": 60, "output": "", "steps": [], "comment": "", "links": [], "groups": []}
@@ -2369,6 +2459,8 @@ def _constructor_allocation(planning, previous=None, *, check=True):
     for cube in ctor.get("cubes", {}).values():
         if cube["kind"] != "task":
             continue
+        if deleted_cube(planning, cube["id"]):
+            continue
         if _scope_exempt(planning, cube["task_id"]):
             continue
         report = _constructor_report(planning, cube)
@@ -2383,9 +2475,10 @@ def _constructor_allocation(planning, previous=None, *, check=True):
                 segment_alloc[lock["segment_id"]] += _lock_reservation(planning, lock)
     remaining = _remaining(planning)
     credits = _segment_effective_credits(planning)
+    retired = _retired_minutes(planning, by_segment=True)
     segments = {s["id"]: s for s in planning.get("task_segments", [])}
     overflow = {"task:"+tid: max(0, n-remaining.get(tid, 0)) for tid, n in task_alloc.items()}
-    overflow.update({"segment:"+sid: max(0, n-segments[sid]["minutes"]+credits.get(sid, 0)) for sid, n in segment_alloc.items()})
+    overflow.update({"segment:"+sid: max(0, n-segments[sid]["minutes"]+credits.get(sid, 0)+retired[sid]) for sid, n in segment_alloc.items()})
     overflow = {key: value for key, value in overflow.items() if value}
     baseline = _constructor_allocation(previous, check=False) if previous is not None else {}
     if check and any(value > baseline.get(key, 0) for key, value in overflow.items()):
@@ -2535,7 +2628,8 @@ def _goal_cube_catalog(planning):
                            if _constructor_event_required(planning, event)}
     for cube_id, cube in ctor.get("cubes", {}).items():
         report = _constructor_report(planning, cube)
-        catalog[cube_id] = {**deepcopy(cube), "selected_date": _constructor_selected_date(planning, cube_id),
+        deleted = planning.get("cube_deletions", {}).get(cube_id)
+        catalog[cube_id] = {**deepcopy(cube), "selected_date": deleted.get("selected_date") if deleted else _constructor_selected_date(planning, cube_id),
             "progress_percent": report.get("percent", 0), "actual_minutes": report.get("actual_minutes", 0),
             "report_date": report.get("date"), "fixed_calendar": cube["kind"] == "calendar" and cube["source_ref"] in fixed_calendar_refs}
         if cube.get("task_id") in tasks:
@@ -2632,6 +2726,8 @@ def _refresh_constructor_result(planning):
     days, cubes = {}, []
     overflow = _constructor_allocation(planning, check=False)
     for cube_id, cube in ctor.get("cubes", {}).items():
+        if deleted_cube(planning, cube_id):
+            continue
         key = _constructor_selected_date(planning, cube_id)
         report = _constructor_report(planning, cube)
         lock = next((lock for lock in planning.get("locks", []) if lock["cube_id"] == cube_id), {})
@@ -2717,7 +2813,8 @@ def _eligible_award_ids(planning):
     goals = {goal["id"] for goal in model["goals"] if goal["status"] != "cancelled" and
              (goal["status"] == "completed" or goal["achieved"])}
     cubes = {cube.get("canonical_id", cube_id) for cube_id, cube in model["goal_cubes"].items()
-             if cube.get("progress_percent") == 100 and not cube.get("alias_of") and not cube.get("archived_goal_member")}
+             if cube.get("progress_percent") == 100 and not cube.get("alias_of") and not cube.get("archived_goal_member")
+             and not deleted_cube(planning, cube_id)}
     return {"goals": goals, "cubes": cubes}
 
 
@@ -3083,6 +3180,8 @@ def project_task_importance(planning):
 def apply_action(planning, action, data):
     if not isinstance(data, dict):
         raise ValidationError("planning data: требуется объект")
+    if isinstance(data.get("cube_id"), str) and deleted_cube(planning, data["cube_id"]):
+        raise ValidationError("Кубик удалён; изменение исторических фактов запрещено")
     if action == "monthly_plan_approve":
         if set(data) != {"month", "task_ids"}:
             raise ValidationError("monthly_plan_approve: нужны только month,task_ids")
@@ -3176,6 +3275,10 @@ def apply_action(planning, action, data):
         entries[:] = [x for x in entries if (x["task_id"], x["date"]) != (task_id, day)]
         entries.append({"task_id": task_id, "date": day, "remaining_minutes": remaining,
                         "done": done, "note": note})
+        latest = latest_remaining_baseline(planning, task_id)
+        if latest and latest[0] == day and (remaining is not None or done):
+            epochs = planning.setdefault("remaining_epochs", {})
+            epochs[task_id] = epochs.get(task_id, 0)+1
         _refresh_result_remaining(planning)
         if day in planning.get("manual_days", {}):
             _refresh_manual_day(planning, day)
