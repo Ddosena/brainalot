@@ -1,5 +1,6 @@
 import "./desktop-platform.js";
 import { mountTimeUI } from "./time-ui.js";
+import { sharedApi } from "./time-client.js";
 // Work mode page: a week of projects with deadlines, a notes board and task
 // workspaces made of Chrome tab groups. Opened from the side panel's Work button.
 import * as store from "./work-store.js";
@@ -9,7 +10,7 @@ import * as tabs from "./work-tabs.js";
 import { createCalendar } from "./work-calendar.js";
 import { createDrawer } from "./work-drawer.js";
 import { createBoard } from "./work-board.js";
-import { createPlanning } from "./work-planning.js";
+import { createPlanning } from "./work-planning.js?v=constructor-20261023-a";
 import { applyDocument, localeChange, syncLocale, t } from "./i18n.js";
 
 const $ = s => document.querySelector(s);
@@ -412,6 +413,8 @@ async function main() {
     retryDraft: store.retryPlanningDraft,
     discardDraft: store.discardPlanningDraft,
     openWorkspace: item => openWorkspace(item),
+    openCubeWorkspace: (item, onlyGroup = null) => tabs.openWorkspace(item, onlyGroup),
+    readDashboard: () => sharedApi("/api/dashboard"),
     toast,
   });
   $("#mode-plan").onclick = () => setMode("plan");

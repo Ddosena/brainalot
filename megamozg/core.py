@@ -47,11 +47,12 @@ class NotFoundError(LookupError):
 KINDS = {"inbox", "task", "purchase", "media", "idea", "thought", "link", "project", "person"}
 MEDIA = {"movie", "series", "book", "game", "podcast", "article"}
 IMPORTANCE = {"low", "normal", "high", "critical"}
+LEGACY_IMPORTANCE_SCORES = {"low": 1, "normal": 2, "high": 4, "critical": 5}
 IMPORTANCE_WEIGHTS = {"low": 1, "normal": 2, "high": 3, "critical": 4}
 PROJECT_IDEA_RECALL_INTERVAL = 20
 IMPORTANCE_LABELS = {"low": "низкая", "normal": "обычная", "high": "высокая", "critical": "очень высокая"}
 STATUSES = {"inbox", "active", "done", "cancelled", "archived"}
-FIELDS = {"title", "body", "kind", "due", "media_type", "status", "tags", "url", "context_id", "topic", "importance", "show_in_carousel", "show_in_unscheduled", "planning_horizon", "attachments"}
+FIELDS = {"title", "body", "kind", "due", "media_type", "status", "tags", "url", "context_id", "topic", "importance", "importance_score", "show_in_carousel", "show_in_unscheduled", "planning_horizon", "attachments"}
 FOLDERS = {
     "inbox": "1 Входящие", "task": "2 Дела/Задачи", "purchase": "2 Дела/Покупки",
     "media": "3 Библиотека", "idea": "4 Идеи и мысли/Идеи",
@@ -74,6 +75,19 @@ def folder(note: dict) -> str:
     if note["kind"] == "media":
         base += "/" + MEDIA_FOLDERS[note["media_type"]]
     return base
+
+
+def validate_importance_score(value):
+    if type(value) is not int or not 0 <= value <= 5:
+        raise ValidationError("Важность: целое число от 0 до 5")
+    return value
+
+
+def legacy_importance(score, kind):
+    """The explicit numeric score wins when both representations are supplied."""
+    validate_importance_score(score)
+    return ("low" if score <= 1 else "normal" if score == 2 else
+            "critical" if score == 5 and kind in ("task", "purchase") else "high")
 
 
 def validate(meta: dict) -> None:
@@ -136,6 +150,8 @@ def validate(meta: dict) -> None:
         raise ValidationError("Важность: low, normal, high или critical")
     if importance == "critical" and meta["kind"] not in {"task", "purchase"}:
         raise ValidationError("Очень высокая важность доступна только для дел и покупок")
+    if "importance_score" in meta:
+        validate_importance_score(meta["importance_score"])
     if not isinstance(meta.get("show_in_carousel", True), bool):
         raise ValidationError("Показ в карусели должен быть true или false")
     if not isinstance(meta.get("show_in_unscheduled", False), bool):
@@ -191,6 +207,9 @@ def decode_note(content: str) -> tuple[dict, str]:
     meta.setdefault("context_id", None)
     meta.setdefault("topic", None)
     meta.setdefault("importance", "normal")
+    if ("importance_score" not in meta and isinstance(meta["importance"], str)
+            and meta["importance"] in LEGACY_IMPORTANCE_SCORES):
+        meta["importance_score"] = LEGACY_IMPORTANCE_SCORES[meta["importance"]]
     meta.setdefault("show_in_carousel", True)
     meta.setdefault("show_in_unscheduled", False)
     meta.setdefault("planning_horizon", None)
@@ -559,7 +578,11 @@ class Store:
     def capture(self, text, *, kind="inbox", title=None, due=None, media_type=None,
                 url=None, tags=None, source="manual", external_id=None, source_capture_id=None,
                 context_id=None, topic=None, importance="normal", show_in_unscheduled=False,
-                planning_horizon=None, attachments=None):
+                planning_horizon=None, attachments=None, importance_score=None):
+        if importance_score is not None:
+            importance = legacy_importance(importance_score, kind)
+        elif isinstance(importance, str) and importance in LEGACY_IMPORTANCE_SCORES:
+            importance_score = LEGACY_IMPORTANCE_SCORES[importance]
         attachments = [] if attachments is None else self._normalize_attachments(attachments)
         if not isinstance(text, str) or (not text.strip() and not attachments) or len(text) > 50000 or "\x00" in text:
             raise ValidationError("Текст: от 1 до 50000 символов или вложение")
@@ -572,14 +595,16 @@ class Store:
             planning_horizon = None
         payload = dict(text=text, kind=kind, title=title, due=due, media_type=media_type,
                        url=url, tags=tags, source=source, source_capture_id=source_capture_id,
-                       context_id=context_id, topic=topic, importance=importance, show_in_carousel=True,
+                       context_id=context_id, topic=topic, importance=importance,
+                       importance_score=importance_score, show_in_carousel=True,
                        show_in_unscheduled=show_in_unscheduled, planning_horizon=planning_horizon,
                        attachments=[{"id": item["id"], "name": item["name"]} for item in attachments])
         meta = dict(id=uuid4().hex, title=title or (" ".join(text.split())[:120] if text.strip() else attachments[0]["name"][:120]), kind=kind,
                     status="inbox" if kind == "inbox" else "active", created=self.clock().isoformat(),
                     due=due, media_type=media_type, tags=tags, url=url, source=source,
                     completed_at=None, source_capture_id=source_capture_id,
-                    context_id=context_id, topic=topic, importance=importance, show_in_carousel=True,
+                    context_id=context_id, topic=topic, importance=importance,
+                    importance_score=importance_score, show_in_carousel=True,
                     show_in_unscheduled=show_in_unscheduled, planning_horizon=planning_horizon,
                     manual_order=None, attachments=attachments)
         validate(meta)
@@ -597,6 +622,7 @@ class Store:
                                      ("show_in_carousel", True), ("show_in_unscheduled", False),
                                      ("planning_horizon", None), ("attachments", [])):
                     previous_payload.setdefault(key, default)
+                previous_payload.setdefault("importance_score", LEGACY_IMPORTANCE_SCORES.get(previous_payload["importance"]))
                 if json_text(previous_payload) != json_text(payload):
                     raise ConflictError("Этот ID события уже использован для другого содержания")
                 failed = db.execute("SELECT status FROM operations WHERE note_id=? AND kind='capture'", (old["note_id"],)).fetchone()
@@ -641,6 +667,10 @@ class Store:
             body = body.replace("\r\n", "\n").replace("\r", "\n")
         old_title = meta["title"]
         meta.update(patch)
+        if "importance_score" in patch:
+            meta["importance"] = legacy_importance(patch["importance_score"], meta["kind"])
+        elif "importance" in patch:
+            meta["importance_score"] = LEGACY_IMPORTANCE_SCORES.get(patch["importance"] if isinstance(patch["importance"], str) else None)
         if "title" in patch and not body_was_patched:
             generated_heading = re.match(r"^(\s*# )([^\r\n]+)(\r?\n)", body)
             if generated_heading and generated_heading.group(2) == old_title:

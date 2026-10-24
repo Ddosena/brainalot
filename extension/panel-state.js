@@ -1,4 +1,5 @@
 import { locale, localeTag, t } from "./i18n.js";
+import { validImportanceScore } from "./importance-score.js";
 /** Serialize refreshes while preserving a request that arrives during an active read. */
 export function createRefreshGate(read) {
   let running = null;
@@ -12,7 +13,7 @@ export function createRefreshGate(read) {
   };
 }
 
-export function capturePayload({text, kind, due, planningHorizon = null, mediaType, contextId, topic, importance, showInUnscheduled = false}) {
+export function capturePayload({text, kind, due, planningHorizon = null, mediaType, contextId, topic, importance, importanceScore = null, showInUnscheduled = false}) {
   const task = ["task", "purchase"].includes(kind);
   return {
     text, kind,
@@ -22,6 +23,7 @@ export function capturePayload({text, kind, due, planningHorizon = null, mediaTy
     context_id: contextId || null,
     topic: topic || null,
     importance,
+    ...(validImportanceScore(importanceScore) ? {importance_score:importanceScore} : {}),
     show_in_unscheduled: kind === "thought" && Boolean(showInUnscheduled),
   };
 }
@@ -38,7 +40,7 @@ export function markdownNoteBody(title, text = "") {
   return `\n# ${String(title).trim()}\n${content ? `\n${content}\n` : ""}`;
 }
 
-export function editNotePatch({title, text, kind, schedule = "none", exactDate = null, mediaType = null, contextId = null, topic = null, importance = "normal", url = null, showInCarousel = true, showInUnscheduled = false}) {
+export function editNotePatch({title, text, kind, schedule = "none", exactDate = null, mediaType = null, contextId = null, topic = null, importance = "normal", importanceScore = null, url = null, showInCarousel = true, showInUnscheduled = false}) {
   const cleanTitle = String(title).trim();
   if (!cleanTitle) throw new Error(t("Укажите название записи."));
   const task = ["task", "purchase"].includes(kind);
@@ -53,6 +55,7 @@ export function editNotePatch({title, text, kind, schedule = "none", exactDate =
     context_id: contextId || null,
     topic: String(topic || "").trim() || null,
     importance,
+    ...(validImportanceScore(importanceScore) ? {importance_score:importanceScore} : {}),
     url: String(url || "").trim() || null,
     show_in_carousel: Boolean(showInCarousel),
     show_in_unscheduled: kind === "thought" && Boolean(showInUnscheduled),

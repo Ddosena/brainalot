@@ -23,3 +23,11 @@ test("recorded minutes follow cube identity and do not credit completion",async(
   assert.deepEqual(timer.state(cube),{status:"idle",elapsed_ms:0,remaining_ms:1800000});
   assert.equal(cube.progress_percent,undefined);
 });
+
+test("constructor explicit duration supports 240 minutes without changing the shared preset",async()=>{
+  const calls=[],client={state:null,async refresh(){return this.state;},async command(action,data){calls.push({action,...data});return this.state;}},timer=createCubeTimer(client,async()=>({rows:[]}));
+  await timer.start({id:"long",title:"Long cube",minutes:240});
+  assert.equal(calls[0].duration_ms,14400000);
+  await assert.rejects(timer.start({id:"invalid",title:"Invalid",minutes:245}));
+  await assert.rejects(timer.start({id:"zero",title:"Rest",minutes:0}));
+});

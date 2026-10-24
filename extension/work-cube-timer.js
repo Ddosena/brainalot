@@ -10,7 +10,7 @@ export function createCubeTimer(client, api) {
   const related = (cube, state) => state?.task?.source === "work" && state.task.id === cubeTimerRef(cube).id;
   return {
     async start(cube) {
-      if (!Number.isInteger(cube.minutes) || cube.minutes < 1 || cube.minutes > 180) throw new Error(t("Укажите длительность кубика от 1 до 180 минут"));
+      if (!Number.isInteger(cube.minutes) || cube.minutes < 1 || cube.minutes > 240) throw new Error(t("Укажите длительность кубика от 1 до 240 минут"));
       const state = await client.refresh();
       if (related(cube, state) && state.mode === "pomodoro") {
         if (state.status === "running") return state;

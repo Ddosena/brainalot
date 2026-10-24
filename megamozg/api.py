@@ -523,7 +523,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.post("/api/captures")
     async def capture(request: Request):
-        data = await payload(request, {"text", "kind", "title", "due", "media_type", "url", "tags", "source", "external_id", "source_capture_id", "context_id", "topic", "importance", "show_in_unscheduled", "planning_horizon", "attachments"})
+        data = await payload(request, {"text", "kind", "title", "due", "media_type", "url", "tags", "source", "external_id", "source_capture_id", "context_id", "topic", "importance", "importance_score", "show_in_unscheduled", "planning_horizon", "attachments"})
         if "text" not in data:
             raise ValidationError("Требуется text")
         return await run_in_threadpool(lambda: store.capture(**data))

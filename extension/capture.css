@@ -58,3 +58,9 @@ body.capture-page{min-width:0;max-width:none;padding:0;min-height:100vh;backgrou
 [data-theme="dark"][data-design="glamour"] .capture-page .primary{background:#ff66be;color:#391331}
 @media(prefers-color-scheme:dark){:root:not([data-theme])[data-design="glamour"] .capture-page .primary{background:#ff66be;color:#391331}}
 @media(max-width:390px){.capture-shell{padding:15px 14px 22px}.shortcut{display:none}.capture-page .capture-actions{gap:6px}.capture-page .primary,.capture-page .secondary{padding:8px}}
+
+/* Shared numeric task importance; the thumb is a native keyboard control. */
+.importance-score-field{display:flex;align-items:center;gap:10px;margin:8px 0 12px;color:var(--ink);font-size:12px}
+.importance-score-field input[type="range"]{flex:1;min-width:0;width:auto;margin:0;padding:0;accent-color:var(--accent);cursor:pointer}
+.importance-score-field output{min-width:34px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+[hidden].importance-score-field{display:none}

@@ -69,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--topic", help="Короткая тема записи")
     capture.add_argument("--importance", choices=["low", "normal", "high", "critical"], default="normal",
                          help="critical доступен только для дел и покупок")
+    capture.add_argument("--importance-score", type=int, choices=range(6),
+                         help="Важность от 0 до 5; приоритетнее --importance")
     capture.add_argument("--show-in-unscheduled", action="store_true",
                          help="Показывать мысль среди бессрочных дел")
 
@@ -298,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                     kind=args.kind, title=args.title, due=args.due, media_type=args.media_type,
                     url=args.url, tags=args.tags, source=args.source, external_id=args.external_id,
                     source_capture_id=args.source_capture_id, context_id=args.context_id,
-                    topic=args.topic, importance=args.importance,
+                    topic=args.topic, importance=args.importance, importance_score=args.importance_score,
                     show_in_unscheduled=args.show_in_unscheduled,
                 )
             case "parse" | "dictate":

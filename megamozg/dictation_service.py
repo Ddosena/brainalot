@@ -26,11 +26,11 @@ from uuid import uuid4
 from filelock import FileLock
 
 from . import dictation
-from .core import ConflictError, ValidationError
+from .core import ConflictError, ValidationError, legacy_importance, validate_importance_score
 from .google_calendar_api import event_id_for
 
 
-OVERRIDE_FIELDS = {"kind", "title", "due", "planning_horizon", "media_type", "importance", "context_id",
+OVERRIDE_FIELDS = {"kind", "title", "due", "planning_horizon", "media_type", "importance", "importance_score", "context_id",
                    "tags", "route", "event", "keep_context_in_title"}
 TASK_KINDS = {"task", "purchase"}
 _EXTERNAL_ID = re.compile(r"[\w:.-]{1,160}")
@@ -157,6 +157,8 @@ def finish_plan(plan: dict) -> dict:
     """Drop fields the Store accepts only for some kinds of record."""
     kind = plan["kind"]
     final = dict(plan)
+    if "importance_score" in final:
+        final["importance"] = legacy_importance(final["importance_score"], kind)
     if kind not in TASK_KINDS:
         final["due"] = final["planning_horizon"] = None
     elif final.get("due") is not None:
@@ -270,7 +272,8 @@ class DictationService:
         return {**parsed, "calendar": _public_target(target), "effective_route": plan["route"], "plan": {
             key: plan.get(key) for key in ("route", "kind", "title", "due", "planning_horizon", "media_type",
                                            "importance", "context_id", "tags", "url", "event")
-        } | {"context_title": context["title"] if context else None, "context_kind": context["kind"] if context else None,
+        } | ({"importance_score": plan["importance_score"]} if "importance_score" in plan else {})
+          | {"context_title": context["title"] if context else None, "context_kind": context["kind"] if context else None,
              "reason": resolved["reason"], "warnings": resolved["warnings"]}}
 
     def _journal(self) -> dict:
@@ -303,6 +306,9 @@ class DictationService:
             raise ValidationError("Вложения должны быть списком")
         if not isinstance(show_in_unscheduled, bool):
             raise ValidationError("Показ в несрочных должен быть true или false")
+        # Validate before receipt comparison: Python considers False == 0 and 1.0 == 1.
+        if isinstance(overrides, dict) and "importance_score" in overrides:
+            validate_importance_score(overrides["importance_score"])
         if isinstance(topic, str):
             topic = topic.strip() or None
         now = self.moment(captured_at)
@@ -359,7 +365,8 @@ class DictationService:
                 text, kind=plan["kind"], title=plan["title"], due=plan.get("due"),
                 media_type=plan.get("media_type"), url=plan.get("url"), tags=plan.get("tags") or [],
                 source=source, external_id=external_id, context_id=plan.get("context_id"),
-                importance=plan.get("importance", "normal"), planning_horizon=plan.get("planning_horizon"),
+                importance=plan.get("importance", "normal"), importance_score=plan.get("importance_score"),
+                planning_horizon=plan.get("planning_horizon"),
                 attachments=attachments or None, topic=topic,
                 show_in_unscheduled=show_in_unscheduled and plan["kind"] == "thought")
             result = {"route": "note", "note": note, "event": None, "parsed": parsed, "warnings": warnings}

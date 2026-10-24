@@ -10,6 +10,8 @@ import { DOSSIER_SECTIONS, LIBRARY_CATEGORIES, dossierCounts, groupLibraryNotes,
 import { finishLibraryReturn, LIBRARY_SNAPSHOT_KEY, mayWriteLibrarySnapshot, normalizeLibrarySnapshot } from "./library-window.js";
 import { createCalendarOverlay, createNoteDeletionOverlay } from "./optimistic.js";
 import { CALENDAR_IMPORTANCE_KEY, FIRE_LIMIT, calendarImportanceKey, calendarImportanceLevel, fireGroupOfTask, importanceStep, normalizeCalendarImportance, withCalendarImportance } from "./importance-state.js";
+import { importanceScore, legacyForScore } from "./importance-score.js";
+import { bindTaskRename } from "./task-rename.js";
 import { createFireLayer, IGNITION_MS } from "./fire-layer.js";
 import { CALENDAR_CHANGED_KEY } from "./dictation.js";
 import { applyDocument, LOCALE_KEY, locale, localeChange, localeTag, saveLocale, setLocale, syncLocale, t } from "./i18n.js";
@@ -349,6 +351,14 @@ function renderNote(note, {task = false, movable = false, compact = movable, lib
   if (["task", "purchase"].includes(note.kind) || note.show_in_unscheduled) heading.append(taskTimeButton({source:"library", id:note.id, title:note.title}));
   const title = node("strong", "note-title", note.title);
   let taskDisclosureTimer = null;
+  if (["task", "purchase"].includes(note.kind)) bindTaskRename(title, note, {
+    onStart: () => clearTimeout(taskDisclosureTimer),
+    save: async value => {
+      await send("update", {id:note.id, version:note.version, patch:{title:value}});
+      await refresh();
+    },
+    onError: error => { notice(error.message, true); void refresh(); },
+  });
   let content = el;
   if (compact || library) {
     el.classList.add(library ? "compact-library" : "compact-task");
@@ -384,6 +394,31 @@ function renderNote(note, {task = false, movable = false, compact = movable, lib
     heading.append(details);
     content = details;
   } else heading.append(title);
+  if (task) {
+    const label = node("label", "task-importance-score");
+    const caption = node("span", "sr-only", t("Важность"));
+    const range = node("input");
+    range.type = "range"; range.min = "0"; range.max = "5"; range.step = "1";
+    range.value = String(importanceScore(note));
+    range.dataset.testid = "task-importance";
+    range.setAttribute("aria-label", t("Важность задачи «{title}»", {title:note.title}));
+    const output = node("output", "", range.value);
+    const reportValue = () => { output.value = range.value; range.setAttribute("aria-valuetext", `${range.value} / 5`); };
+    reportValue();
+    range.addEventListener("input", reportValue);
+    range.addEventListener("change", async () => {
+      const score = Number(range.value);
+      if (score === importanceScore(note)) return;
+      range.disabled = true;
+      try {
+        await send("update", {id:note.id, version:note.version, patch:{importance_score:score}});
+      } catch (error) { notice(error.message, true); }
+      finally { await refresh(); if (range.isConnected) range.disabled = false; }
+    });
+    for (const name of ["click", "dblclick", "pointerdown", "contextmenu"]) range.addEventListener(name, event => event.stopPropagation());
+    label.append(caption, range, output);
+    heading.append(label);
+  }
   if (task && compact) {
     const level = note.importance || "normal";
     el.classList.toggle("is-important", level === "high" || level === "critical");
@@ -1770,6 +1805,8 @@ function syncEditFields() {
   $("edit-show-in-unscheduled-label").hidden = !thought;
   if (!thought) $("edit-show-in-unscheduled").checked = false;
   // The fire marks only tasks and purchases, the rows that can burn in a list.
+  $("edit-score-row").hidden = !task;
+  $("edit-importance").closest("label").hidden = task;
   const critical = $("edit-importance").querySelector('option[value="critical"]');
   critical.hidden = !task;
   critical.disabled = !task;
@@ -1797,6 +1834,8 @@ function openEditor(note) {
   populateContexts($("edit-context"), note.context_id);
   $("edit-topic").value = note.topic || "";
   $("edit-importance").value = note.importance || "normal";
+  $("edit-importance-score").value = String(importanceScore(note));
+  $("edit-importance-output").value = String(importanceScore(note));
   $("edit-url").value = note.url || "";
   $("edit-show-in-carousel").checked = note.show_in_carousel !== false;
   $("edit-show-in-unscheduled").checked = Boolean(note.show_in_unscheduled);
@@ -1855,13 +1894,19 @@ $("edit-note-text").addEventListener("paste", event => {
   importEditFiles(images);
 });
 $("edit-kind").addEventListener("change", syncEditFields);
+$("edit-importance-score").addEventListener("input", event => {
+  const score = Number(event.target.value);
+  $("edit-importance-output").value = String(score);
+  event.target.setAttribute("aria-valuetext", `${score} / 5`);
+  $("edit-importance").value = legacyForScore(score, $("edit-kind").value);
+});
 $("edit-schedule").addEventListener("change", syncEditFields);
 $("edit-form").addEventListener("submit", async event => {
   event.preventDefault();
   if (!editingNote || editClosing) return;
   const button = $("edit-submit");
   if (button.disabled) return;
-  const fireGroup = editFireGroup();
+  const fireGroup = $("edit-score-row").hidden ? editFireGroup() : null;
   if (fireGroup && burningCount(fireGroup, noteFireKey(editingNote)) >= FIRE_LIMIT) {
     showEditError(fireGroup === "backlog"
       ? t("Среди дел без срока уже есть очень важное. Сначала погасите его.")
@@ -1891,6 +1936,7 @@ $("edit-form").addEventListener("submit", async event => {
       contextId:$("edit-context").value,
       topic:$("edit-topic").value,
       importance:$("edit-importance").value,
+      importanceScore:["task", "purchase"].includes($("edit-kind").value) ? Number($("edit-importance-score").value) : null,
       url:$("edit-url").value,
       showInCarousel:$("edit-show-in-carousel").checked,
       showInUnscheduled:$("edit-show-in-unscheduled").checked,

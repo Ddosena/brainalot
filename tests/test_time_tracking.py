@@ -240,6 +240,26 @@ def test_validation(tmp_path):
         cmd(t, "start", 0, "long", task={"source": "calendar", "id": "x" * 2049, "title": "A"})
 
 
+def test_long_work_cube_duration_survives_replay_and_pause(tmp_path):
+    clock = FakeClock()
+    timer = store(tmp_path, clock)
+    body = {"request_id": "long-cube", "expected_revision": 0, "action": "start",
+            "task": {"source": "work", "id": "work-cube:long", "title": "Long cube"},
+            "mode": "pomodoro", "duration_ms": 240 * 60_000}
+    started = timer.command(body)
+    assert started["duration_ms"] == 240 * 60_000
+    assert timer.command(body) == started
+    clock.advance(10_000)
+    paused = cmd(timer, "pause", started["revision"], "long-cube-pause")
+    assert paused["elapsed_ms"] == 10_000
+    assert paused["duration_ms"] == 240 * 60_000
+    with pytest.raises(ValidationError):
+        cmd(timer, "start", paused["revision"], "too-long", mode="pomodoro",
+            duration_ms=240 * 60_000 + 1)
+    assert timer.state()["revision"] == paused["revision"]
+    assert timer.state()["status"] == "paused"
+
+
 def test_reset_pomodoro_keeps_work_history(tmp_path):
     c = FakeClock()
     t = store(tmp_path, c)

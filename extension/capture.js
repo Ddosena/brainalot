@@ -5,6 +5,7 @@ import { checkAttachmentLimit, renderAttachmentList, storeAttachment } from "./a
 import { applyDocument, locale, localeChange, syncLocale, t, translateServerMessage } from "./i18n.js";
 import { AUTO, describePlan, dictationOverrides, dictationPayload, scheduleOverride, usesDictation } from "./dictation.js";
 import { attachDictation } from "./voice-recorder.js";
+import { validImportanceScore, scoreForLegacy } from "./importance-score.js";
 
 applyDocument();
 const $ = id => document.getElementById(id);
@@ -65,6 +66,8 @@ function scheduleOptions(selected = AUTO) {
 }
 function updateFields() {
   const kind = $("capture-kind").value;
+  $("capture-score-row").hidden = ![AUTO, "task", "purchase"].includes(kind);
+  $("capture-importance").closest("label").hidden = !$("capture-score-row").hidden;
   const dated = kind === AUTO || kind === "task" || kind === "purchase";
   $("capture-schedule").disabled = !dated;
   $("capture-schedule").title = dated ? "" : t("Сначала выберите дело или покупку");
@@ -84,6 +87,7 @@ function snapshot() {
     schedule: $("capture-schedule").value, exactDate: $("capture-date").value,
     mediaType: $("capture-media").value, contextId: $("capture-context").value,
     topic: $("capture-topic").value, importance: $("capture-importance").value,
+    importanceScore: $("capture-score-row").hidden ? null : draft.importanceScore,
     showInUnscheduled: $("capture-unscheduled").checked, route: draft.route, voice: draft.voice,
     requestId: draft.requestId, attachments: draft.attachments,
     revision: draft.revision + 1,
@@ -180,6 +184,7 @@ function plainPayload(text) {
   return { ...capturePayload({
     text, kind, due: schedule.due, planningHorizon: schedule.planning_horizon, mediaType: draft.mediaType,
     contextId: draft.contextId === AUTO ? "" : draft.contextId, topic: draft.topic, importance,
+    importanceScore: draft.importanceScore,
     showInUnscheduled: draft.showInUnscheduled,
   }), attachments: draft.attachments };
 }
@@ -321,6 +326,8 @@ async function initialize() {
   $("capture-media").value = draft.mediaType;
   $("capture-topic").value = draft.topic;
   $("capture-importance").value = draft.importance;
+  $("capture-importance-score").value = String(validImportanceScore(draft.importanceScore) ? draft.importanceScore : scoreForLegacy(draft.importance === AUTO ? "normal" : draft.importance));
+  $("capture-importance-output").value = validImportanceScore(draft.importanceScore) ? `${draft.importanceScore} / 5` : t("Авто");
   $("capture-unscheduled").checked = draft.showInUnscheduled;
   updateFields();
   const chosenContext = draft.contextId !== AUTO && draft.contextId;
@@ -477,7 +484,14 @@ document.addEventListener("keydown", event => {
   }
   if (event.key === "Enter" && event.ctrlKey) { event.preventDefault(); void submit(); }
 });
-$("capture-form").addEventListener("input", () => { importFailure = null; clearError(); void persist(); schedulePreview(); });
+$("capture-form").addEventListener("input", event => {
+  if (event.target.id === "capture-importance-score") {
+    draft.importanceScore = Number(event.target.value);
+    $("capture-importance-output").value = `${draft.importanceScore} / 5`;
+    event.target.setAttribute("aria-valuetext", `${draft.importanceScore} / 5`);
+  }
+  importFailure = null; clearError(); void persist(); schedulePreview();
+});
 $("capture-form").addEventListener("change", event => {
   if (event.target !== $("capture-files")) importFailure = null;
   if (event.target.id === "capture-kind" || event.target.id === "capture-schedule") updateFields();

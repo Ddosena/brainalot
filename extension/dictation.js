@@ -7,6 +7,7 @@
 // and the service's preview into short chips. It has no DOM, so Node tests
 // cover it; capture.js draws the result.
 import { addDays } from "./panel-state.js";
+import { validImportanceScore } from "./importance-score.js";
 import { localeTag, t, translateServerMessage } from "./i18n.js";
 
 export const AUTO = "auto";
@@ -52,6 +53,7 @@ export function dictationOverrides(draft, { today = null, strict = false } = {})
   }
   if ((draft.contextId ?? AUTO) !== AUTO) overrides.context_id = draft.contextId || null;
   if ((draft.importance ?? AUTO) !== AUTO) overrides.importance = draft.importance;
+  if (validImportanceScore(draft.importanceScore)) overrides.importance_score = draft.importanceScore;
   if (draft.route === "note") overrides.route = "note";
   return overrides;
 }

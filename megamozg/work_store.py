@@ -82,8 +82,12 @@ class WorkStore(SharedState):
         row = version if version is not None else self._version(db)
         if row is None:
             return dict(revision=0, initialized=False, state=None, images=[])
+        state = json.loads(self._blob(db, row["state_blob"]))
+        if "planning" in state:
+            from .work_planning import project_task_importance
+            project_task_importance(state["planning"])
         return dict(revision=row["revision"], initialized=True,
-                    state=json.loads(self._blob(db, row["state_blob"])), images=json.loads(row["images"]))
+                    state=state, images=json.loads(row["images"]))
 
     def read(self):
         with self.db() as db:
@@ -166,6 +170,11 @@ class WorkStore(SharedState):
             descriptors = self._validate(db, command.get("state_blob"), command.get("images"))
             incoming = json.loads(self._blob(db, command["state_blob"]))
             previous = json.loads(self._blob(db, current["state_blob"])) if current else {}
+            # A round trip of read-time defaults is not a planning edit.
+            from .work_planning import project_task_importance
+            for document in (incoming, previous):
+                if "planning" in document:
+                    project_task_importance(document["planning"])
             if incoming.get("planning") != previous.get("planning") and command.get("restore_import") is not True:
                 raise ValidationError("План Work меняется только через /api/work/planning")
             db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (revision + 1, int(time.time()*1000),
@@ -181,7 +190,8 @@ class WorkStore(SharedState):
         from copy import deepcopy
         from datetime import date, timedelta
         from .work_planning import (apply_action, calculate, merge_calendar_refresh,
-                                    reconcile_segment_estimates, validate_planning)
+                                    reconcile_segment_estimates, validate_planning, CONSTRUCTOR_ACTIONS,
+                                    _constructor_allocation, _constructor_budget_guard)
         if not isinstance(command, dict) or set(command) != {"request_id", "expected_revision", "action", "data"}:
             raise ValidationError("planning: нужны request_id, expected_revision, action, data")
         action, data = command["action"], command["data"]
@@ -189,7 +199,8 @@ class WorkStore(SharedState):
                           "capacity_override", "weekly_review_done", "describe_cubes",
                           "day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
                           "day_cube_move", "day_cube_resize", "segment_create",
-                          "segment_progress", "day_segment_add"}:
+                          "segment_progress", "day_segment_add", "scope_exempt", "task_importance",
+                          "monthly_plan_approve"} | CONSTRUCTOR_ACTIONS:
             raise ValidationError("Неизвестное действие planning")
         if not isinstance(data, dict):
             raise ValidationError("planning.data: требуется объект")
@@ -203,6 +214,7 @@ class WorkStore(SharedState):
             self.check_revision(command, row["revision"])
             state = json.loads(self._blob(db, row["state_blob"]))
             images = [{k: image[k] for k in ("id", "blob", "mime")} for image in json.loads(row["images"])]
+        allocation_baseline = deepcopy(state.get("planning"))
         if action == "import":
             if set(data) != {"planning"}:
                 raise ValidationError("import.data: требуется только planning")
@@ -232,8 +244,23 @@ class WorkStore(SharedState):
                 })
                 existing_items.add(item_id)
             previous = state.get("planning")
+            previous_monthly = previous.get("monthly_plan") if isinstance(previous, dict) else None
+            if "monthly_plan" in planning and planning["monthly_plan"] != previous_monthly:
+                raise ValidationError("План месяца согласуется только через monthly_plan_approve")
+            if previous_monthly is not None:
+                monthly = deepcopy(previous_monthly)
+                known_ids = {task["id"] for task in planning["tasks"] if isinstance(task.get("id"), str)}
+                retained = [tid for tid in monthly["task_ids"] if tid in known_ids]
+                if retained != monthly["task_ids"]:
+                    monthly.update(task_ids=retained, status="draft", approved_at=None)
+                planning["monthly_plan"] = monthly
             if isinstance(previous, dict) and previous.get("version") == 1:
                 # Updating estimates/source data must not erase observed work.
+                previous_tasks = {task["id"]: task for task in previous["tasks"]}
+                for task in planning["tasks"]:
+                    old_task = previous_tasks.get(task.get("id"), {})
+                    if "importance_score" not in task and "importance_score" in old_task:
+                        task["importance_score"] = old_task["importance_score"]
                 planning["completed_cubes"] = {
                     **planning["completed_cubes"], **previous.get("completed_cubes", {})}
                 outcomes = {(x["task_id"], x["date"]): x for x in planning["day_outcomes"]}
@@ -252,6 +279,10 @@ class WorkStore(SharedState):
                     **planning.get("prep_overrides", {}), **previous.get("prep_overrides", {})}
                 planning["prep_progress"] = {
                     **planning.get("prep_progress", {}), **previous.get("prep_progress", {})}
+                if "constructor" in previous:
+                    planning["constructor"] = deepcopy(previous["constructor"])
+                if "scope_exemptions" in previous:
+                    planning["scope_exemptions"] = deepcopy(previous["scope_exemptions"])
                 if "task_segments" in previous:
                     planning["task_segments"] = deepcopy(previous["task_segments"])
                     planning["segment_baseline_remaining"] = deepcopy(previous["segment_baseline_remaining"])
@@ -316,6 +347,15 @@ class WorkStore(SharedState):
                         task["title"] = item["title"]
                 planning = calculate(planning, from_date=data.get("from_date"), reason=reason)
             else:
+                candidate = data.get("cube", {}) if action == "constructor_select" else data if action == "constructor_cube" else {}
+                if action == "constructor_select" and not candidate:
+                    candidate = planning.get("constructor", {}).get("cubes", {}).get(data.get("cube_id"), {})
+                if candidate.get("kind") == "brainalot":
+                    from .core import Store
+                    source = next((note for note in Store(self.root).list_notes()
+                                   if note["id"] == candidate.get("source_ref")), None)
+                    if source is None or source.get("kind") != "task" or source.get("status") != "active":
+                        raise ValidationError("Brainalot: исходная активная задача не найдена")
                 planning = apply_action(planning, action, data)
                 if action == "day_outcome" and ("done" in data or data.get("remaining_minutes") == 0):
                     task = next((item for item in planning["tasks"] if item["id"] == data.get("task_id")), None)
@@ -327,6 +367,16 @@ class WorkStore(SharedState):
                             linked["status"] = "done"
                         elif data["done"] is False and linked.get("status") == "done":
                             linked["status"] = "todo"
+        if action not in {"cube_progress", "day_outcome", "segment_progress", "prep_progress",
+                          "task_importance", "monthly_plan_approve"}:
+            _constructor_allocation(planning, allocation_baseline)
+            _constructor_budget_guard(planning, allocation_baseline)
+        from .work_planning import _refresh_constructor_result, update_constructor_awards
+        if action not in {"task_importance", "monthly_plan_approve"}:
+            update_constructor_awards(planning, allocation_baseline,
+                                      backfill=action in {"constructor_day", "recalculate", "scope_exempt"},
+                                      allow_new=action != "import")
+            _refresh_constructor_result(planning)
         state["planning"] = planning
         encoded_state = encoded(state).encode("utf-8")
         digest = hashlib.sha256(encoded_state).hexdigest()

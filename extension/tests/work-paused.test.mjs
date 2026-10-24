@@ -9,12 +9,12 @@ const source = file => readFile(new URL(`../${file}`, import.meta.url), "utf8");
 test("Work is enabled and keeps the conditional pause loader", async () => {
   assert.equal(WORK_ENABLED, true);
   const page = await source("work.html");
-  assert.match(page, /<script type="module" src="work-paused\.js"><\/script>/);
+  assert.match(page, /<script type="module" src="work-paused\.js(?:\?v=[a-z0-9-]+)?"><\/script>/);
   assert.doesNotMatch(page, /<script[^>]+src="work-app\.js"/);
   assert.match(page, /Ваши задачи, доски и изображения сохранены/);
   const loader = await source("work-paused.js");
   assert.ok(loader.includes('if (WORK_ENABLED)'));
-  assert.ok(loader.includes('await import("./work-app.js")'));
+  assert.match(loader, /if \(WORK_ENABLED\) \{\s+await import\("\.\/work-app\.js(?:\?v=[a-z0-9-]+)?"\);/);
 });
 
 test("Work is available and the retained pause helpers still protect data", async () => {

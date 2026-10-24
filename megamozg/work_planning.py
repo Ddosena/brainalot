@@ -5,14 +5,19 @@ from collections import defaultdict
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
+import math
 from pathlib import Path
-from uuid import uuid4
+from random import SystemRandom
+from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import ValidationError
 from .shared_state import encoded, identifier
 
 MAX_DAYS = 366
+AWARD_VARIANTS = ("enamel", "crystal", "order", "cup", "relic", "crown", "shield", "compass",
+                  "laurel", "sun", "peak", "book", "phoenix", "orbit", "obelisk")
 STEPS = {
     "webinar_prep": [("Исследование", "проверенные источники"), ("Практика", "повторяемые шаги"),
                      ("Слайды", "готовый блок слайдов"), ("Сценарий", "текст действий"),
@@ -336,6 +341,8 @@ def validate_planning(planning, state=None):
                 raise ValidationError("task.work_item_id: Work item другого проекта")
         if not isinstance(task.get("title"), str) or not task["title"].strip():
             raise ValidationError("task.title: требуется текст")
+        if "importance_score" in task:
+            _int(task["importance_score"], "task.importance_score", 0, 5)
         if task.get("kind", "other") not in STEPS:
             raise ValidationError("task.kind: неизвестный тип")
         if type(task.get("early_prep", False)) is not bool:
@@ -357,6 +364,8 @@ def validate_planning(planning, state=None):
             raise ValidationError("task.resources: требуется список")
         for resource in task.get("resources", []):
             _validate_resource(resource, course, settings)
+    if "monthly_plan" in planning:
+        _validate_monthly_plan(planning["monthly_plan"], seen)
     segment_by_id = {}
     segments = planning.get("task_segments")
     if segments is not None:
@@ -456,7 +465,7 @@ def validate_planning(planning, state=None):
         identifier(cube_id, "completed cube id")
         if not isinstance(entry, dict) or entry.get("task_id") not in seen:
             raise ValidationError("completed cube: неизвестная задача")
-        if _day(entry.get("date"), "completed cube date") not in days:
+        if _day(entry.get("date"), "completed cube date") > days[-1]:
             raise ValidationError("completed cube date вне горизонта")
         _int(entry.get("planned_minutes"), "completed cube planned_minutes")
         _int(entry.get("percent"), "completed cube percent", 0, 100)
@@ -485,13 +494,16 @@ def validate_planning(planning, state=None):
             raise ValidationError("lock: неизвестная задача или locked != true")
         identifier(lock.get("cube_id"), "lock.cube_id")
         _day(lock.get("date"), "lock.date")
-        minutes = _int(lock.get("minutes"), "lock.minutes", 1, 90)
+        minutes = _int(lock.get("minutes"), "lock.minutes", 1, 240 if lock.get("constructor") else 90)
         if lock.get("segment_id") is not None:
             segment = segment_by_id.get(lock["segment_id"])
             if segment is None or segment["task_id"] != lock["task_id"]:
                 raise ValidationError("lock.segment_id: чужой этап")
         if lock.get("manual"):
-            if minutes not in (15, 30, 45, 60, 90) and not (lock.get("is_remainder") and 1 <= minutes < 60):
+            if lock.get("constructor"):
+                if minutes < 5 or minutes % 5:
+                    raise ValidationError("constructor lock: 5..240 с шагом 5")
+            elif minutes not in (15, 30, 45, 60, 90) and not (lock.get("is_remainder") and 1 <= minutes < 60):
                 raise ValidationError("manual lock: размер 15/30/45/60/90")
             if lock.get("floating"):
                 if lock.get("start") is not None or lock.get("end") is not None:
@@ -506,6 +518,18 @@ def validate_planning(planning, state=None):
         raise ValidationError("planning.history: максимум 40")
     if not isinstance(planning.get("result", {}), dict):
         raise ValidationError("planning.result: требуется объект")
+    _validate_constructor(planning)
+    exemptions = planning.get("scope_exemptions", {})
+    if not isinstance(exemptions, dict):
+        raise ValidationError("scope_exemptions: требуется map")
+    for task_id, entry in exemptions.items():
+        if task_id not in seen or not isinstance(entry, dict) or type(entry.get("exempt")) is not bool:
+            raise ValidationError("scope_exemptions: неизвестная задача или неверная запись")
+        _day(entry.get("from_date"), "scope from_date")
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip() or len(entry["reason"]) > 1000:
+            raise ValidationError("scope reason: требуется текст до1000")
+    if "constructor" in planning:
+        _constructor_validate_slots(planning)
     return days
 
 
@@ -550,6 +574,13 @@ def _live_details(planning):
     details, synthetic, matched_ids = [], [], set()
     for live in planning.get("live_events", []):
         record = deepcopy(live)
+        if _scope_exempt(planning, live.get("task_id"), live.get("date")):
+            matched = calendar_by_id.get(live.get("calendar_event_id"))
+            if matched:
+                matched_ids.add(str(matched["id"]))
+            record.update(status="scope_exempt", scope_exempt=True, effective_start=None, covered_by_calendar=bool(matched))
+            details.append(record)
+            continue
         if live.get("date") is None:
             record.update(status="unscheduled", effective_start=None, covered_by_calendar=False)
         else:
@@ -634,9 +665,16 @@ def _ledger(planning, days):
                 left = int((a-midnight).total_seconds() // 60)
                 right = int((b-midnight).total_seconds() // 60)
                 entry = entries[cursor.isoformat()]
+                constructor_day = planning.get("constructor", {}).get("days", {}).get(cursor.isoformat(), {})
+                required = _constructor_event_required(planning, event)
+                selected = False  # Optional Calendar selections use their own movable Work slot.
+                if constructor_day.get("initialized") or _event_identity(event) in planning.get("constructor", {}).get("event_required", {}):
+                    if not required and not selected:
+                        cursor += timedelta(days=1)
+                        continue
                 entry["timed"].append((left, right))
                 entry["events"].append(event["id"])
-                if category in {"work", "lesson", "unknown"}:
+                if category in {"work", "lesson", "unknown"} or selected or required and constructor_day.get("initialized"):
                     entry["work"].append((left, right))
                 if category == "unknown":
                     entry["unknown"].append(event["id"])
@@ -660,7 +698,12 @@ def _ledger(planning, days):
                 "default_minutes": settings["prep_minutes"], "floating": True,
                 "start": None, "end": None,
             })
-            if duration == 0:
+            ctor_day = planning.get("constructor", {}).get("days", {}).get(key, {})
+            prep_selected = _constructor_source_selected(planning, "prep", prep_id, key)
+            if duration == 0 or ctor_day.get("initialized") and not prep_selected:
+                continue
+            if ctor_day.get("initialized"):
+                entry["constructor_prep_minutes"] = entry.get("constructor_prep_minutes", 0)+duration
                 continue
             while candidate - duration >= 0:
                 clashes = [(a, b) for a, b in _union(entry["timed"] + entry["prep"])
@@ -676,7 +719,7 @@ def _ledger(planning, days):
         entry["prep"] = _union(entry["prep"])
         entry["timed_minutes"] = _duration(entry["work"])
         entry["busy_minutes"] = _duration(entry["timed"])
-        entry["prep_minutes"] = _duration(entry["prep"])
+        entry["prep_minutes"] = _duration(entry["prep"]) + entry.get("constructor_prep_minutes", 0)
         entry["homework_minutes"] = (min(30, _int(settings.get("homework_minutes", 30),
                                                    "homework_minutes", 0, 30)) if entry["homework"] else 0)
         entry["fixed_minutes"] = entry["timed_minutes"] + entry["prep_minutes"] + entry["homework_minutes"]
@@ -750,6 +793,11 @@ def _weekly_reviews(planning, days, ledger, rest, locks):
                   "minutes": weekly["minutes"], "status": "unplaced",
                   "title": WEEKLY_REVIEW_TITLE,
                   "checklist": [{"id": key, "label": label} for key, label in WEEKLY_REVIEW_CHECKLIST]}
+        if any(cube.get("kind") == "weekly_review" and cube.get("source_ref") == identifier_value
+               for cube in planning.get("constructor", {}).get("cubes", {}).values()):
+            review["status"] = "done" if done_map.get(identifier_value) else "constructor_proposal"
+            reviews.append(review)
+            continue
         for candidate in reversed([d for d in days if week_start <= d <= week_end]):
             key = candidate.isoformat()
             if key in rest or key in by_date:
@@ -905,7 +953,8 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
         minutes = lock["minutes"]
         manual = bool(lock.get("manual"))
         if manual and lock.get("floating"):
-            if minutes not in (15, 30, 45, 60, 90) and not lock.get("is_remainder"):
+            if (not lock.get("constructor") and minutes not in (15, 30, 45, 60, 90)
+                    and not lock.get("is_remainder")):
                 raise ValidationError("floating lock: размер 15/30/45/60/90")
             a = b = None
         else:
@@ -919,7 +968,8 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
             raise ValidationError("lock: занятый слот или вне рабочего окна")
         if a is not None:
             occupied[day].append((a, b, lock["task_id"]))
-        by_task[lock["task_id"]] += _lock_reservation(planning, lock)
+        if not lock.get("constructor"):
+            by_task[lock["task_id"]] += _lock_reservation(planning, lock)
         phase = lock.get("phase", "preparation")
         if not manual:
             by_phase[(lock["task_id"], phase)] += minutes
@@ -944,7 +994,9 @@ def _validate_locks(planning, ledger, remaining, rest, from_date):
                 ledger[day]["fixed_minutes"] + sum(b-a for a, b, _ in intervals) > ledger[day]["day_limit_minutes"]):
             raise ValidationError("lock: дневной лимит превышен")
         for first, second in zip(sorted(intervals), sorted(intervals)[1:]):
-            if second[0]-first[1] < planning["settings"]["break_minutes"]:
+            minimum_break = (0 if planning.get("constructor", {}).get("days", {}).get(day, {}).get("initialized")
+                             else planning["settings"]["break_minutes"])
+            if second[0]-first[1] < minimum_break:
                 raise ValidationError("lock: пересечение или недостаточный перерыв")
     for tid, minutes in by_task.items():
         if minutes > remaining[tid]:
@@ -969,6 +1021,14 @@ def _manual_day_view(planning, key, led, locks, weekly_review, rest):
                     for entry in reports.values() if not entry.get("actual_minutes"))
     reported_work = measured + estimated
     unstarted = sum(_lock_reservation(planning, lock) for lock in ordered)
+    constructor_day = planning.get("constructor", {}).get("days", {}).get(key, {}).get("initialized", False)
+    if constructor_day:
+        selected_ids = {lock["cube_id"] for lock in ordered}
+        task_charge = sum(_constructor_cube_charge(lock["minutes"], reports.get(lock["cube_id"], {}), selected=True)
+                          for lock in ordered)
+        task_charge += sum(_constructor_cube_charge(report["planned_minutes"], report, selected=False)
+                           for cube_id, report in reports.items() if cube_id not in selected_ids)
+        unstarted = max(0, task_charge-reported_work)
     weekly_minutes = weekly_review["minutes"] if weekly_review else 0
     completed_preps = planning.get("prep_progress", {})
     prep_cubes = []
@@ -981,7 +1041,14 @@ def _manual_day_view(planning, key, led, locks, weekly_review, rest):
         prep_actual_excess += max(0, actual-prep["minutes"])
         prep_cubes.append({**prep, "progress_percent": report.get("percent", 0),
                            "actual_minutes": actual})
-    total = led["fixed_minutes"] + prep_actual_excess + weekly_minutes + reported_work + unstarted
+    fixed_minutes = led["fixed_minutes"]
+    if constructor_day:
+        # In the constructor prep is a movable selected source, charged below
+        # with the same policy as task cubes. Only Calendar remains fixed.
+        fixed_minutes -= led["prep_minutes"]
+        prep_actual_excess = 0
+    source_load = _constructor_source_load(planning, key)
+    total = fixed_minutes + prep_actual_excess + weekly_minutes + reported_work + unstarted + source_load
     first = ordered[0] if ordered else None
     segment_by_id = {segment["id"]: segment for segment in planning.get("task_segments", [])}
     first_segment = segment_by_id.get(first.get("segment_id")) if first else None
@@ -995,12 +1062,12 @@ def _manual_day_view(planning, key, led, locks, weekly_review, rest):
             "lesson_prep_minutes": led["prep_minutes"], "prep_cubes": prep_cubes,
             "prep_actual_minutes": prep_actual_minutes,
             "prep_actual_excess_minutes": prep_actual_excess,
-            "all_day_assumed_minutes": led["homework_minutes"], "fixed_minutes": led["fixed_minutes"],
-            "development_minutes": reported_work + unstarted, "manual_cube_minutes": unstarted,
-            "builder_selected_minutes": reported_work + unstarted,
+            "all_day_assumed_minutes": led["homework_minutes"], "fixed_minutes": fixed_minutes,
+            "development_minutes": reported_work + unstarted + source_load, "manual_cube_minutes": unstarted,
+            "builder_selected_minutes": reported_work + unstarted + source_load,
             "builder_available_minutes": max(0, led["day_limit_minutes"] -
-                                             led["fixed_minutes"] - prep_actual_excess -
-                                             weekly_minutes - reported_work - unstarted),
+                                             fixed_minutes - prep_actual_excess -
+                                             weekly_minutes - reported_work - unstarted - source_load),
             "weekly_review_minutes": weekly_minutes,
             "weekly_review": ({k: weekly_review[k] for k in ("id", "start", "end", "minutes", "status")}
                               if weekly_review else None),
@@ -1064,13 +1131,15 @@ def _task_pool(planning, cubes, days):
         "segments": segments_by_task[task["id"]],
     } for task in sorted(planning["tasks"], key=lambda task: _priority(
         task, actual_remaining, pool_today, planning["settings"]))
-       if actual_remaining[task["id"]] > 0]
+       if actual_remaining[task["id"]] > 0 and not _scope_exempt(planning, task["id"])]
 
 
 def _refresh_result_remaining(planning):
     actual = _remaining(planning)
     for task in planning.get("result", {}).get("tasks", []):
         task["remaining_minutes"] = actual.get(task["id"], 0)
+        task["active_remaining_minutes"] = 0 if _scope_exempt(planning, task["id"]) else task["remaining_minutes"]
+        task["scope_exempt"] = _scope_exempt(planning, task["id"])
 
 
 def calculate(planning, *, from_date=None, reason="recalculate"):
@@ -1204,8 +1273,11 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
         non_early_lock = next((x for x in locks if not task_by_id[x["task_id"]].get("early_prep")), None)
         focus = (primary_lock or non_early_lock or {}).get("task_id")
         primary_left = any(task["course"] == planning["settings"].get("priority_course") and
+                           not _scope_exempt(planning, task["id"], key) and
                            remaining[task["id"]] - reserved[task["id"]] >= 60 for task in planning["tasks"])
         def schedulable(task):
+            if _scope_exempt(planning, task["id"], key):
+                return False
             amount = remaining[task["id"]] - reserved[task["id"]]
             prep_left = max(0, amount-task.get("review_minutes", 0))
             review_open = not task.get("methodist_start") or key >= task["methodist_start"]
@@ -1219,6 +1291,8 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                      and remaining[task["id"]] - reserved[task["id"]] - task.get("review_minutes", 0) >= 60]
         if focus is None and key not in rest and candidates:
             focus = min(candidates, key=lambda task: _priority(task, remaining, day, planning["settings"]))["id"]
+        if focus and _scope_exempt(planning, focus, key):
+            focus = None
         early_cube = None
         if (focus and priority_active and task_by_id[focus]["course"] == planning["settings"]["priority_course"]
                 and day.weekday() >= 3 and secondary and budget >= 120 and key not in rest):
@@ -1351,11 +1425,17 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
         assigned = sum(c["minutes"] for c in cubes if c["task_id"] == tid and c["date"] >= start.isoformat()
                        and (not due or c["date"] <= due))
         demand = _remaining(planning)[tid]
-        deficit = max(0, demand-assigned)
+        exempt = _scope_exempt(planning, tid)
+        active_demand = 0 if exempt else demand
+        deficit = max(0, active_demand-assigned)
         record = {**task, "remaining_minutes": demand,
+                  "active_remaining_minutes": active_demand, "scope_exempt": exempt,
                   "scheduled_by_due_minutes": assigned, "deficit_by_due_minutes": deficit,
-                  "remaining_at_horizon_minutes": remaining[tid]}
+                  "remaining_at_horizon_minutes": 0 if exempt else remaining[tid]}
         result_tasks.append(record)
+        if exempt and any(lock["task_id"] == tid and lock["date"] >= planning["scope_exemptions"][tid]["from_date"]
+                          and _started(planning, lock["cube_id"]) for lock in planning.get("locks", [])):
+            risks.append({"code": "scope_exempt_started_work_retained", "task_id": tid})
         if due and deficit:
             risks.append({"code": "deadline_deficit", "task_id": tid, "minutes": deficit})
     task_pool = _task_pool(planning, cubes, days)
@@ -1406,7 +1486,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
               "historical_unreported_planned_hours": round(sum(x.get("planned_development_minutes",
                                                                    x.get("development_minutes", 0))
                                                                for x in result_days if x.get("historical_unreported"))/60, 2),
-              "remaining_horizon_hours": round(sum(remaining.values())/60, 2),
+              "remaining_horizon_hours": round(sum(n for tid, n in remaining.items() if not _scope_exempt(planning, tid))/60, 2),
               "tasks_missing_due": sum(bool(x["deficit_by_due_minutes"] and x.get("due")) for x in result_tasks),
               "max_total_work_minutes": max((x["total_work_minutes"] for x in result_days), default=0)}
     totals["weekly_review_hours"] = round(sum(x.get("weekly_review_minutes", 0) for x in result_days)/60, 2)
@@ -1414,7 +1494,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
     totals["unscheduled_live_minutes"] = sum(x["duration_minutes"] for x in unscheduled_live)
     totals["by_course"] = {course: {"scheduled_hours": round(sum(c["minutes"] for c in cubes
                                                                  if c["course"] == course and c["date"] >= start.isoformat())/60, 2),
-                                   "remaining_hours": round(sum(remaining[t["id"]] for t in planning["tasks"] if t["course"] == course)/60, 2)}
+                                   "remaining_hours": round(sum(remaining[t["id"]] for t in planning["tasks"] if t["course"] == course and not _scope_exempt(planning, t["id"]))/60, 2)}
                            for course in sorted({x["course"] for x in planning["tasks"]})}
     unresolved = [x for x in result_tasks if x.get("remaining_at_horizon_minutes", 0) > 0 or
                   (x.get("due") and x["deficit_by_due_minutes"] > 0)]
@@ -1446,6 +1526,7 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                                           "effective_from": start.isoformat(), "report_warning": report_warning,
                                           "reason": reason}}
     planning["result"] = result
+    _refresh_constructor_result(planning)
     planning["needs_recalculation"] = False
     planning["last_update"] = {"action": "recalculate", "reason": reason,
                                "at": datetime.now(timezone.utc).isoformat()}
@@ -1466,6 +1547,8 @@ def calculate(planning, *, from_date=None, reason="recalculate"):
                                                 "task_segments": planning.get("task_segments", []),
                                                 "segment_baseline_remaining": planning.get("segment_baseline_remaining", {}),
                                                 "segment_progress": planning.get("segment_progress", {}),
+                                                "constructor": planning.get("constructor", {}),
+                                                "scope_exemptions": planning.get("scope_exemptions", {}),
                                                 "from": start.isoformat()}).encode()).hexdigest()[:24]
     return planning
 
@@ -1564,7 +1647,9 @@ def _materialize_manual_day(planning, key):
             locks.append(lock)
             by_id[lock["cube_id"]] = lock
         else:
-            lock.update(manual=True, floating=True, start=None, end=None)
+            lock.update(manual=True)
+            if not lock.get("constructor"):
+                lock.update(floating=True, start=None, end=None)
             lock.setdefault("order", index)
     _normalize_manual_order(planning, key)
 
@@ -1591,14 +1676,20 @@ def _refresh_manual_day(planning, key):
         if detail := planning.get("cube_details", {}).get(lock["cube_id"]):
             cube.update(deepcopy(detail))
         old_cubes.append(cube)
-    if row["over_cap_minutes"] and any(_lock_reservation(planning, lock) for lock in locks):
+    ctor_day = planning.get("constructor", {}).get("days", {}).get(key, {})
+    if not ctor_day.get("initialized"):
+        ctor_day = {}
+    ctor_cubes = planning.get("constructor", {}).get("cubes", {})
+    unstarted_source = any(not _constructor_started(planning, ctor_cubes[cid])
+                           for cid in ctor_day.get("selected_source_ids", []))
+    if not ctor_day and row["over_cap_minutes"] and (any(_lock_reservation(planning, lock) for lock in locks) or unstarted_source):
         raise ValidationError("Бюджета недостаточно для не начатых кубиков: сначала верните или переставьте кубик")
     available_by_task = _remaining(planning)
     reserved_by_task = defaultdict(int)
     for lock in planning.get("locks", []):
         if lock.get("manual"):
             reserved_by_task[lock["task_id"]] += _lock_reservation(planning, lock)
-    if any(reserved > available_by_task[tid] for tid, reserved in reserved_by_task.items()):
+    if not ctor_day and any(reserved > available_by_task[tid] for tid, reserved in reserved_by_task.items()):
         raise ValidationError("Выбранные ручные кубики превышают остаток задачи")
     segment_credits = _segment_effective_credits(planning)
     by_segment = {segment["id"]: segment for segment in planning.get("task_segments", [])}
@@ -1609,7 +1700,7 @@ def _refresh_manual_day(planning, key):
             if segment_id not in by_segment or by_segment[segment_id]["task_id"] != lock["task_id"]:
                 raise ValidationError("Ручной кубик ссылается на чужой этап")
             segment_reserved[segment_id] += _lock_reservation(planning, lock)
-    if any(reserved > by_segment[segment_id]["minutes"]-segment_credits.get(segment_id, 0)
+    if not ctor_day and any(reserved > by_segment[segment_id]["minutes"]-segment_credits.get(segment_id, 0)
            for segment_id, reserved in segment_reserved.items()):
         raise ValidationError("Выбранные кубики превышают остаток этапа")
 
@@ -1651,6 +1742,9 @@ def apply_day_builder(planning, action, data):
                 if minutes < max(progress.get("actual_minutes", 0), credited):
                     raise ValidationError("Подтверждённую подготовку нельзя уменьшить или убрать")
             planning.setdefault("prep_overrides", {})[prep_id] = minutes
+            for cube in planning.get("constructor", {}).get("cubes", {}).values():
+                if cube.get("kind") == "prep" and cube.get("source_ref") == prep_id:
+                    cube["minutes"] = minutes
         else:
             percent = _int(data["percent"], "prep_progress.percent", 0, 100)
             prior = planning.setdefault("prep_progress", {}).get(prep_id, {})
@@ -1863,9 +1957,1167 @@ def apply_segment_action(planning, action, data):
     raise ValidationError("Неизвестное действие этапа")
 
 
+CONSTRUCTOR_ACTIONS = frozenset({"constructor_day", "constructor_cube", "constructor_split",
+    "constructor_select", "constructor_return", "constructor_hide", "constructor_timeline", "calendar_required", "constructor_goal", "constructor_goal_status"})
+CONSTRUCTOR_KINDS = frozenset({"task", "prep", "calendar", "weekly_review", "brainalot"})
+
+
+def _event_identity(event):
+    return str(event.get("prep_key") or event.get("occurrence_id") or event["id"])
+
+
+def _constructor_event_required(planning, event):
+    overrides = planning.get("constructor", {}).get("event_required", {})
+    return overrides.get(_event_identity(event),
+                         _event_category(event, planning["calendar"].get("rules", {})) in {"lesson", "work", "unknown"})
+
+
+def _constructor_source_selected(planning, kind, source_ref, key):
+    ctor = planning.get("constructor", {})
+    selected = ctor.get("days", {}).get(key, {}).get("selected_source_ids", [])
+    return any(cube_id in selected and cube.get("kind") == kind and cube.get("source_ref") == source_ref
+               for cube_id, cube in ctor.get("cubes", {}).items())
+
+
+def _constructor_selected_date(planning, cube_id):
+    lock = next((lock for lock in planning.get("locks", []) if lock["cube_id"] == cube_id), None)
+    if lock is not None:
+        return lock["date"]
+    return next((key for key, day in planning.get("constructor", {}).get("days", {}).items()
+                 if cube_id in day.get("selected_source_ids", [])), None)
+
+
+def _constructor_report(planning, cube):
+    if cube["kind"] == "task":
+        return planning.get("completed_cubes", {}).get(cube["id"], {})
+    if cube["kind"] == "prep":
+        return planning.get("prep_progress", {}).get(cube["source_ref"], {})
+    return planning.get("constructor", {}).get("source_reports", {}).get(cube["id"], {})
+
+
+def _constructor_started(planning, cube):
+    report = _constructor_report(planning, cube)
+    return bool(report.get("percent", 0) or report.get("actual_minutes", 0))
+
+
+def _constructor_source_load(planning, key):
+    """Charge each non-task source once, including returned facts on their date."""
+    ctor = planning.get("constructor", {})
+    day = ctor.get("days", {}).get(key, {})
+    if not day.get("initialized"):
+        return 0
+    selected = set(day.get("selected_source_ids", []))
+    events = {_event_identity(event): event for event in planning["calendar"]["events"]}
+    total = 0
+    for cube_id, cube in ctor.get("cubes", {}).items():
+        if cube["kind"] == "task":
+            continue
+        report = _constructor_report(planning, cube)
+        same_date_report = report if report.get("date") == key else {}
+        charge = _constructor_cube_charge(cube["minutes"], same_date_report, selected=cube_id in selected)
+        if cube["kind"] == "calendar" and cube["source_ref"] in events and _constructor_event_required(planning, events[cube["source_ref"]]):
+            event = events[cube["source_ref"]]
+            first = datetime.fromisoformat(event["start"].replace("Z", "+00:00"))
+            if first.tzinfo:
+                first = first.astimezone(ZoneInfo(planning["settings"]["timezone"]))
+            if first.date().isoformat() != key:
+                total += charge
+            elif cube_id in selected or report.get("date") == key:
+                total += max(0, charge-cube["minutes"])
+            continue
+        total += charge
+    return total
+
+
+def _constructor_cube_charge(minutes, report, *, selected):
+    """Energy, not task credit: selected unfinished work keeps its full budget."""
+    actual = report.get("actual_minutes", 0)
+    percent = report.get("percent", 0)
+    if selected:
+        return (actual or minutes) if percent == 100 else max(minutes, actual)
+    return actual or round(minutes*percent/100)
+
+
+def _constructor_position(value):
+    if not isinstance(value, dict) or set(value) != {"x", "y", "angle"}:
+        raise ValidationError("position: нужны x,y,angle")
+    for field, limit in (("x", 10000), ("y", 10000), ("angle", 360)):
+        n = value[field]
+        if type(n) not in (int, float) or not math.isfinite(n) or abs(n) > limit:
+            raise ValidationError("position: требуется конечная координата в пределах")
+
+
+def _constructor_resources(value, *, drafts=False):
+    if not isinstance(value, dict):
+        raise ValidationError("resources: требуется объект")
+    def links(items):
+        if not isinstance(items, list) or len(items) > 100:
+            raise ValidationError("links: до 100 ссылок")
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValidationError("link: требуется объект")
+            item_id = identifier(item.get("id"), "link.id")
+            if item_id in seen:
+                raise ValidationError("link.id: повтор")
+            seen.add(item_id)
+            if not isinstance(item.get("title", ""), str) or len(item.get("title", "")) > 300:
+                raise ValidationError("link.title: до 300 символов")
+            raw = item.get("url")
+            if not isinstance(raw, str) or len(raw) > 4000:
+                raise ValidationError("link.url: текст до 4000")
+            if drafts:
+                continue
+            try:
+                parsed = urlsplit(raw)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or any(c.isspace() for c in raw):
+                    raise ValueError()
+                parsed.port
+            except ValueError as exc:
+                raise ValidationError("link.url: требуется http(s) и hostname без credentials") from exc
+    links(value.get("links", []))
+    groups = value.get("groups", [])
+    if not isinstance(groups, list) or len(groups) > 50:
+        raise ValidationError("groups: до 50 групп")
+    seen = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValidationError("group: требуется объект")
+        group_id = identifier(group.get("id"), "group.id")
+        if group_id in seen:
+            raise ValidationError("group.id: повтор")
+        seen.add(group_id)
+        if not isinstance(group.get("title"), str) or len(group["title"]) > 300 or not drafts and not group["title"].strip():
+            raise ValidationError("group.title: текст до 300")
+        links(group.get("links", []))
+
+
+def _validate_constructor(planning):
+    ctor = planning.get("constructor")
+    if ctor is None:
+        return
+    if not isinstance(ctor, dict) or ctor.get("version") != 1:
+        raise ValidationError("constructor.version: требуется 1")
+    cubes, days = ctor.get("cubes", {}), ctor.get("days", {})
+    if not isinstance(cubes, dict) or len(cubes) > 10000 or not isinstance(days, dict):
+        raise ValidationError("constructor: неверные cubes/days")
+    tasks = {task["id"]: task for task in planning["tasks"]}
+    segments = {segment["id"]: segment for segment in planning.get("task_segments", [])}
+    source_ids = set()
+    for cube_id, cube in cubes.items():
+        identifier(cube_id, "constructor cube_id")
+        if not isinstance(cube, dict) or cube.get("id") != cube_id or cube.get("kind") not in CONSTRUCTOR_KINDS:
+            raise ValidationError("constructor cube: неверные id/kind")
+        kind = cube["kind"]
+        if kind == "task":
+            if cube.get("task_id") not in tasks:
+                raise ValidationError("constructor task_id: задача не найдена")
+            if cube.get("segment_id") is not None and (cube["segment_id"] not in segments or segments[cube["segment_id"]]["task_id"] != cube["task_id"]):
+                raise ValidationError("constructor segment_id: чужой этап")
+        else:
+            ref = identifier(cube.get("source_ref"), "source_ref")
+            if (kind, ref) in source_ids:
+                raise ValidationError("constructor source_ref: источник уже представлен")
+            source_ids.add((kind, ref))
+        minutes = _int(cube.get("minutes"), "constructor minutes", 0 if kind == "prep" else 1, 1440 if kind == "calendar" else 240)
+        if kind in {"task", "brainalot"} and (minutes < 5 or minutes % 5):
+            raise ValidationError("constructor minutes: 5..240 шаг5")
+        if kind == "prep" and (minutes > 120 or minutes % 5) or kind == "weekly_review" and minutes != 60:
+            raise ValidationError("constructor source minutes: неверная длительность")
+        for field, maximum, required in (("title", 300, True), ("output", 1000, False), ("comment", 4000, False)):
+            value = cube.get(field, "")
+            if not isinstance(value, str) or len(value) > maximum or required and not value.strip():
+                raise ValidationError(f"constructor {field}: неверный текст")
+        steps = cube.get("steps", [])
+        if not isinstance(steps, list) or len(steps) > 20 or any(not isinstance(s, str) or not s.strip() or len(s) > 500 for s in steps):
+            raise ValidationError("constructor steps: до20 шагов")
+        if cube.get("planned_date") is not None and _day(cube["planned_date"], "planned_date") not in _dates(planning["settings"]):
+            raise ValidationError("planned_date: вне горизонта")
+        _constructor_resources(cube)
+        if "resource_drafts" in cube:
+            _constructor_resources(cube["resource_drafts"], drafts=True)
+        if "week_position" in cube:
+            _constructor_position(cube["week_position"])
+        if "blueprint_ref" in cube:
+            identifier(cube["blueprint_ref"], "blueprint_ref")
+    selected_ids = set()
+    for key, day in days.items():
+        selected_day = _day(key, "constructor day")
+        if not isinstance(day, dict) or type(day.get("initialized")) is not bool:
+            raise ValidationError("constructor day: неверная дата/initialized")
+        if day["initialized"] and selected_day not in _dates(planning["settings"]):
+            raise ValidationError("constructor day: рабочий день вне горизонта")
+        _int(day.get("goal_percent", 0), "goal_percent", 0, 100)
+        if not day["initialized"] and any(day.get(field) for field in ("selected_source_ids", "source_slots", "hidden_cube_ids", "positions", "main_task_id")):
+            raise ValidationError("constructor goal-only day: недопустимо рабочее состояние")
+        if day.get("main_task_id") is not None and day["main_task_id"] not in tasks:
+            raise ValidationError("constructor main_task_id: неизвестная задача")
+        if not isinstance(day.get("goal", ""), str) or len(day.get("goal", "")) > 1000:
+            raise ValidationError("constructor goal: до1000 символов")
+        for field in ("hidden_cube_ids", "selected_source_ids"):
+            values = day.get(field, [])
+            if not isinstance(values, list) or len(values) != len(set(values)) or any(v not in cubes for v in values):
+                raise ValidationError(f"constructor {field}: неизвестные/повторные кубики")
+        for cube_id in day.get("selected_source_ids", []):
+            if cubes[cube_id]["kind"] == "task" or cube_id in selected_ids:
+                raise ValidationError("constructor selection: повтор/неверный источник")
+            selected_ids.add(cube_id)
+        slots = day.get("source_slots", {})
+        if not isinstance(slots, dict) or any(cid not in day.get("selected_source_ids", []) for cid in slots):
+            raise ValidationError("constructor source_slots: неверные выбранные ID")
+        for start in slots.values():
+            _clock(start, "constructor source slot")
+        for tray, positions in day.get("positions", {}).items():
+            if tray not in {"selected", "possible"} or not isinstance(positions, dict) or len(positions) > 10000:
+                raise ValidationError("constructor positions: неверная россыпь")
+            for cube_id, position in positions.items():
+                identifier(cube_id, "position cube_id")
+                _constructor_position(position)
+    weeks = ctor.get("weeks", {})
+    if not isinstance(weeks, dict) or len(weeks) > 10000:
+        raise ValidationError("constructor weeks: требуется map до10000")
+    for key, week in weeks.items():
+        if _day(key, "goal week").weekday() != 0 or not isinstance(week, dict):
+            raise ValidationError("constructor week: требуется понедельник и объект")
+        if not isinstance(week.get("goal", ""), str) or len(week.get("goal", "")) > 1000:
+            raise ValidationError("constructor week goal: до1000 символов")
+        _int(week.get("goal_percent", 0), "weekly goal_percent", 0, 100)
+    for record in [*days.values(), *weeks.values()]:
+        if record.get("goal_status", "active") not in {"active", "completed", "cancelled"}:
+            raise ValidationError("goal_status: active|completed|cancelled")
+        member_ids = record.get("closed_cube_ids", [])
+        if not isinstance(member_ids, list) or len(member_ids) > 20000 or any(not isinstance(cid, str) for cid in member_ids) or len(member_ids) != len(set(member_ids)):
+            raise ValidationError("closed_cube_ids: требуется список уникальных ID")
+        for cube_id in member_ids:
+            identifier(cube_id, "closed cube_id")
+        snapshots = record.get("closed_cube_snapshots", {})
+        if not isinstance(snapshots, dict) or len(snapshots) > 20000:
+            raise ValidationError("closed_cube_snapshots: требуется map")
+        for cube_id, snapshot in snapshots.items():
+            identifier(cube_id, "closed snapshot id")
+            if not isinstance(snapshot, dict) or snapshot.get("id") != cube_id:
+                raise ValidationError("closed cube snapshot: неверный id/объект")
+            _int(snapshot.get("minutes"), "closed snapshot minutes", 0, 1440)
+            if not isinstance(snapshot.get("title"), str) or len(snapshot["title"]) > 300:
+                raise ValidationError("closed snapshot title: до300 символов")
+            _constructor_resources(snapshot)
+    awards = ctor.get("awards")
+    if awards is not None:
+        if not isinstance(awards, dict) or awards.get("version") != 1:
+            raise ValidationError("awards.version: требуется 1")
+        if not isinstance(awards.get("decks"), dict):
+            raise ValidationError("awards.decks: требуется объект")
+        for kind in ("goals", "cubes"):
+            assignments = awards.get(kind)
+            if not isinstance(assignments, dict) or len(assignments) > 100000:
+                raise ValidationError("awards assignments: требуется map до100000")
+            for entity_id, variant in assignments.items():
+                identifier(entity_id, "award entity id")
+                if variant not in AWARD_VARIANTS:
+                    raise ValidationError("award variant: неизвестный вариант")
+            deck = awards["decks"].get(kind)
+            if not isinstance(deck, dict) or not isinstance(deck.get("remaining"), list):
+                raise ValidationError("award deck: требуется remaining[]")
+            remaining = deck["remaining"]
+            if len(remaining) > len(AWARD_VARIANTS) or any(variant not in AWARD_VARIANTS for variant in remaining) or len(remaining) != len(set(remaining)):
+                raise ValidationError("award deck: повтор/неизвестный вариант")
+            if "last" not in deck or deck.get("last") is not None and deck["last"] not in AWARD_VARIANTS:
+                raise ValidationError("award deck.last: неизвестный вариант")
+            _int(deck.get("cycle"), "award deck.cycle", 0, 10**8)
+    for field in ("event_required", "source_reports"):
+        if not isinstance(ctor.get(field, {}), dict):
+            raise ValidationError(f"constructor {field}: требуется map")
+    for stable_id, required in ctor.get("event_required", {}).items():
+        identifier(stable_id, "event occurrence id")
+        if type(required) is not bool:
+            raise ValidationError("event_required: требуется bool")
+    for cube_id, report in ctor.get("source_reports", {}).items():
+        if cube_id not in cubes or cubes[cube_id]["kind"] == "task" or not isinstance(report, dict):
+            raise ValidationError("source_reports: неизвестный источник")
+        if _day(report.get("date"), "source report date") not in _dates(planning["settings"]):
+            raise ValidationError("source report date: вне горизонта")
+        _int(report.get("percent"), "source percent", 0, 100)
+        _int(report.get("actual_minutes", 0), "source actual_minutes")
+
+
+def _constructor_init(planning, key):
+    ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    if ctor["days"].get(key, {}).get("initialized"):
+        return ctor["days"][key]
+    prior_goal = deepcopy(ctor["days"].get(key, {}))
+    old_row = next(row for row in planning["result"]["days"] if row["date"] == key)
+    prior_slots = {lock["cube_id"]: {field: deepcopy(lock.get(field)) for field in ("floating", "start", "end")}
+                   for lock in planning.get("locks", []) if lock["date"] == key and not lock.get("floating")}
+    _materialize_manual_day(planning, key)
+    for lock in _manual_locks(planning, key):
+        if lock["cube_id"] in prior_slots:
+            lock.update(prior_slots[lock["cube_id"]])
+    day = {"initialized": True, "main_task_id": old_row.get("focus_task_id"), "goal": old_row.get("goal") or "",
+           "hidden_cube_ids": [], "selected_source_ids": [], "positions": {"selected": {}, "possible": {}}, "source_slots": {}}
+    day.update(prior_goal)
+    day["initialized"] = True
+    day.setdefault("goal_percent", 0)
+    ctor["days"][key] = day
+    for lock in _manual_locks(planning, key):
+        cube_id = lock["cube_id"]
+        # Preserve historical short tails without changing their duration contract.
+        if cube_id not in ctor["cubes"] and lock["minutes"] >= 5 and lock["minutes"] % 5 == 0:
+            ctor["cubes"][cube_id] = {"id": cube_id, "kind": "task", "task_id": lock["task_id"],
+                **({"segment_id": lock["segment_id"]} if lock.get("segment_id") else {}), "minutes": lock["minutes"],
+                "title": lock.get("title") or next(t["title"] for t in planning["tasks"] if t["id"] == lock["task_id"]),
+                "output": lock.get("output", ""), "steps": deepcopy(lock.get("steps", [])), "comment": "", "links": [], "groups": []}
+            if detail := planning.get("cube_details", {}).get(cube_id):
+                ctor["cubes"][cube_id].update(deepcopy(detail))
+            lock["constructor"] = True
+    for prep in old_row.get("prep_cubes", []):
+        cube_id = "constructor:"+prep["id"]
+        ctor["cubes"].setdefault(cube_id, {"id": cube_id, "kind": "prep", "source_ref": prep["id"], "minutes": prep["minutes"],
+            "title": "Подготовка к уроку "+prep.get("lesson_start", ""), "output": "", "steps": [], "comment": "", "planned_date": key, "links": [], "groups": []})
+        if _constructor_started(planning, ctor["cubes"][cube_id]):
+            day["selected_source_ids"].append(cube_id)
+    zone = ZoneInfo(planning["settings"]["timezone"])
+    for event in planning["calendar"]["events"]:
+        if event.get("all_day") or event.get("status") == "cancelled":
+            continue
+        first = datetime.fromisoformat(event["start"].replace("Z", "+00:00")).astimezone(zone)
+        if first.date().isoformat() != key:
+            continue
+        stable_id = _event_identity(event)
+        cube_id = "constructor:event:"+sha256(stable_id.encode()).hexdigest()[:24]
+        if not any(c.get("kind") == "calendar" and c.get("source_ref") == stable_id for c in ctor["cubes"].values()):
+            duration = int((datetime.fromisoformat(event["end"].replace("Z", "+00:00"))-datetime.fromisoformat(event["start"].replace("Z", "+00:00"))).total_seconds()/60)
+            if duration > 0:
+                ctor["cubes"][cube_id] = {"id": cube_id, "kind": "calendar", "source_ref": stable_id,
+                    "minutes": duration, "title": event.get("title") or event.get("summary") or "Calendar",
+                    "output": "", "steps": [], "comment": "", "planned_date": key, "links": [], "groups": []}
+    review = old_row.get("weekly_review")
+    if review:
+        cube_id = "constructor:"+review["id"]
+        ctor["cubes"].setdefault(cube_id, {"id": cube_id, "kind": "weekly_review", "source_ref": review["id"], "minutes": 60,
+            "title": WEEKLY_REVIEW_TITLE, "output": "", "steps": [], "comment": "", "planned_date": key, "links": [], "groups": []})
+        if planning.get("weekly_review_done", {}).get(review["id"]):
+            ctor["source_reports"][cube_id] = {"date": key, "percent": 100, "actual_minutes": 0}
+    return day
+
+
+def _constructor_cube_update(planning, data):
+    allowed = {"cube_id", "kind", "task_id", "segment_id", "source_ref", "minutes", "title", "output", "steps", "comment", "planned_date", "links", "groups", "week_position", "resource_drafts", "blueprint_ref"}
+    if set(data)-allowed or "cube_id" not in data:
+        raise ValidationError("constructor_cube: неверные поля")
+    cube_id = identifier(data["cube_id"], "cube_id")
+    ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    previous = ctor["cubes"].get(cube_id)
+    cube = deepcopy(previous) if previous else {"id": cube_id, "minutes": 60, "output": "", "steps": [], "comment": "", "links": [], "groups": []}
+    for field, value in data.items():
+        if field != "cube_id":
+            cube[field] = deepcopy(value)
+    if "planned_date" in data:
+        cube["planned_date_configured"] = data["planned_date"] is not None
+    existing_lock = next((lock for lock in planning.get("locks", []) if lock["cube_id"] == cube_id), None)
+    existing_report = planning.get("completed_cubes", {}).get(cube_id)
+    if not previous and (existing_lock or existing_report):
+        raise ValidationError("cube_id: уже используется; сначала инициализируйте исходный день")
+    if previous:
+        if any(cube.get(field) != previous.get(field) for field in ("kind", "task_id", "segment_id", "source_ref")):
+            raise ValidationError("constructor cube identity: нельзя менять источник")
+        if _constructor_started(planning, previous) and cube["minutes"] != previous["minutes"]:
+            raise ValidationError("Начатую длительность нельзя менять")
+        report = _constructor_report(planning, previous)
+        if _constructor_started(planning, previous) and cube.get("planned_date") not in (None, report.get("date")):
+            raise ValidationError("Факт нельзя перенести на другую дату")
+    elif cube.get("kind") == "task" and _scope_exempt(planning, cube.get("task_id"), cube.get("planned_date")):
+        raise ValidationError("Задача освобождена от будущей работы")
+    if cube.get("kind") in {"calendar", "prep", "weekly_review"}:
+        if previous and cube["minutes"] != previous["minutes"]:
+            if cube["kind"] != "prep":
+                raise ValidationError("Длительность события/разбора определяется источником")
+        ref = cube.get("source_ref")
+        if cube["kind"] == "prep":
+            prep = next((p for day in planning["result"]["days"] for p in day.get("prep_cubes", []) if p["id"] == ref), None)
+            if prep is None:
+                raise ValidationError("Подготовка не найдена")
+            planning.setdefault("prep_overrides", {})[ref] = cube["minutes"]
+            cube["planned_date"] = prep["date"]
+        elif cube["kind"] == "calendar":
+            event = next((e for e in planning["calendar"]["events"] if ref in {_event_identity(e), e["id"]}), None)
+            if event is None or event.get("all_day"):
+                raise ValidationError("Calendar: требуется существующее событие со временем")
+            cube["source_ref"] = _event_identity(event)
+            cube["minutes"] = int((datetime.fromisoformat(event["end"].replace("Z", "+00:00"))-datetime.fromisoformat(event["start"].replace("Z", "+00:00"))).total_seconds()/60)
+        elif not any(review["id"] == ref for review in planning["result"].get("weekly_reviews", [])):
+            raise ValidationError("Недельный разбор не найден")
+    ctor["cubes"][cube_id] = cube
+    _validate_constructor(planning)
+    lock = next((lock for lock in planning.get("locks", []) if lock["cube_id"] == cube_id), None)
+    if lock:
+        lock.update({field: deepcopy(cube[field]) for field in ("minutes", "title", "output", "steps")})
+        if not lock.get("floating"):
+            lock["end"] = _hhmm(_clock(lock["start"], "start")+cube["minutes"])
+    if cube_id in planning.get("cube_details", {}):
+        detail = planning["cube_details"][cube_id]
+        for field in ("title", "output", "steps"):
+            if field in data:
+                detail[field] = deepcopy(cube[field])
+        _validate_cube_detail(detail)
+    return cube
+
+
+def _constructor_allocation(planning, previous=None, *, check=True):
+    """Proposals reserve an estimate once; selecting the same ID adds no estimate."""
+    ctor = planning.get("constructor", {})
+    task_alloc, segment_alloc = defaultdict(int), defaultdict(int)
+    for cube in ctor.get("cubes", {}).values():
+        if cube["kind"] != "task":
+            continue
+        if _scope_exempt(planning, cube["task_id"]):
+            continue
+        report = _constructor_report(planning, cube)
+        amount = max(0, cube["minutes"]-round(cube["minutes"]*report.get("percent", 0)/100))
+        task_alloc[cube["task_id"]] += amount
+        if cube.get("segment_id"):
+            segment_alloc[cube["segment_id"]] += amount
+    for lock in planning.get("locks", []):
+        if lock.get("manual") and lock["cube_id"] not in ctor.get("cubes", {}):
+            task_alloc[lock["task_id"]] += _lock_reservation(planning, lock)
+            if lock.get("segment_id"):
+                segment_alloc[lock["segment_id"]] += _lock_reservation(planning, lock)
+    remaining = _remaining(planning)
+    credits = _segment_effective_credits(planning)
+    segments = {s["id"]: s for s in planning.get("task_segments", [])}
+    overflow = {"task:"+tid: max(0, n-remaining.get(tid, 0)) for tid, n in task_alloc.items()}
+    overflow.update({"segment:"+sid: max(0, n-segments[sid]["minutes"]+credits.get(sid, 0)) for sid, n in segment_alloc.items()})
+    overflow = {key: value for key, value in overflow.items() if value}
+    baseline = _constructor_allocation(previous, check=False) if previous is not None else {}
+    if check and any(value > baseline.get(key, 0) for key, value in overflow.items()):
+        raise ValidationError("Предложения превышают остаток задачи или этапа")
+    return overflow
+
+
+def _constructor_budget_guard(planning, previous=None):
+    before_days = {day["date"]: day for day in (previous or {}).get("result", {}).get("days", [])}
+    for day in planning.get("result", {}).get("days", []):
+        key = day["date"]
+        meta = planning.get("constructor", {}).get("days", {}).get(key)
+        if not meta or not meta.get("initialized"):
+            continue
+        prior = before_days.get(key, {})
+        if day.get("over_cap_minutes", 0) <= prior.get("over_cap_minutes", 0):
+            continue
+        cubes = planning["constructor"]["cubes"]
+        unstarted = any(_lock_reservation(planning, lock) for lock in _manual_locks(planning, key))
+        unstarted |= any(not _constructor_started(planning, cubes[cid]) for cid in meta.get("selected_source_ids", []))
+        if unstarted:
+            raise ValidationError("Бюджета недостаточно: сначала верните или переставьте не начатый кубик")
+
+
+def _constructor_return(planning, cube):
+    key = _constructor_selected_date(planning, cube["id"])
+    if key is None:
+        return
+    _builder_date(planning, key)
+    planning["locks"] = [lock for lock in planning.get("locks", []) if lock["cube_id"] != cube["id"]]
+    day = planning["constructor"]["days"][key]
+    day["selected_source_ids"] = [cid for cid in day["selected_source_ids"] if cid != cube["id"]]
+    day.setdefault("source_slots", {}).pop(cube["id"], None)
+    _normalize_manual_order(planning, key)
+
+
+def _constructor_snap(planning, cube, key, desired):
+    if desired is None:
+        return None
+    wanted = _clock(desired, "constructor start")
+    ledger = _ledger(planning, _dates(planning["settings"]))
+    free = list(ledger[key]["free_windows"])
+    for lock in planning.get("locks", []):
+        if lock["date"] == key and lock["cube_id"] != cube["id"] and not lock.get("floating"):
+            free = _subtract(free, (_clock(lock["start"], "start"), _clock(lock["end"], "end")))
+    ctor = planning["constructor"]
+    for cid, start in ctor["days"][key].get("source_slots", {}).items():
+        if cid != cube["id"] and cid in ctor["days"][key]["selected_source_ids"]:
+            left = _clock(start, "source slot")
+            free = _subtract(free, (left, left+ctor["cubes"][cid]["minutes"]))
+    candidates = [minute for a, b in free for minute in range(((a+4)//5)*5, b-cube["minutes"]+1, 5)]
+    if not candidates:
+        raise ValidationError("Нет свободного интервала для кубика")
+    return _hhmm(min(candidates, key=lambda minute: (abs(minute-wanted), minute)))
+
+
+def _constructor_validate_slots(planning):
+    ledger = _ledger(planning, _dates(planning["settings"]))
+    ctor = planning.get("constructor", {})
+    for key, day in ctor.get("days", {}).items():
+        if not day.get("initialized"):
+            continue
+        occupied = []
+        for lock in _manual_locks(planning, key):
+            if not lock.get("floating"):
+                occupied.append((_clock(lock["start"], "start"), _clock(lock["end"], "end")))
+        for cube_id, start in day.get("source_slots", {}).items():
+            if cube_id not in day.get("selected_source_ids", []):
+                raise ValidationError("source slot: кубик не выбран")
+            left = _clock(start, "source slot")
+            occupied.append((left, left+ctor["cubes"][cube_id]["minutes"]))
+        for left, right in occupied:
+            if not any(a <= left < right <= b for a, b in ledger[key]["free_windows"]):
+                raise ValidationError("constructor slot: пересечение события или вне рабочего окна")
+        if any(second[0] < first[1] for first, second in zip(sorted(occupied), sorted(occupied)[1:])):
+            raise ValidationError("constructor slot: пересечение кубиков")
+
+
+def _constructor_set_slot(planning, cube, key, desired):
+    if cube["kind"] == "calendar":
+        event = next(e for e in planning["calendar"]["events"] if _event_identity(e) == cube["source_ref"])
+        if _constructor_event_required(planning, event):
+            raise ValidationError("Обязательное Calendar событие неподвижно")
+    start = _constructor_snap(planning, cube, key, desired)
+    if cube["kind"] == "task":
+        lock = next(lock for lock in planning["locks"] if lock["cube_id"] == cube["id"])
+        lock.update(floating=start is None, start=start, end=None if start is None else _hhmm(_clock(start, "start")+cube["minutes"]))
+    else:
+        slots = planning["constructor"]["days"][key].setdefault("source_slots", {})
+        if start is None:
+            slots.pop(cube["id"], None)
+        else:
+            slots[cube["id"]] = start
+
+
+def _constructor_select(planning, cube, key, start=None):
+    overflow = _constructor_allocation(planning, check=False)
+    if cube["kind"] == "task" and not _constructor_started(planning, cube) and (
+            "task:"+cube["task_id"] in overflow or cube.get("segment_id") and "segment:"+cube["segment_id"] in overflow):
+        raise ValidationError("Предложение устарело после отчёта: превышен остаток задачи/этапа")
+    if cube["kind"] == "task" and _scope_exempt(planning, cube["task_id"], key) and not _constructor_started(planning, cube):
+        raise ValidationError("Задача освобождена от будущей работы")
+    if cube["kind"] == "calendar":
+        event = next(e for e in planning["calendar"]["events"] if _event_identity(e) == cube["source_ref"])
+        begins = datetime.fromisoformat(event["start"].replace("Z", "+00:00")).astimezone(ZoneInfo(planning["settings"]["timezone"]))
+        if begins.date().isoformat() != key:
+            raise ValidationError("Calendar occurrence относится к исходной дате события")
+    day = _constructor_init(planning, key)
+    report = _constructor_report(planning, cube)
+    if _constructor_started(planning, cube) and report.get("date") != key:
+        raise ValidationError("Факт нельзя перенести на другую дату")
+    current = _constructor_selected_date(planning, cube["id"])
+    if current is not None and current != key:
+        _constructor_return(planning, cube)
+    if cube["kind"] == "task":
+        if not any(lock["cube_id"] == cube["id"] for lock in planning["locks"]):
+            task = next(task for task in planning["tasks"] if task["id"] == cube["task_id"])
+            planning["locks"].append({"cube_id": cube["id"], "task_id": cube["task_id"],
+                **({"segment_id": cube["segment_id"]} if cube.get("segment_id") else {}), "date": key,
+                "minutes": cube["minutes"], "title": cube["title"], "output": cube.get("output", ""), "steps": deepcopy(cube.get("steps", [])),
+                "phase": "review" if _remaining(planning)[task["id"]] <= task.get("review_minutes", 0) else "preparation",
+                "manual": True, "constructor": True, "locked": True, "floating": True, "start": None, "end": None,
+                "order": len(_manual_locks(planning, key))})
+    else:
+        if cube["minutes"] == 0:
+            raise ValidationError("Кубик нулевой длительности нельзя выбрать")
+        if cube["kind"] == "prep" and cube.get("planned_date") != key:
+            raise ValidationError("Подготовка относится к дате урока")
+        if cube["id"] not in day["selected_source_ids"]:
+            day["selected_source_ids"].append(cube["id"])
+    day["hidden_cube_ids"] = [cid for cid in day["hidden_cube_ids"] if cid != cube["id"]]
+    if start is not None:
+        _constructor_set_slot(planning, cube, key, start)
+
+
+def _goal_cube_catalog(planning):
+    """Expose stable report metadata, including cubes no longer in a day view."""
+    ctor = planning.get("constructor", {})
+    tasks = {task["id"]: task for task in planning["tasks"]}
+    existing = {cube["id"]: cube for cube in planning.get("result", {}).get("cubes", [])}
+    catalog = {}
+    snapshots = {}
+    goal_records = [record for records in (ctor.get("days", {}), ctor.get("weeks", {})) for record in records.values()]
+    for record in sorted(goal_records, key=lambda value: value.get("closed_at", "")):
+        snapshots.update(deepcopy(record.get("closed_cube_snapshots", {})))
+    fixed_calendar_refs = {_event_identity(event) for event in planning["calendar"]["events"]
+                           if _constructor_event_required(planning, event)}
+    for cube_id, cube in ctor.get("cubes", {}).items():
+        report = _constructor_report(planning, cube)
+        catalog[cube_id] = {**deepcopy(cube), "selected_date": _constructor_selected_date(planning, cube_id),
+            "progress_percent": report.get("percent", 0), "actual_minutes": report.get("actual_minutes", 0),
+            "report_date": report.get("date"), "fixed_calendar": cube["kind"] == "calendar" and cube["source_ref"] in fixed_calendar_refs}
+        if cube.get("task_id") in tasks:
+            catalog[cube_id].setdefault("resources", deepcopy(tasks[cube["task_id"]].get("resources", [])))
+    for cube_id, report in planning.get("completed_cubes", {}).items():
+        if cube_id in catalog:
+            continue
+        known = existing.get(cube_id, {})
+        detail = planning.get("cube_details", {}).get(cube_id, {})
+        catalog[cube_id] = {**deepcopy(known), **deepcopy(detail), "id": cube_id, "kind": "task",
+            "task_id": report["task_id"], "title": detail.get("title") or known.get("title") or tasks[report["task_id"]]["title"],
+            "minutes": report["planned_minutes"], "progress_percent": report["percent"],
+            "actual_minutes": report.get("actual_minutes", 0), "report_date": report["date"],
+            "selected_date": _constructor_selected_date(planning, cube_id), "fixed_calendar": False}
+        catalog[cube_id].setdefault("resources", deepcopy(tasks[report["task_id"]].get("resources", [])))
+    # Legacy manually selected cubes can have no report yet. AUTO forecasts are
+    # never guessed to be goal members.
+    for lock in planning.get("locks", []):
+        cube_id = lock["cube_id"]
+        if cube_id in catalog or not (lock.get("manual") or lock.get("locked")):
+            continue
+        known = existing.get(cube_id, {})
+        catalog[cube_id] = {**deepcopy(lock), **deepcopy(known), "id": cube_id, "kind": "task",
+            "title": known.get("title") or lock.get("title") or tasks[lock["task_id"]]["title"],
+            "progress_percent": 0, "actual_minutes": 0, "report_date": None,
+            "selected_date": lock["date"], "fixed_calendar": False}
+        catalog[cube_id].setdefault("resources", deepcopy(tasks[lock["task_id"]].get("resources", [])))
+    represented_preps = {cube.get("source_ref") for cube in catalog.values() if cube.get("kind") == "prep"}
+    known_preps = {prep["id"]: prep for day in planning.get("result", {}).get("days", []) for prep in day.get("prep_cubes", [])}
+    for prep_id, report in planning.get("prep_progress", {}).items():
+        if prep_id in represented_preps or not report.get("date"):
+            continue
+        prep = known_preps.get(prep_id, {})
+        catalog[prep_id] = {"id": prep_id, "kind": "prep", "source_ref": prep_id, "title": "Подготовка к уроку",
+            "minutes": prep.get("minutes", planning.get("prep_overrides", {}).get(prep_id, planning["settings"]["prep_minutes"])),
+            "progress_percent": report["percent"], "actual_minutes": report.get("actual_minutes", 0),
+            "report_date": report["date"], "selected_date": None, "fixed_calendar": False}
+    for cube_id, snapshot in snapshots.items():
+        if cube_id in catalog:
+            # Durable descriptive fields are a fallback; all live/report values
+            # and current source metadata take precedence over closure history.
+            catalog[cube_id] = {**snapshot, **catalog[cube_id], "archived_goal_member": False}
+        else:
+            catalog[cube_id] = {**snapshot, "selected_date": None, "report_date": None,
+                "progress_percent": 0, "actual_minutes": 0, "archived_goal_member": True}
+    # Preserve a legacy prep ID already captured by a closed goal, while new
+    # active membership/trophy projection uses the canonical source only once.
+    closed_ids = {cid for records in (ctor.get("days", {}), ctor.get("weeks", {}))
+                  for record in records.values() for cid in record.get("closed_cube_ids", [])}
+    for cube_id, cube in list(catalog.items()):
+        cube["canonical_id"] = cube_id
+        if cube.get("kind") == "prep" and cube.get("source_ref") in closed_ids and cube["source_ref"] != cube_id:
+            catalog[cube["source_ref"]] = {**deepcopy(cube), "id": cube["source_ref"], "alias_of": cube_id}
+    return catalog
+
+
+def _goal_member_ids(scope, key, record, catalog):
+    if record.get("goal_status", "active") in {"completed", "cancelled"}:
+        return list(record.get("closed_cube_ids", []))
+    last = key if scope == "day" else (date.fromisoformat(key)+timedelta(days=6)).isoformat()
+    def belongs(value):
+        return isinstance(value, str) and key <= value <= last
+    members = []
+    for cube_id, cube in catalog.items():
+        if cube.get("fixed_calendar") or cube.get("alias_of") or cube.get("archived_goal_member"):
+            continue
+        selected_or_reported = belongs(cube.get("selected_date")) or belongs(cube.get("report_date"))
+        configured_week = (scope == "week" and belongs(cube.get("planned_date")) and
+                           (cube.get("kind") in {"task", "brainalot"} or cube.get("planned_date_configured")))
+        if selected_or_reported or configured_week:
+            members.append(cube_id)
+    return sorted(members)
+
+
+def _goal_read_row(scope, key, record, catalog):
+    member_ids = _goal_member_ids(scope, key, record, catalog)
+    members = [catalog.get(cid, {"minutes": 0, "progress_percent": 0}) for cid in member_ids]
+    total = sum(cube["minutes"] for cube in members)
+    weighted = sum(cube["minutes"]*cube.get("progress_percent", 0) for cube in members)
+    status = record.get("goal_status", "active")
+    complete_ids = [cid for cid in member_ids if catalog.get(cid, {}).get("progress_percent", 0) == 100]
+    achieved = bool(member_ids) and len(complete_ids) == len(member_ids)
+    percent = (100 if achieved else min(99.9, round(weighted/total))) if total else 0
+    return {"id": scope+":"+key, "scope": scope, "date": key, "title": record.get("goal", ""),
+        "percent": percent, "status": status, "achieved": achieved,
+        "display_status": "achieved" if status == "active" and achieved else status,
+        "cube_ids": member_ids, "completed_cube_ids": complete_ids,
+        "unfinished_cube_ids": [cid for cid in member_ids if cid not in complete_ids],
+        "total_minutes": total, "completed_minutes": round(weighted/100, 2)}
+
+
+def _refresh_constructor_result(planning):
+    ctor = planning.get("constructor", {})
+    days, cubes = {}, []
+    overflow = _constructor_allocation(planning, check=False)
+    for cube_id, cube in ctor.get("cubes", {}).items():
+        key = _constructor_selected_date(planning, cube_id)
+        report = _constructor_report(planning, cube)
+        lock = next((lock for lock in planning.get("locks", []) if lock["cube_id"] == cube_id), {})
+        start = lock.get("start") if cube["kind"] == "task" else ctor.get("days", {}).get(key, {}).get("source_slots", {}).get(cube_id)
+        stale = cube["kind"] == "task" and ("task:"+cube["task_id"] in overflow or bool(cube.get("segment_id") and "segment:"+cube["segment_id"] in overflow))
+        cubes.append({**deepcopy(cube), "allocation_stale": stale, "scope_exempt": cube["kind"] == "task" and _scope_exempt(planning, cube["task_id"]), "selected_date": key, "start": start,
+                      "end": _hhmm(_clock(start, "start")+cube["minutes"]) if start else None,
+                      "progress_percent": report.get("percent", 0), "actual_minutes": report.get("actual_minutes", 0),
+                      "report_date": report.get("date")})
+    zone = ZoneInfo(planning["settings"]["timezone"])
+    for row in planning.get("result", {}).get("days", []):
+        key = row["date"]
+        meta = ctor.get("days", {}).get(key)
+        events = []
+        for event in planning["calendar"]["events"]:
+            first = datetime.fromisoformat(event["start"].replace("Z", "+00:00"))
+            last = datetime.fromisoformat(event["end"].replace("Z", "+00:00"))
+            if first.tzinfo:
+                first, last = first.astimezone(zone), last.astimezone(zone)
+            if first.date().isoformat() <= key < last.date().isoformat() or first.date().isoformat() == key:
+                events.append({**deepcopy(event), "stable_id": _event_identity(event), "required": _constructor_event_required(planning, event)})
+        selected = [cube["id"] for cube in cubes if cube["selected_date"] == key]
+        hidden = (meta or {}).get("hidden_cube_ids", [])
+        required_refs = {event["stable_id"] for event in events if event["required"]}
+        possible = [cube["id"] for cube in cubes if not cube["selected_date"] and cube["id"] not in hidden
+                    and not cube.get("scope_exempt")
+                    and not (cube["kind"] == "calendar" and cube["source_ref"] in required_refs)
+                    and cube.get("planned_date") in (None, key) and (not cube.get("report_date") or cube["report_date"] == key)]
+        reports = [(cube, _constructor_report(planning, cube)) for cube in ctor.get("cubes", {}).values()]
+        actual = sum(report.get("actual_minutes", 0) for cube, report in reports if report.get("date") == key)
+        credit = sum(round(cube["minutes"]*report.get("percent", 0)/100) for cube, report in reports if report.get("date") == key)
+        days[key] = {**deepcopy(meta or {}), "date": key, "initialized": bool(meta and meta.get("initialized")),
+            "goal": (meta or {}).get("goal", row.get("goal") or ""), "goal_percent": (meta or {}).get("goal_percent", 0), "selected_cube_ids": selected,
+            "possible_cube_ids": possible, "hidden_cube_ids": deepcopy(hidden), "actual_minutes": actual,
+            "credited_minutes": credit, "selected_minutes": sum(cube["minutes"] for cube in cubes if cube["selected_date"] == key),
+            "fixed_minutes": row.get("fixed_minutes", 0), "total_work_minutes": row.get("builder_total_work_minutes", row["total_work_minutes"]),
+            "budget_minutes": row["day_limit_minutes"], "available_minutes": row.get("builder_available_minutes", row.get("unused_capacity_minutes", 0)),
+            "over_cap_minutes": row.get("builder_over_cap_minutes", row.get("over_cap_minutes", 0)), "events": events}
+    goals = []
+    goal_cubes = _goal_cube_catalog(planning)
+    goal_records = {"day": dict(ctor.get("days", {})), "week": dict(ctor.get("weeks", {}))}
+    for goal_cube in goal_cubes.values():
+        if goal_cube.get("fixed_calendar") or goal_cube.get("archived_goal_member"):
+            continue
+        known_dates = [goal_cube.get("selected_date"), goal_cube.get("report_date")]
+        for known_date in known_dates:
+            if known_date:
+                goal_records["day"].setdefault(known_date, {})
+                known = date.fromisoformat(known_date)
+                goal_records["week"].setdefault((known-timedelta(days=known.weekday())).isoformat(), {})
+        planned = goal_cube.get("planned_date")
+        if planned and (goal_cube.get("kind") in {"task", "brainalot"} or goal_cube.get("planned_date_configured")):
+            known = date.fromisoformat(planned)
+            goal_records["week"].setdefault((known-timedelta(days=known.weekday())).isoformat(), {})
+    for scope, records in goal_records.items():
+        for key, record in sorted(records.items()):
+            goals.append(_goal_read_row(scope, key, record, goal_cubes))
+    for goal in goals:
+        if goal["scope"] == "day" and goal["date"] in days:
+            days[goal["date"]]["goal_percent"] = goal["percent"]
+    weeks = deepcopy(goal_records["week"])
+    for goal in goals:
+        if goal["scope"] == "week":
+            weeks[goal["date"]].setdefault("goal", goal["title"])
+            weeks[goal["date"]]["goal_percent"] = goal["percent"]
+    assignments = ctor.get("awards", {})
+    for goal in goals:
+        goal["award_variant"] = assignments.get("goals", {}).get(goal["id"])
+    for cube_id, cube in goal_cubes.items():
+        cube["award_variant"] = assignments.get("cubes", {}).get(cube.get("canonical_id", cube_id))
+    for cube in cubes:
+        cube["award_variant"] = assignments.get("cubes", {}).get(cube["id"])
+    planning["result"]["constructor"] = {"version": 1, "days": days, "cubes": cubes, "allocation_overflow": overflow,
+        "goals": goals, "weeks": weeks, "goal_cubes": goal_cubes}
+
+
+def _eligible_award_ids(planning):
+    if planning is None:
+        return {"goals": set(), "cubes": set()}
+    projected = deepcopy(planning)
+    _refresh_constructor_result(projected)
+    model = projected["result"]["constructor"]
+    goals = {goal["id"] for goal in model["goals"] if goal["status"] != "cancelled" and
+             (goal["status"] == "completed" or goal["achieved"])}
+    cubes = {cube.get("canonical_id", cube_id) for cube_id, cube in model["goal_cubes"].items()
+             if cube.get("progress_percent") == 100 and not cube.get("alias_of") and not cube.get("archived_goal_member")}
+    return {"goals": goals, "cubes": cubes}
+
+
+def _draw_award(deck):
+    if not deck["remaining"]:
+        order = list(AWARD_VARIANTS)
+        SystemRandom().shuffle(order)
+        if order[0] == deck["last"]:
+            order[0], order[1] = order[1], order[0]
+        deck["remaining"] = order
+        deck["cycle"] += 1
+    variant = deck["remaining"].pop(0)
+    deck["last"] = variant
+    return variant
+
+
+def update_constructor_awards(planning, previous, *, backfill=False, allow_new=True):
+    """Assign only on typed writes; receipts persist the exact shuffled result."""
+    eligible = _eligible_award_ids(planning)
+    prior_eligible = {"goals": set(), "cubes": set()} if backfill else _eligible_award_ids(previous)
+    pending = {kind: eligible[kind]-prior_eligible[kind] if allow_new or backfill else set() for kind in eligible}
+    ctor = planning.get("constructor")
+    awards = (ctor or {}).get("awards")
+    if awards is None and not any(pending.values()):
+        return
+    if ctor is None:
+        ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    if awards is None:
+        awards = ctor.setdefault("awards", {"version": 1, "goals": {}, "cubes": {},
+            "decks": {kind: {"remaining": [], "last": None, "cycle": 0} for kind in ("goals", "cubes")}})
+    # A prep can acquire its constructor wrapper after a legacy completion.
+    # Move that alias key, preserving its award and consuming no second draw.
+    for cube_id, cube in _goal_cube_catalog(planning).items():
+        if cube.get("kind") == "prep" and not cube.get("alias_of"):
+            legacy_id = cube.get("source_ref")
+            if legacy_id != cube_id and legacy_id in awards["cubes"]:
+                awards["cubes"].setdefault(cube_id, awards["cubes"].pop(legacy_id))
+    for kind in ("goals", "cubes"):
+        for entity_id in sorted(pending[kind]):
+            if entity_id not in awards[kind]:
+                awards[kind][entity_id] = _draw_award(awards["decks"][kind])
+    _validate_constructor(planning)
+
+
+def _constructor_progress(planning, data):
+    if set(data)-{"cube_id", "percent", "actual_minutes"} or not {"cube_id", "percent"} <= set(data):
+        raise ValidationError("cube_progress: неверные поля")
+    planning = deepcopy(planning)
+    cube = planning["constructor"]["cubes"][data["cube_id"]]
+    prior = _constructor_report(planning, cube)
+    key = _constructor_selected_date(planning, cube["id"]) or prior.get("date") or cube.get("planned_date")
+    if key is None:
+        raise ValidationError("Для факта требуется выбранная/назначенная дата")
+    percent = _int(data["percent"], "percent", 0, 100)
+    actual = _int(data.get("actual_minutes", prior.get("actual_minutes", 0)), "actual_minutes")
+    report = {**deepcopy(prior), "date": key, "percent": percent, "actual_minutes": actual}
+    if cube["kind"] == "task":
+        report.update(task_id=cube["task_id"], planned_minutes=cube["minutes"])
+        if cube.get("segment_id"):
+            report["segment_id"] = cube["segment_id"]
+        planning.setdefault("completed_cubes", {})[cube["id"]] = report
+    elif cube["kind"] == "prep":
+        planning.setdefault("prep_progress", {})[cube["source_ref"]] = report
+    else:
+        planning["constructor"].setdefault("source_reports", {})[cube["id"]] = report
+    for day_key in planning["constructor"]["days"]:
+        if planning["constructor"]["days"][day_key].get("initialized"):
+            _refresh_manual_day(planning, day_key)
+    _refresh_result_remaining(planning)
+    planning["result"]["task_pool"] = _task_pool(planning, planning["result"]["cubes"], _dates(planning["settings"]))
+    _refresh_constructor_result(planning)
+    planning["needs_recalculation"] = True
+    planning["last_update"] = {"action": "cube_progress", "at": datetime.now(timezone.utc).isoformat()}
+    return planning
+
+
+def apply_constructor(planning, action, data):
+    original = planning
+    planning = deepcopy(planning)
+    ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    if action == "constructor_day":
+        if set(data)-{"date", "main_task_id", "goal", "replace_unstarted", "positions"} or "date" not in data:
+            raise ValidationError("constructor_day: неверные поля")
+        key = _builder_date(planning, data["date"])
+        day = _constructor_init(planning, key)
+        old_main = day.get("main_task_id")
+        if "main_task_id" in data:
+            if data["main_task_id"] is not None and data["main_task_id"] not in {t["id"] for t in planning["tasks"]}:
+                raise ValidationError("main_task_id: неизвестная задача")
+            day["main_task_id"] = data["main_task_id"]
+        if "goal" in data:
+            day["goal"] = deepcopy(data["goal"])
+        if type(data.get("replace_unstarted", False)) is not bool:
+            raise ValidationError("replace_unstarted: требуется bool")
+        if data.get("replace_unstarted") and old_main != day.get("main_task_id") and day.get("main_task_id"):
+            replace = [lock for lock in _manual_locks(planning, key) if lock["task_id"] == old_main
+                       and lock.get("floating") and lock["cube_id"] in ctor["cubes"] and not _constructor_started(planning, ctor["cubes"][lock["cube_id"]])]
+            for lock in replace:
+                old_cube = ctor["cubes"][lock["cube_id"]]
+                _constructor_return(planning, old_cube)
+                new_id = "constructor:"+uuid4().hex
+                new_cube = _constructor_cube_update(planning, {"cube_id": new_id, "kind": "task", "task_id": day["main_task_id"],
+                    "minutes": old_cube["minutes"], "title": next(t["title"] for t in planning["tasks"] if t["id"] == day["main_task_id"]), "planned_date": key})
+                _constructor_select(planning, new_cube, key)
+        if "positions" in data:
+            if not isinstance(data["positions"], dict):
+                raise ValidationError("positions: требуется объект")
+            for tray, positions in data["positions"].items():
+                if tray not in {"selected", "possible"} or not isinstance(positions, dict):
+                    raise ValidationError("positions: неверная россыпь")
+                day["positions"].setdefault(tray, {}).update(deepcopy(positions))
+    elif action == "constructor_cube":
+        _constructor_cube_update(planning, data)
+    elif action == "constructor_split":
+        if set(data)-{"cube_id", "minutes", "new_cube_id"} or not {"cube_id", "minutes"} <= set(data):
+            raise ValidationError("constructor_split: неверные поля")
+        cube = ctor["cubes"].get(data["cube_id"])
+        if cube is None or cube["kind"] != "task" or _constructor_started(planning, cube) or _constructor_selected_date(planning, cube["id"]):
+            raise ValidationError("Разделить можно неначатое невыбранное предложение задачи")
+        minutes = _int(data["minutes"], "split minutes", 5, cube["minutes"]-5)
+        if minutes % 5:
+            raise ValidationError("split: шаг5")
+        new_id = identifier(data.get("new_cube_id", "constructor:"+uuid4().hex), "new_cube_id")
+        if new_id in ctor["cubes"]:
+            raise ValidationError("new_cube_id: уже существует")
+        second = deepcopy(cube)
+        second.update(id=new_id, minutes=cube["minutes"]-minutes)
+        second.pop("week_position", None)
+        cube["minutes"] = minutes
+        ctor["cubes"][new_id] = second
+    elif action == "constructor_select":
+        if set(data)-{"cube_id", "date", "cube", "start"} or not {"cube_id", "date"} <= set(data):
+            raise ValidationError("constructor_select: неверные поля")
+        if "cube" in data:
+            if not isinstance(data["cube"], dict) or "cube_id" in data["cube"]:
+                raise ValidationError("constructor_select.cube: неверный объект")
+            _constructor_cube_update(planning, {**data["cube"], "cube_id": data["cube_id"]})
+        cube = ctor["cubes"].get(data["cube_id"])
+        if cube is None:
+            raise ValidationError("constructor cube: не найден")
+        _constructor_select(planning, cube, _builder_date(planning, data["date"]), data.get("start"))
+    elif action in {"constructor_return", "constructor_hide", "constructor_timeline"}:
+        allowed = {"cube_id"} if action == "constructor_return" else {"cube_id", "date", "hidden"} if action == "constructor_hide" else {"cube_id", "date", "start"}
+        required = allowed if action != "constructor_timeline" else {"cube_id", "start"}
+        if set(data)-allowed or not required <= set(data):
+            raise ValidationError(f"{action}: неверные поля")
+        cube = ctor["cubes"].get(data["cube_id"])
+        if cube is None:
+            raise ValidationError("constructor cube: не найден")
+        if action == "constructor_return":
+            _constructor_return(planning, cube)
+        elif action == "constructor_hide":
+            key = _builder_date(planning, data["date"])
+            if type(data["hidden"]) is not bool:
+                raise ValidationError("hidden: требуется bool")
+            day = _constructor_init(planning, key)
+            if data["hidden"]:
+                if _constructor_selected_date(planning, cube["id"]) == key:
+                    _constructor_return(planning, cube)
+                if cube["id"] not in day["hidden_cube_ids"]:
+                    day["hidden_cube_ids"].append(cube["id"])
+            else:
+                day["hidden_cube_ids"] = [cid for cid in day["hidden_cube_ids"] if cid != cube["id"]]
+        else:
+            key = _constructor_selected_date(planning, cube["id"])
+            if key is None or data.get("date", key) != key:
+                raise ValidationError("timeline: кубик не выбран на этой дате")
+            _builder_date(planning, key)
+            _constructor_set_slot(planning, cube, key, data["start"])
+    elif action == "calendar_required":
+        if set(data) != {"event_id", "required"} or type(data["required"]) is not bool:
+            raise ValidationError("calendar_required: нужны event_id,required bool")
+        event = next((e for e in planning["calendar"]["events"] if data["event_id"] in {e["id"], _event_identity(e)}), None)
+        if event is None:
+            raise ValidationError("Calendar event: не найден")
+        ctor["event_required"][_event_identity(event)] = data["required"]
+        if data["required"]:
+            for cube in ctor["cubes"].values():
+                if cube["kind"] == "calendar" and cube["source_ref"] == _event_identity(event):
+                    key = _constructor_selected_date(planning, cube["id"])
+                    if key:
+                        ctor["days"][key].setdefault("source_slots", {}).pop(cube["id"], None)
+    else:
+        raise ValidationError("Неизвестное действие constructor")
+    _validate_constructor(planning)
+    _constructor_allocation(planning, original)
+    _constructor_validate_slots(planning)
+    for key in ctor["days"]:
+        if ctor["days"][key].get("initialized"):
+            _refresh_manual_day(planning, key)
+    result = calculate(planning, reason=action)
+    # calculate freezes reported days; refresh the explicitly edited manual view
+    # so return/hide after progress removes only selection, never the report.
+    for key in ctor["days"]:
+        if ctor["days"][key].get("initialized"):
+            _refresh_manual_day(result, key)
+    _refresh_constructor_result(result)
+    return result
+
+
+def _scope_exempt(planning, task_id, key=None):
+    entry = planning.get("scope_exemptions", {}).get(task_id, {})
+    return entry.get("exempt", False) and (key is None or key >= entry["from_date"])
+
+
+def apply_scope_exempt(planning, data):
+    allowed = {"task_ids", "exempt", "reason", "from_date", "release_unstarted"}
+    if set(data)-allowed or not {"task_ids", "exempt", "reason", "from_date"} <= set(data):
+        raise ValidationError("scope_exempt: неверные поля")
+    ids = data["task_ids"]
+    if not isinstance(ids, list) or not ids or len(ids) > 3000 or len(ids) != len(set(ids)) or any(tid not in {t["id"] for t in planning["tasks"]} for tid in ids):
+        raise ValidationError("scope_exempt.task_ids: нужны существующие уникальные ID")
+    if type(data["exempt"]) is not bool or type(data.get("release_unstarted", False)) is not bool:
+        raise ValidationError("scope_exempt: требуется bool")
+    if not isinstance(data["reason"], str) or not data["reason"].strip() or len(data["reason"]) > 1000:
+        raise ValidationError("scope_exempt.reason: требуется текст до1000")
+    planning = deepcopy(planning)
+    key = _builder_date(planning, data["from_date"])
+    released = []
+    if data["exempt"]:
+        to_release = [lock for lock in planning.get("locks", []) if lock["task_id"] in ids and lock["date"] >= key and not _started(planning, lock["cube_id"])]
+        if to_release and not data.get("release_unstarted"):
+            raise ValidationError("Сначала явно разрешите release_unstarted для будущих резервов")
+        for lock in to_release:
+            planning["locks"].remove(lock)
+            released.append({"cube_id": lock["cube_id"], "date": lock["date"], "minutes": lock["minutes"]})
+            _normalize_manual_order(planning, lock["date"])
+    for tid in ids:
+        planning.setdefault("scope_exemptions", {})[tid] = {**planning.get("scope_exemptions", {}).get(tid, {}),
+            "exempt": data["exempt"], "reason": data["reason"], "from_date": key, "at": datetime.now(timezone.utc).isoformat()}
+    # Keep reported/frozen history, remove only unstarted forecasts from the future
+    # part before calculate may retain old days behind a later report boundary.
+    if data["exempt"]:
+        planning["result"]["cubes"] = [cube for cube in planning["result"]["cubes"]
+            if cube["task_id"] not in ids or cube["date"] < key or _started(planning, cube["id"])]
+    for day_key in planning.get("constructor", {}).get("days", {}):
+        if planning["constructor"]["days"][day_key].get("initialized"):
+            _refresh_manual_day(planning, day_key)
+    result = calculate(planning, from_date=key, reason="scope_exempt")
+    for day_key in result.get("constructor", {}).get("days", {}):
+        if result["constructor"]["days"][day_key].get("initialized"):
+            _refresh_manual_day(result, day_key)
+    _refresh_constructor_result(result)
+    result["result"]["scope_released_reservations"] = released
+    result["last_update"] = {"action": "scope_exempt", "at": datetime.now(timezone.utc).isoformat()}
+    return result
+
+
+def apply_constructor_goal(planning, data):
+    """Store explicit goal progress without converting a day or crediting work."""
+    if (set(data)-{"scope", "date", "title", "percent"} or not {"scope", "date"} <= set(data)
+            or not ({"title", "percent"} & set(data))):
+        raise ValidationError("constructor_goal: нужны scope,date и title или percent")
+    if data["scope"] not in {"day", "week"}:
+        raise ValidationError("constructor_goal.scope: day или week")
+    selected = _day(data["date"], "constructor_goal.date")
+    key = (selected-timedelta(days=selected.weekday())).isoformat() if data["scope"] == "week" else selected.isoformat()
+    if "title" in data and (not isinstance(data["title"], str) or len(data["title"]) > 1000):
+        raise ValidationError("constructor_goal.title: текст до1000")
+    if "percent" in data:
+        _int(data["percent"], "constructor_goal.percent", 0, 100)
+    planning = deepcopy(planning)
+    ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    if data["scope"] == "day":
+        record = ctor["days"].setdefault(key, {"initialized": False, "goal": "", "goal_percent": 0})
+    else:
+        record = ctor.setdefault("weeks", {}).setdefault(key, {"goal": "", "goal_percent": 0})
+    if "title" in data:
+        record["goal"] = data["title"]
+    if "percent" in data:
+        record["goal_percent"] = data["percent"]
+    _validate_constructor(planning)
+    _refresh_constructor_result(planning)
+    planning["last_update"] = {"action": "constructor_goal", "at": datetime.now(timezone.utc).isoformat()}
+    return planning
+
+
+def apply_constructor_goal_status(planning, data):
+    if set(data) != {"scope", "date", "status"} or data["scope"] not in {"day", "week"}:
+        raise ValidationError("constructor_goal_status: нужны scope,date,status")
+    if data["status"] not in {"active", "completed", "cancelled"}:
+        raise ValidationError("constructor_goal_status.status: active|completed|cancelled")
+    selected = _day(data["date"], "constructor_goal_status.date")
+    key = (selected-timedelta(days=selected.weekday())).isoformat() if data["scope"] == "week" else selected.isoformat()
+    planning = deepcopy(planning)
+    ctor = planning.setdefault("constructor", {"version": 1, "cubes": {}, "days": {}, "event_required": {}, "source_reports": {}})
+    records = ctor["days"] if data["scope"] == "day" else ctor.setdefault("weeks", {})
+    record = records.setdefault(key, {"goal": "", "goal_percent": 0, **({"initialized": False} if data["scope"] == "day" else {})})
+    old_status = record.get("goal_status", "active")
+    if data["status"] != "active" and old_status == "active":
+        catalog = _goal_cube_catalog(planning)
+        record["closed_cube_ids"] = _goal_member_ids(data["scope"], key, record, catalog)
+        preserved = record.setdefault("closed_cube_snapshots", {})
+        for cube_id in record["closed_cube_ids"]:
+            if cube_id in catalog:
+                preserved[cube_id] = deepcopy(catalog[cube_id])
+        record["closed_at"] = datetime.now(timezone.utc).isoformat()
+    record["goal_status"] = data["status"]
+    _validate_constructor(planning)
+    _refresh_constructor_result(planning)
+    planning["last_update"] = {"action": "constructor_goal_status", "at": datetime.now(timezone.utc).isoformat()}
+    return planning
+
+
+def _month(value):
+    if not isinstance(value, str) or len(value) != 7:
+        raise ValidationError("month: требуется YYYY-MM")
+    try:
+        parsed = date.fromisoformat(value + "-01")
+    except ValueError as exc:
+        raise ValidationError("month: требуется существующий месяц YYYY-MM") from exc
+    if parsed.isoformat()[:7] != value:
+        raise ValidationError("month: требуется YYYY-MM")
+    return value
+
+
+def _monthly_task_ids(values, known_ids):
+    if (not isinstance(values, list) or len(values) > 3000
+            or any(not isinstance(tid, str) or tid not in known_ids for tid in values)
+            or len(values) != len(set(values))):
+        raise ValidationError("monthly_plan.task_ids: уникальные ID известных Work задач")
+    return values
+
+
+def _validate_monthly_plan(record, known_ids):
+    fields = {"id", "month", "status", "approved_at", "task_ids"}
+    if not isinstance(record, dict) or set(record) != fields:
+        raise ValidationError("monthly_plan: нужны только id,month,status,approved_at,task_ids")
+    try:
+        UUID(record["id"])
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValidationError("monthly_plan.id: требуется UUID") from exc
+    _month(record["month"])
+    _monthly_task_ids(record["task_ids"], known_ids)
+    status = record["status"]
+    if not isinstance(status, str) or status not in {"approved", "draft"}:
+        raise ValidationError("monthly_plan.status: approved или draft")
+    if status == "draft":
+        if record["approved_at"] is not None:
+            raise ValidationError("monthly_plan draft: approved_at должен быть null")
+    else:
+        try:
+            stamp = datetime.fromisoformat(record["approved_at"])
+            if stamp.tzinfo is None or stamp.utcoffset() != timedelta(0):
+                raise ValueError("UTC required")
+        except (ValueError, TypeError) as exc:
+            raise ValidationError("monthly_plan.approved_at: требуется время UTC") from exc
+
+
+def project_task_importance(planning):
+    """Add read defaults and refresh task rows without touching cube identity/facts."""
+    scores = {task["id"]: task.get("importance_score", 0) for task in planning.get("tasks", [])}
+    for task in planning.get("tasks", []):
+        task["importance_score"] = scores[task["id"]]
+    for collection in ("tasks", "task_pool"):
+        for row in planning.get("result", {}).get(collection, []):
+            task_id = row.get("task_id") if collection == "task_pool" else row.get("id")
+            if task_id in scores:
+                row["importance_score"] = scores[task_id]
+    return planning
+
+
 def apply_action(planning, action, data):
     if not isinstance(data, dict):
         raise ValidationError("planning data: требуется объект")
+    if action == "monthly_plan_approve":
+        if set(data) != {"month", "task_ids"}:
+            raise ValidationError("monthly_plan_approve: нужны только month,task_ids")
+        month = _month(data["month"])
+        task_ids = _monthly_task_ids(data["task_ids"], {task["id"] for task in planning["tasks"]})
+        planning = deepcopy(planning)
+        previous = planning.get("monthly_plan", {})
+        planning["monthly_plan"] = {
+            "id": previous["id"] if previous.get("month") == month else str(uuid4()),
+            "month": month, "status": "approved",
+            "approved_at": datetime.now(timezone.utc).isoformat(), "task_ids": list(task_ids),
+        }
+        _validate_monthly_plan(planning["monthly_plan"], {task["id"] for task in planning["tasks"]})
+        return planning
+    if action == "task_importance":
+        if set(data) != {"task_id", "importance_score"}:
+            raise ValidationError("task_importance: нужны task_id, importance_score")
+        score = _int(data["importance_score"], "importance_score", 0, 5)
+        task_id = identifier(data["task_id"], "task_id")
+        planning = deepcopy(planning)
+        task = next((task for task in planning["tasks"] if task["id"] == task_id), None)
+        if task is None:
+            raise ValidationError("task_importance: задача не найдена")
+        task["importance_score"] = score
+        return project_task_importance(planning)
+    if action == "scope_exempt":
+        return apply_scope_exempt(planning, data)
+    if action == "constructor_goal":
+        return apply_constructor_goal(planning, data)
+    if action == "constructor_goal_status":
+        return apply_constructor_goal_status(planning, data)
+    if action.startswith("constructor_") or action == "calendar_required":
+        return apply_constructor(planning, action, data)
+    if action == "cube_progress" and data.get("cube_id") in planning.get("constructor", {}).get("cubes", {}):
+        return _constructor_progress(planning, data)
     if action in {"segment_create", "segment_progress", "day_segment_add"}:
         return apply_segment_action(planning, action, data)
     if action in {"day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
@@ -2087,6 +3339,8 @@ def compact_status(snapshot):
             "tasks": [{"id": t.get("id"), "course": t.get("course"), "title": t.get("title"),
                        "due": t.get("due"), "due_status": t.get("due_status"),
                        "remaining_minutes": actual_remaining.get(t.get("id")),
+                       "active_remaining_minutes": t.get("active_remaining_minutes", actual_remaining.get(t.get("id"))),
+                       "scope_exempt": t.get("scope_exempt", False),
                        "remaining_at_horizon_minutes": t.get("remaining_at_horizon_minutes"),
                        "deficit_by_due_minutes": t.get("deficit_by_due_minutes")}
                       for t in result.get("tasks", [])]}

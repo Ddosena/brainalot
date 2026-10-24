@@ -6,6 +6,11 @@ The application includes Python, FastAPI, Starlette, Uvicorn, Pydantic, PyYAML, 
 
 Oswald and PT Sans fonts are distributed under the SIL Open Font License. Their original notices are included as `extension/fonts/OFL-Oswald.txt` and `extension/fonts/OFL-PTSans.txt`.
 
+The Work constructor includes Matter.js 0.20.0, Copyright (c) Liam Brummitt and
+contributors, under the MIT License. The unmodified local build and its full
+license are bundled in `extension/vendor/`; upstream: https://brm.io/matter-js/
+and https://github.com/liabru/matter-js. No CDN is required at runtime.
+
 The Spotify icon is an unmodified Black/White SVG from Spotify's official icon
 asset package, used to identify and open the local Spotify application.
 Spotify trademarks and brand assets remain the property of Spotify and are

@@ -279,8 +279,8 @@ class TimeStore:
             return 0
         if value is None:
             return POMODORO_MS if mode == "pomodoro" else 0
-        if isinstance(value, bool) or not isinstance(value, int) or not 60_000 <= value <= 10_800_000:
-            raise ValidationError("duration_ms must be between 60000 and 10800000")
+        if isinstance(value, bool) or not isinstance(value, int) or not 60_000 <= value <= 14_400_000:
+            raise ValidationError("duration_ms must be between 60000 and 14400000")
         return value
 
     def command(self, body: dict):

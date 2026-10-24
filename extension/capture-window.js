@@ -1,4 +1,5 @@
 import { t } from "./i18n.js";
+import { validImportanceScore } from "./importance-score.js";
 import { AUTO } from "./dictation.js";
 export const POPUP_CONTEXT_KEY = "panel:popup-context";
 export const DRAFT_KEY = "panel:capture-draft";
@@ -45,6 +46,7 @@ export function normalizeDraft(value) {
     topic: typeof raw.topic === "string" ? raw.topic.slice(0, 100) : "",
     importance: ["low", "normal", "high", "critical"].includes(raw.importance) && !(legacy && raw.importance === "normal")
       ? raw.importance : AUTO,
+    importanceScore: validImportanceScore(raw.importanceScore) ? raw.importanceScore : null,
     route: raw.route === "note" ? "note" : AUTO,
     voice: raw.voice === true,
     showInUnscheduled: raw.showInUnscheduled === true,
