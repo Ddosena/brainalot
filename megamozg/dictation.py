@@ -257,6 +257,7 @@ _IMPORTANCE_PHRASES = (
 _HORIZONS = (
     (("на", "этой", "неделе"), "week"), (("на", "неделе"), "week"), (("в", "течение", "недели"), "week"),
     (("до", "конца", "недели"), "week"), (("на", "эту", "неделю"), "week"), (("за", "неделю"), "week"),
+    (("в", "план", "на", "неделю"), "week"), (("на", "неделю"), "week"),
     (("в", "этом", "месяце"), "month"), (("на", "этот", "месяц"), "month"), (("на", "месяц"), "month"),
     (("в", "течение", "месяца"), "month"), (("до", "конца", "месяца"), "month"),
     (("в", "конце", "месяца"), "month"),
@@ -269,6 +270,10 @@ _HORIZONS = (
 
 _PREFIXES = (
     (re.compile(r"(?:ну|так|итак|короче|слушай|значит|давай|пожалуйста|э+|эм+)\b[\s,.]*", re.I), None),
+    (re.compile(r"(?:я\s+)?хочу\s*,?\s+чтобы\s+ты\s+(?:добавил|добавила|поставил|поставила|создал|создала)\s+"
+                r"(?:мне\s+)?(?:задачу|задание|дело)\b[\s,:.]*", re.I), "task"),
+    (re.compile(r"(?:(?:мне\s+бы|мне)\s+)?(?:поставить|поставим|поставь|поставьте|добавить|добавим|добавь|создать|"
+                r"создадим|создай)\s+(?:мне\s+)?(?:задачу|задание|дело)\b[\s,:.]*", re.I), "task"),
     (re.compile(r"(?:поставь|добавь|запиши|внеси|создай|заведи|закинь|кинь|сохрани|запланируй)\b"
                 r"(?:\s+(?:мне|себе|нам|пожалуйста|еще|ещё))*[\s,:.]*", re.I), None),
     (re.compile(r"(?:в\s+)?(?:список\s+покупок|покупки)\b[\s,:.–—-]*", re.I), "purchase"),
@@ -287,6 +292,17 @@ _PREFIXES = (
                 r"(?:(?:о\s+том,?\s+)?что\s+)?", re.I), "thought"),
     (re.compile(r"(?:(?:новый|создай|создать|завести|заведи)\s+)?проект\b\s*(?:[:,.–—-]\s*)?", re.I),
      "project"),
+)
+_CORRECTION_MARKER = (
+    r"(?:(?:на\s+)?(?:сегодня|завтра|послезавтра)|"
+    r"на\s+(?:этой\s+неделе|эту\s+неделю|неделе|неделю|этот\s+месяц|месяц)|"
+    r"в\s+этом\s+месяце)\b"
+)
+_CORRECTED_DATE_PREFIXES = (
+    re.compile(r"\bне\s+" + _CORRECTION_MARKER + r"\s*,?\s*а\s+(?="
+               + _CORRECTION_MARKER + r")", re.I),
+    re.compile(r"\b" + _CORRECTION_MARKER + r"\s*[,;:–—-]\s*нет\s*"
+               r"[,;:–—-]?\s*(?:лучше\s+)?(?=" + _CORRECTION_MARKER + r")", re.I),
 )
 _TARGETS = (
     (("в", "список", "покупок"), "purchase"), (("в", "покупки"), "purchase"), (("к", "покупкам"), "purchase"),
@@ -816,6 +832,25 @@ class _Parser:
         for sequence, meaning in _HORIZONS:
             if not self.words_at(i, sequence):
                 continue
+            if sequence == ("на", "неделю"):
+                previous_action = None
+                between: list[str] = []
+                planning_commands = {"запланировать", "запланируй", "добавь", "добавить",
+                                     "поставь", "поставить", "поставим"}
+                for token in reversed(self.tokens[:i]):
+                    if token.kind == "punct" and token.text in {",", ";", ".", ":", "!", "?"}:
+                        break
+                    if token.kind == "word" and (token.norm in planning_commands or _looks_like_verb(token.norm)):
+                        previous_action = token.norm
+                        break
+                    if token.kind == "word":
+                        between.append(token.norm)
+                if (previous_action and (previous_action not in planning_commands or
+                        any(word not in {"мне", "нам", "себе", "пожалуйста", "еще", "ещё",
+                                         "задачу", "задание", "дело", "новую", "новое", "новая", "одно"}
+                            for word in between))):
+                    # A command with an object before «на неделю» can name its duration.
+                    continue
             count = len(sequence)
             if meaning in {"week", "month"}:
                 if self.horizon is None:
@@ -1050,6 +1085,11 @@ class _Parser:
 
     # -- run ----------------------------------------------------------------
     def run(self) -> dict:
+        for pattern in _CORRECTED_DATE_PREFIXES:
+            for match in pattern.finditer(self.text):
+                for k, token in enumerate(self.tokens):
+                    if token.start >= match.start() and token.end <= match.end():
+                        self.marks[k] = "filler"
         matchers = (self.m_url_tag, self.m_recurrence, self.m_offset, self.m_horizon, self.m_range,
                     self.m_explicit_date, self.m_relative_day, self.m_weekday, self.m_time,
                     self.m_duration, self.m_part_of_day, self.m_target, self.m_importance, self.m_context)
@@ -1113,7 +1153,8 @@ class _Parser:
 
     def build(self) -> dict:
         remaining = self.remaining_text()
-        stripped, label = _strip_prefixes(remaining)
+        stripped, label = _strip_prefixes(remaining, scheduled=bool(
+            self.date or self.horizon or self.start or self.offset or self.recurrence or self.deadline))
         if self.label and label in {None, "task?"}:
             label = self.label
         kind, media_type, confident = self.classify(stripped, label)
@@ -1304,7 +1345,7 @@ def _tidy(text: str) -> str:
     return text.strip(" ,.;:!?-–—")
 
 
-def _strip_prefixes(text: str) -> tuple[str, str | None]:
+def _strip_prefixes(text: str, *, scheduled: bool = False) -> tuple[str, str | None]:
     label: str | None = None
     signup = re.match(r"(?:запиши|записать)\s+(\S+(?:\s+\S+)?\s+(?:к|ко|на)\s.+)$", text, re.I)
     if signup and not re.match(r"(?:мне|себе|нам|пожалуйста|мысль|идею|дело|задачу|покупку|заметку|в)\b",
@@ -1315,6 +1356,18 @@ def _strip_prefixes(text: str) -> tuple[str, str | None]:
     previous = None
     while previous != text:
         previous = text
+        wish = re.match(r"(?:я\s+)?хочу\b[\s,:.]+([^\W\d_]+)", text, re.I)
+        if scheduled and wish and _looks_like_verb(_norm(wish.group(1))):
+            text, label = _tidy(text[wish.start(1):]), label or "task"
+            continue
+        purpose = re.match(r"чтобы\s+([^\W\d_]+)", text, re.I)
+        if label == "task" and purpose and _looks_like_verb(_norm(purpose.group(1))):
+            text = _tidy(text[purpose.start(1):])
+            continue
+        planned_action = re.match(r"запланировать\b[\s,:.]+([^\W\d_]+)", text, re.I)
+        if planned_action and _looks_like_verb(_norm(planned_action.group(1))):
+            text, label = _tidy(text[len("запланировать"):]), label or "task"
+            continue
         for pattern, meaning in _PREFIXES:
             match = pattern.match(text)
             if not match or not match.group(0):
