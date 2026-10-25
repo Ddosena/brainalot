@@ -1,5 +1,6 @@
 import { native } from "./desktop-platform.js";
 import { installWindowGestures } from "./desktop-gestures.js";
+import { createDesktopNavigation, desktopFrameReady } from "./desktop-navigation.js";
 import { timeClient, sharedApi, elapsedAt } from "./time-client.js";
 import { resolveActiveTask, timerProgress } from "./widget-model.js";
 import { calendarImportanceLevel } from "./importance-state.js";
@@ -25,18 +26,14 @@ document.getElementById("desktop-spotify-toggle").onclick = () => {
 document.documentElement.dataset.theme = saved["panel:theme"] || "light";
 document.documentElement.dataset.design = saved["panel:design"] || "stream";
 document.querySelector('[data-view="work"]').hidden = !WORK_ENABLED;
-function show(view) {
-  if (view === "home") view = "day";
-  if (view === "work" && !WORK_ENABLED) view = "day";
+const navigation = createDesktopNavigation({frame: document.getElementById("desktop-content"),
+  baseUrl: location.href, workEnabled: WORK_ENABLED, onView: view => {
   if (view !== "work" && document.body.classList.contains("work-expanded")) {
     void native.window_action("work_expand", false).then(() => document.body.classList.remove("work-expanded")).catch(error => showError(error));
   }
-  const paths = { day: "panel.html?embedded-desktop=1", library: "panel.html?library-window=1&embedded-desktop=1", work: "work.html", capture: "capture.html" };
-  const frame = document.getElementById("desktop-content");
-  const next = new URL(paths[view] || paths.day, location.href).href;
-  if (frame.src !== next) { frame.dataset.loading = "true"; frame.src = next; }
   document.querySelectorAll("[data-view]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.view === view)));
-}
+}});
+const show = view => navigation.show(view);
 const initialView = new URLSearchParams(location.search).get("view") || "day";
 document.querySelectorAll("[data-view]").forEach(button => button.onclick = () => { document.querySelector(".desktop-menu").open = false; show(button.dataset.view); });
 window.addEventListener("brainalot-view", event => show(event.detail));
@@ -44,8 +41,11 @@ const bootstrap = await native.bootstrap();
 document.body.classList.toggle("work-expanded", !!bootstrap.work_expanded);
 window.addEventListener("message", async event => {
   const frame = document.getElementById("desktop-content"), request = event.data;
-  if (event.origin !== location.origin || event.source !== frame.contentWindow ||
-      request?.type !== "brainalot-work-fullscreen-request" || typeof request.expanded !== "boolean" ||
+  if (event.origin !== location.origin || event.source !== frame.contentWindow) return;
+  if (request?.type === "brainalot:desktop-view") {
+    navigation.fromPanel(request); return;
+  }
+  if (request?.type !== "brainalot-work-fullscreen-request" || typeof request.expanded !== "boolean" ||
       !frame.src.includes("/work.html")) return;
   try {
     const result = await native.window_action("work_expand", request.expanded);
@@ -58,7 +58,9 @@ window.addEventListener("message", async event => {
 installWindowGestures(native, {doubleClick: bootstrap.double_click, freeDoubleClick: true,
   onDoubleClick: () => void native.window_action("card")});
 document.getElementById("desktop-content").addEventListener("load", event => {
-  const frame = event.currentTarget; frame.dataset.loading = "false";
+  const frame = event.currentTarget;
+  if (!desktopFrameReady(frame)) return;
+  frame.dataset.loading = "false";
   try {
     if (frame.contentDocument?.body) installWindowGestures(native, {surface: frame.contentDocument.body,
       doubleClick: bootstrap.double_click, freeDoubleClick: true, onDoubleClick: () => void native.window_action("card")});
@@ -67,12 +69,7 @@ document.getElementById("desktop-content").addEventListener("load", event => {
 show(initialView);
 document.querySelectorAll("[data-panel-action]").forEach(button => { button.onclick = async () => {
   document.querySelector(".desktop-menu").open = false;
-  const frame = document.getElementById("desktop-content");
-  if (!frame.src.includes("panel.html")) {
-    const loaded = new Promise(resolve => frame.addEventListener("load", resolve, {once: true}));
-    show("day"); await loaded;
-  }
-  frame.contentWindow.postMessage({type: "brainalot:panel-action", action: button.dataset.panelAction}, location.origin);
+  await navigation.panelAction(button.dataset.panelAction);
 }; });
 function renderProgress() {
   const progress = timerProgress(timeClient.state, elapsedAt(timeClient.state));

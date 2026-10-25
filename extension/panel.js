@@ -20,11 +20,13 @@ import { DEFAULT_IGNITION_SOUND, IGNITION_SOUNDS, normalizeIgnitionSound, playIg
 import { openWorkPage } from "./work-tabs.js";
 import { WORK_ENABLED } from "./work-availability.js";
 import { mountQuickVoice } from "./quick-voice.js";
+import { resolvePanelView } from "./desktop-navigation.js";
 
 applyDocument();
 const $ = (id) => document.getElementById(id);
 const IS_LIBRARY_WINDOW = new URLSearchParams(location.search).has("library-window");
 const EMBEDDED_DESKTOP = chrome.desktop === true && window !== window.top && new URLSearchParams(location.search).has("embedded-desktop");
+const DESKTOP_PANEL_VIEW = new URLSearchParams(location.search).get("desktop-view") === "library" || IS_LIBRARY_WINDOW ? "library" : "day";
 if (EMBEDDED_DESKTOP) document.body.classList.add("desktop-embedded-panel");
 const kinds = {inbox:t("Входящие"),task:t("Дело"),purchase:t("Покупка"),media:t("Медиа"),idea:t("Идея"),thought:t("Мысль"),link:t("Ссылка"),project:t("Проект"),person:t("Человек")};
 const media = {movie:t("Фильм"),series:t("Сериал"),book:t("Книга"),game:t("Игра"),podcast:t("Подкаст"),article:t("Статья")};
@@ -1708,7 +1710,7 @@ function applyLibrarySnapshot(value) {
   for (const id of snapshot.expanded) expandedLibrary.add(id);
   libraryRenderKey = null;
   libraryRestoreScroll = {list:snapshot.listScroll, nav:snapshot.navScroll};
-  if (snapshot.open || IS_LIBRARY_WINDOW) openLibrary({focus:false, resetScroll:false, persist:false});
+  if (resolvePanelView(snapshot, {embedded:EMBEDDED_DESKTOP, view:DESKTOP_PANEL_VIEW, libraryWindow:IS_LIBRARY_WINDOW}) === "library") openLibrary({focus:false, resetScroll:false, persist:false});
   else if (document.body.dataset.panelView === "library") returnToDay(false, false);
   renderLibrary();
   libraryRestoring = false;
@@ -2358,6 +2360,10 @@ $("focus-neon-colors").addEventListener("keydown", event => {
   void chooseNeonColor(ids[(ids.indexOf(focusOverlayColor) + step + ids.length) % ids.length], {focus:true});
 });
 function openLibrary({focus = true, resetScroll = true, persist = true} = {}) {
+  if (EMBEDDED_DESKTOP && DESKTOP_PANEL_VIEW !== "library") {
+    window.parent.postMessage({type:"brainalot:desktop-view", view:"library", href:location.href}, location.origin);
+    return;
+  }
   closeAppearancePanel(false);
   if (document.body.dataset.panelView === "library") { if (focus) $("library-search").focus(); return; }
   closeFocusPanel(false);
@@ -2374,6 +2380,10 @@ function openLibrary({focus = true, resetScroll = true, persist = true} = {}) {
   if (persist) void persistLibraryState();
 }
 function returnToDay(restoreFocus = true, persist = true) {
+  if (EMBEDDED_DESKTOP && DESKTOP_PANEL_VIEW === "library") {
+    window.parent.postMessage({type:"brainalot:desktop-view", view:"day", href:location.href}, location.origin);
+    return;
+  }
   if (IS_LIBRARY_WINDOW) return;
   delete document.body.dataset.panelView;
   $("library-pane").hidden = true;
@@ -2473,6 +2483,10 @@ $("library-window-toggle").addEventListener("click", async () => {
   } finally { button.disabled = false; }
 });
 async function initializeLibraryView() {
+  if (EMBEDDED_DESKTOP) {
+    $("library-window-toggle").hidden = true;
+    if (DESKTOP_PANEL_VIEW === "library") openLibrary({focus:false, persist:false});
+  }
   if (IS_LIBRARY_WINDOW) {
     document.body.dataset.libraryWindow = "true";
     $("library-pane").hidden = false;
@@ -2487,6 +2501,7 @@ async function initializeLibraryView() {
   const saved = (await chrome.storage.local.get(LIBRARY_SNAPSHOT_KEY))[LIBRARY_SNAPSHOT_KEY];
   if (saved) applyLibrarySnapshot(saved);
   else if (IS_LIBRARY_WINDOW) renderLibrary();
+  if (EMBEDDED_DESKTOP && DESKTOP_PANEL_VIEW === "library") $("library-search").focus();
 }
 function stepRotation(direction) {
   if (!dashboard || viewerState) return;
@@ -2504,6 +2519,7 @@ mountTimeUI(timeHost);
 if (EMBEDDED_DESKTOP) timeHost.querySelector(".time-control").hidden = true;
 if (EMBEDDED_DESKTOP) window.addEventListener("message", event => {
   if (event.source !== window.parent || event.origin !== location.origin || event.data?.type !== "brainalot:panel-action") return;
+  if (event.data.action === "day") { returnToDay(false, false); return; }
   const id = {search: "find-toggle", appearance: "appearance-toggle", locale: "locale-toggle", settings: "settings-toggle"}[event.data.action];
   if (id) $(id).click();
 });

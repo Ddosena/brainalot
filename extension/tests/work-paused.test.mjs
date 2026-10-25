@@ -37,7 +37,7 @@ test("Work is available and the retained pause helpers still protect data", asyn
   }
   const desktop = await source("desktop.html");
   assert.match(desktop, /data-view="work" hidden/);
-  assert.match(await source("desktop.js"), /view === "work" && !WORK_ENABLED/);
+  assert.match(await source("desktop.js"), /workEnabled: WORK_ENABLED/);
   assert.match(await source("desktop.js"), /\[data-view="work"\]'\)\.hidden = !WORK_ENABLED/);
   assert.match(await source("time-ui.js"), /task\.source !== "work"/);
 });
