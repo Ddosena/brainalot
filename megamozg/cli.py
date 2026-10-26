@@ -124,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     work = commands.add_parser("work", help="Work-режим: снимок для агента и предложения из чатов")
     work_commands = work.add_subparsers(dest="work_command", required=True, parser_class=Parser)
+    from .work_edit import add_parser as add_work_edit_parser
+    add_work_edit_parser(work_commands, Parser)
     work_commands.add_parser("snapshot", help="Проекты и задачи Work-режима из последнего снимка браузера")
     propose = work_commands.add_parser("propose", help="Предложить задачи: JSON {\"proposals\": [...]} из файла или stdin")
     propose.add_argument("--file", type=Path, help="UTF-8 JSON файл, '-' для stdin")
@@ -155,6 +157,9 @@ def _chats_command(root: Path, args) -> dict:
     from . import features
     if not features.WORK_ENABLED:
         raise ValidationError(features.WORK_PAUSED_MESSAGE)
+    if args.command == 'work' and args.work_command == 'edit':
+        from .work_edit import run
+        return run(root, args)
     from . import telegram_chats
     from .chats import ChatStore
     from .work_inbox import WorkInbox
@@ -185,7 +190,8 @@ def _chats_command(root: Path, args) -> dict:
             return compact_status(snapshot)
         if args.plan_command == "command":
             command = json.loads(_read_input(None, args.file, "JSON команды Work planning"))
-            return compact_status(work.planning_operation(command))
+            from .work_period import PeriodPlanner
+            return compact_status(PeriodPlanner(work).day_command(command))
         if args.plan_command == "import":
             imported = json.loads(_read_input(None, args.file, "JSON planning seed"))
             planning = imported.get("planning", imported) if isinstance(imported, dict) else imported

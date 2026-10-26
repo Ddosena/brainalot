@@ -34,16 +34,11 @@ test('Day actions refresh the effective schedule before returning to its editor'
   assert.equal(f.raw.planning.raw, true);
 });
 
-test('late older reads cannot replace a newer Day projection', async () => {
-  const reads = [];
-  const f = fixture(() => new Promise(resolve => reads.push(resolve)));
-  const first = f.bridge.ready();
-  const second = f.bridge.remoteChanged();
-  reads[1]({revision: 3, planning: {title: 'Newest'}});
-  await second;
-  reads[0]({revision: 2, planning: {title: 'Old'}});
-  await first;
-  assert.equal(f.ctx().state.planning.title, 'Newest');
+test('concurrent Day reads coalesce rather than racing older projections', async () => {
+  const reads=[];const f=fixture(()=>new Promise(resolve=>reads.push(resolve)));
+  const first=f.bridge.ready(),second=f.bridge.remoteChanged();assert.equal(reads.length,1);
+  reads[0]({revision:3,planning:{title:'Newest'}});await Promise.all([first,second]);
+  assert.equal(f.ctx().state.planning.title,'Newest');f.bridge.destroy();
 });
 
 test('failed initial projection never exposes an editable raw schedule', async () => {
@@ -51,4 +46,17 @@ test('failed initial projection never exposes an editable raw schedule', async (
   await assert.rejects(f.bridge.ready(),/Unavailable/);
   assert.equal(f.ctx(), undefined);
   assert.equal(f.root.textContent, 'Unavailable');
+});
+
+
+test('Day live poll sees source fingerprint changes at an unchanged Work revision and stops on destroy',async()=>{
+  let poll,cleared=false,source='one',rawReads=0;const calls=[];
+  const bridge=createDayBridge({textContent:''},{state:{planning:{}},liveRefresh:true,async refreshWork(){rawReads++;}}, {
+    async api(){return {revision:4,fingerprint:source,planning:{title:source}};},
+    createConstructor(){return {render(){calls.push('render');},remoteChanged(){calls.push('remote');},destroy(){calls.push('destroy');}};},
+    setPoll(callback,interval){assert.equal(interval,750);poll=callback;return 77;},clearPoll(id){assert.equal(id,77);cleared=true;},
+  });
+  await bridge.ready();source='two';await poll();await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(calls.includes('remote'));const before=calls.length;await poll();await new Promise(resolve=>setImmediate(resolve));assert.equal(calls.length,before);assert.ok(rawReads>=2);
+  bridge.destroy();assert.equal(cleared,true);
 });

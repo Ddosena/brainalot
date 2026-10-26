@@ -1,6 +1,7 @@
 import {t,localeTag} from '../i18n.js';
 import {ui,uiMarkup} from './ui-text.js';
 import {periodRequest} from './transport.js';
+import {createAutosaveQueue} from './autosave.js';
 const DAY_MS = 86400000;
 let resolveReady,rejectReady;
 const firstModel=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject;});
@@ -77,7 +78,7 @@ export function deadlineLabel(kind) {
 }
 export const canMoveCalendarEvent = event=>event.calendar_role === 'flexible' && event.movable === true;
 export const calendarOfferLabel = cube=>cube.calendar_role === 'evergreen' ? t('Всегда актуально') : t('Возможное');
-export const cubeDurationLabel = cube=>cube.duration_unknown || cube.requires_estimate ? t('Длительность не указана') : minutesLabel(cube.minutes);
+export const cubeDurationLabel = cube=>cube.duration_unknown || cube.requires_estimate ? t('Длительность не указана') : `${cube.duration_provisional?'≈':''}${minutesLabel(cube.minutes)}`;
 export const shelfPriority = (cube,date)=>cube.kind === 'calendar_optional' ? (cube.calendar_role === 'evergreen' ? 1 : 0) : cube.planned_date === date ? 2 : 3;
 export const TIMELINE_PIXELS_PER_MINUTE=2;
 export function formatTimelineMinute(value) {const minute=((Math.round(value)%1440)+1440)%1440,day=Math.floor(value/1440);return `${String(Math.floor(minute/60)).padStart(2,'0')}:${String(minute%60).padStart(2,'0')}${day ? ` +${day}` : ''}`;}
@@ -218,8 +219,10 @@ export function editableNameMarkup(kind,item,location,openAction) {
 let commandSettled=Promise.resolve();
 let model, context, fingerprint = '', busy = false, contextPending = 0, contextSequence = 0, contextQueue = Promise.resolve(), lastContextConflictRevision = -1, fetchPending = false, refreshQueued=false, poll, lastTimelineFocus='';
 let hidePast = true, mergeMode = false, mergeIds = new Set(), drafts = new Map(), timelineGroupDate = null, timelineEntryId=null;
+let internalRender=false;
 let inlineEdit=null,inspectorPlacement=null,inspectorReturnAnchor=null,inspectorProvenance=false,currentDragCubeId=null,rulerEditor=null;
 const ownContextRevisions=new Map();
+const formAutosave=createAutosaveQueue({save:saveEditorSnapshot,onError:error=>notify(error.message,true)});
 let arrowPixelsPerDay=null,arrowViewportClientHeight=null;try{const stored=typeof window!=='undefined' ? Number(window.localStorage?.getItem('period-planner-arrow-scale')) : 0;if(stored>0 && stored<=48)arrowPixelsPerDay=stored;}catch{}
 let arrowDisplayMode='split',arrowSyncingScroll=false;try{if(window.localStorage?.getItem('period-planner-arrow-layout')==='overlay')arrowDisplayMode='overlay';}catch{}
 let resizeState = null, timelineGesture = null, nativeDragActive=false, gestureCommitPending=false, suppressTimelineClick=false,arrowPan=null;
@@ -247,11 +250,13 @@ function renderInspectorHosts(options={}) {
 function renderInlineNameEditor() {
   if(!inlineEdit)return '';
   const edit=inlineEdit,key=`inline-name:${edit.kind}:${edit.id}`,position=edit.position || {left:12,top:100,width:300};
-  return ui`<div class="inline-name-editor${edit.kind==='merge' ? ' is-merge' : ''}" role="group" aria-label="${edit.kind==='merge' ? t('Объединить кубики') : t('Название в этом плане')}" style="left:${position.left}px;top:${position.top}px;width:${position.width}px;">${edit.kind==='merge' ? ui`<span class="inline-merge-total">Объединить · ${minutesLabel(edit.minutes)}</span>` : ''}<input id="inline-name-input" data-inline-title="${edit.kind}" data-name-id="${attr(edit.id)}" data-draft="${attr(key)}" aria-label="Название в этом плане" value="${attr(edit.value)}"${edit.saving ? ' readonly' : ''}><button type="button" data-action="save-inline-name" aria-label="Сохранить название" title="Сохранить · Enter"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8 3 3 7-7"/></svg></button><button type="button" data-action="cancel-inline-name" aria-label="Отменить изменение названия" title="Отменить · Escape"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>`;
+  return ui`<div class="inline-name-editor${edit.kind==='merge' ? ' is-merge' : ''}" role="group" aria-label="${edit.kind==='merge' ? t('Объединить кубики') : t('Название в этом плане')}" style="left:${position.left}px;top:${position.top}px;width:${position.width}px;">${edit.kind==='merge' ? ui`<span class="inline-merge-total">Объединить · ${minutesLabel(edit.minutes)}</span>` : ''}<input id="inline-name-input" data-inline-title="${edit.kind}" data-name-id="${attr(edit.id)}" data-draft="${attr(key)}" aria-label="Название в этом плане" value="${attr(edit.value)}"${edit.saving ? ' readonly' : ''}>${edit.kind==='merge' ? `<button type="button" data-action="save-inline-name" aria-label="${t('Объединить')}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8 3 3 7-7"/></svg></button>` : ''}<button type="button" data-action="cancel-inline-name" aria-label="Отменить изменение названия" title="Отменить · Escape"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg></button></div>`;
 }
 function showInlineNameEditor(focus=false) {
+  const before=internalRender;internalRender=true;try{
   const host=document.getElementById('inline-name-editor-host');if(host)host.innerHTML=renderInlineNameEditor();else render();
   if(focus){const input=document.getElementById('inline-name-input');input?.focus({preventScroll:true});input?.select();}
+  }finally{internalRender=before;}
 }
 export function beginInlineRename(kind,id,location,rect={left:12,top:100,width:260,right:272,bottom:125}) {
   const object=namedObject(kind,id);if(!object)return null;
@@ -282,8 +287,8 @@ export function beginMergePrompt(targetId,draggedId,rect={left:12,top:150,width:
   const cubes=[targetId,draggedId].map(id=>namedObject('cube',id)),eligibility=cubes.every(Boolean) ? mergeEligibility(cubes) : {ok:false,reason:t('Кубик уже изменён.')};if(!eligibility.ok){notify(eligibility.reason,true);return null;}
   const edit=beginInlineRename('merge',targetId,'merge',rect);if(!edit)return null;edit.mergeIds=[targetId,draggedId];edit.snapshots=cubes.map(mergeSnapshot);edit.minutes=eligibility.minutes;edit.baseRevision=model.revision;edit.ready=contextQueue.then(()=>{});edit.position.top=Math.min(edit.position.top,(window.innerHeight || 768)-90);showInlineNameEditor(true);return edit;
 }
-export async function deleteCube(cubeId){const cube=namedObject('cube',cubeId);if(!cube)return null;const permission=cubeDeletePermission(cube);if(!permission.allowed){notify(permission.reason,true);return null;}if(inlineEdit?.id===cubeId)cancelInlineRename();const result=await command('cube_delete',{cube_id:cubeId});if(result && context.cube_id===cubeId)await updateContext({cube_id:null},{partialInspector:true});if(result)notify(t('Кубик удалён.'));return result;}
-export async function returnCubeToPool(cubeId,pool){const cube=namedObject('cube',cubeId);if(!cube)return null;const expected=cubePool(cube,model,context.date);if(pool!==expected){notify(ui`Верните кубик в «${expected==='task' ? t('По задачам дня') : t('Другие')}».`,true);return null;}if(!cube.selected_date)return model;return command('cube_return',{cube_id:cubeId});}
+export async function deleteCube(cubeId){await formAutosave.flush();const cube=namedObject('cube',cubeId);if(!cube)return null;const permission=cubeDeletePermission(cube);if(!permission.allowed){notify(permission.reason,true);return null;}if(inlineEdit?.id===cubeId)cancelInlineRename();const result=await command('cube_delete',{cube_id:cubeId});if(result && context.cube_id===cubeId)await updateContext({cube_id:null},{partialInspector:true});if(result)notify(t('Кубик удалён.'));return result;}
+export async function returnCubeToPool(cubeId,pool){await formAutosave.flush();const cube=namedObject('cube',cubeId);if(!cube)return null;const expected=cubePool(cube,model,context.date);if(pool!==expected){notify(ui`Верните кубик в «${expected==='task' ? t('По задачам дня') : t('Другие')}».`,true);return null;}if(!cube.selected_date)return model;return command('cube_return',{cube_id:cubeId});}
 function clearDragHints(){const root=document.getElementById('planner');for(const target of root.querySelectorAll('.is-merge-target,.is-return-target,.is-invalid-drop'))target.classList.remove('is-merge-target','is-return-target','is-invalid-drop');}
 function dragHints(hit,cubeId){clearDragHints();const cube=namedObject('cube',cubeId);if(!cube || !hit)return;const pool=hit.closest('[data-drop-pool]');if(pool)pool.classList.add(pool.dataset.dropPool===cubePool(cube,model,context.date) ? 'is-return-target' : 'is-invalid-drop');const target=hit.closest('.cube,.timeline-block[data-timeline-kind="cube"]'),targetId=target?.dataset.cubeId || target?.dataset.timelineId;if(targetId && targetId!==cubeId && mergeEligibility([namedObject('cube',targetId),cube].filter(Boolean)).ok)target.classList.add('is-merge-target');}
 function notify(message, error = false) {
@@ -296,10 +301,10 @@ function acceptModel(value, force = false) {
   const next = normalizeModel(value);
   if(!force && model && next.revision<model.revision)return;
   const nextContext = contextFor(next);
-  const nextFingerprint = `${next.revision}|${JSON.stringify(nextContext)}`;
+  const nextFingerprint = `${next.revision}|${next.source_fingerprint||''}|${JSON.stringify(nextContext)}`;
   if (!force && nextFingerprint === fingerprint) { setSync(ui`Сохранено · версия ${next.revision}`); return; }
   model = next; context = nextContext; fingerprint = nextFingerprint;
-  if(inlineEdit && !inlineEdit.saving && namedObject(inlineEdit.kind,inlineEdit.id)?.title!==inlineEdit.original)inlineEdit.conflicted=true;
+  if(inlineEdit && !inlineEdit.saving && namedObject(inlineEdit.kind,inlineEdit.id)?.title!==inlineEdit.original){const latest=namedObject(inlineEdit.kind,inlineEdit.id);if(latest&&inlineEdit.kind!=='merge'&&inlineEdit.value===inlineEdit.original){inlineEdit.original=latest.title;inlineEdit.value=latest.title;inlineEdit.baseRevision=model.revision;inlineEdit.conflicted=false;drafts.delete(`inline-name:${inlineEdit.kind}:${inlineEdit.id}`);}else inlineEdit.conflicted=true;}
   mergeIds = new Set([...mergeIds].filter(id => model.cubes.some(cube => cube.id === id && cube.available !== false)));
   render(); setSync(ui`Сохранено · версия ${model.revision}`);
   if(!modelAnnounced){modelAnnounced=true;for(const callback of readyListeners)callback();}
@@ -313,6 +318,7 @@ export async function refresh(force=false) {
 }
 export async function command(action, data, options={}) {
   const intentRevision = options.expectedRevision ?? model?.revision;
+  if(!options.autosave)await formAutosave.flush();
   // Choosing a screen is persisted too. Its own revision must settle before a work edit.
   await contextQueue;
   if (intentRevision < lastContextConflictRevision) {notify(t('Пока выбирался экран, план изменился в другом окне или агентом. Мы перечитали его; проверьте данные и повторите действие.'),true);return null;}
@@ -365,7 +371,7 @@ export async function updateContext(patch,viewOptions={}) {
       if(!response.ok)throw new Error(saved.error || t('Не удалось сохранить выбранный экран.'));
       if (Number.isInteger(saved.revision)) model.revision = saved.revision;
       if(Number.isInteger(saved.revision)){ownContextRevisions.set(beforeRevision,saved.revision);if(ownContextRevisions.size>200)ownContextRevisions.delete(ownContextRevisions.keys().next().value);}
-      if (sequence === contextSequence) { context = {...context,...(saved.context || {})}; model.context = {...context}; fingerprint = `${model.revision}|${JSON.stringify(context)}`; }
+      if (sequence === contextSequence) { context = {...context,...(saved.context || {})}; model.context = {...context}; fingerprint = `${model.revision}|${model.source_fingerprint||''}|${JSON.stringify(context)}`; }
     } catch (error) { notify(error.message,true); }
     finally { contextPending--; }
   });
@@ -421,12 +427,12 @@ function renderTaskEditor() {
   const unscheduled = model.tasks.filter(item => !item.start && item.owned !== false && model.projects.find(project => project.id === item.project_id)?.visible !== false);
   if (historical) return ui`<section class="task-editor inline-editor" aria-label="Сведения о задаче"><div class="editor-heading"><div><span class="type-label">${historical.owned===false ? t('Справочная задача') : historical.read_only ? t('Задание курса') : t('Задача из истории')} · ${escapeHtml(projectName(model,historical.project_id))}</span><h3>${escapeHtml(historical.title)}</h3></div><button class="text-button" data-action="close-task">Закрыть</button></div><p class="editor-note">${escapeHtml(historical.read_only ? sourceStateLabel(historical) : historical.status_label || taskTimelineState(historical,model.today).label)}${historical.date ? ` · ${shortDate(historical.date)}` : ''}${historical.deadline ? ` · ${deadlineLabel(historical.deadline_kind).toLowerCase()} ${shortDate(historical.deadline)}` : ''}</p><p class="editor-note">${historical.owned===false ? t('Справочный объём не входит в вашу работу и полку кубиков.') : historical.read_only ? t('Даты и состав задания приведены по источнику.') : t('Историческая запись сохраняет сведения из источника. Планирование доступно для текущих задач.')}</p></section>`;
   if (!task) return unscheduled.length ? ui`<details class="without-period"><summary>Задачи без периода · ${unscheduled.length}</summary><div>${unscheduled.map(item => `<button data-action="open-task" data-task-id="${attr(item.id)}">${escapeHtml(item.title)}</button>`).join('')}</div></details>` : '';
-  return ui`<section class="task-editor inline-editor" aria-label="Редактор периода задачи"><div class="editor-heading"><div><span class="type-label">Задача · ${escapeHtml(projectName(model,task.project_id))}</span><h3>${editableNameMarkup('task',task,'task-inspector',null)}</h3></div><button class="text-button" data-action="close-task">Закрыть</button></div><form data-form="period" data-task-id="${attr(task.id)}" class="period-form"><label>Начало периода<input type="date" name="start" value="${attr(task.start || context.date)}" data-draft="period-start-${attr(task.id)}" required></label><label>Конец периода<input type="date" name="end" value="${attr(task.end || context.date)}" data-draft="period-end-${attr(task.id)}" required></label><button class="primary" type="submit">Сохранить период</button>${task.period_explicit ? ui`<button type="button" data-action="clear-period" data-task-id="${attr(task.id)}">Вернуть исходный период</button>` : ''}</form><p class="editor-note">Период определяет дни для выбора кубиков. Объём ${minutesLabel(task.minutes)}${task.deadline ? ui` и ${deadlineLabel(task.deadline_kind).toLowerCase()} ${shortDate(task.deadline)}` : ''} сохраняются.${Number(task.cancelled_minutes) ? ui` Отдельно отменено ${minutesLabel(task.cancelled_minutes)}; осталось в работе ${minutesLabel(task.effective_remaining_minutes)}.` : ''}</p></section>`;
+  return ui`<section class="task-editor inline-editor" aria-label="Редактор периода задачи"><div class="editor-heading"><div><span class="type-label">Задача · ${escapeHtml(projectName(model,task.project_id))}</span><h3>${editableNameMarkup('task',task,'task-inspector',null)}</h3></div><button class="text-button" data-action="close-task">Закрыть</button></div><form data-form="period" data-task-id="${attr(task.id)}" class="period-form"><label>Начало периода<input type="date" name="start" value="${attr(task.start || context.date)}" data-draft="period-start-${attr(task.id)}" required></label><label>Конец периода<input type="date" name="end" value="${attr(task.end || context.date)}" data-draft="period-end-${attr(task.id)}" required></label>${task.period_explicit ? ui`<button type="button" data-action="clear-period" data-task-id="${attr(task.id)}">Вернуть исходный период</button>` : ''}</form><p class="editor-note">Период определяет дни для выбора кубиков. Объём ${minutesLabel(task.minutes)}${task.deadline ? ui` и ${deadlineLabel(task.deadline_kind).toLowerCase()} ${shortDate(task.deadline)}` : ''} сохраняются.${Number(task.cancelled_minutes) ? ui` Отдельно отменено ${minutesLabel(task.cancelled_minutes)}; осталось в работе ${minutesLabel(task.effective_remaining_minutes)}.` : ''}</p></section>`;
 }
 function mergeDropGlyph(cube){return ui`<button type="button" class="merge-drop-glyph" data-merge-target="${attr(cube.id)}" aria-label="Объединить с этим кубиком" title="Объединить"><svg viewBox="0 0 18 18" aria-hidden="true"><path d="M2 4h4l5 5h5M2 14h4l5-5M13 6l3 3-3 3"/></svg></button>`;}
 function cubeMarkup(cube,state){
-  const optional=cube.kind==='calendar_optional',parents=cubeParents(cube),count=new Set(parents.map(part=>part.task_id)).size,draggable=!Number(cube.progress_percent) && !Number(cube.actual_minutes),label=optional ? calendarOfferLabel(cube) : count>1 ? ui`${count} задачи` : projectName(model,cube.project_id);
-  return `<article class="cube${optional ? ` calendar-role-${cube.calendar_role}` : ''}${context.cube_id===cube.id ? ' is-active' : ''}" data-cube-id="${attr(cube.id)}" data-cube-state="${state}"${optional ? ` data-calendar-role="${attr(cube.calendar_role)}"` : ''} draggable="${draggable}" style="--project:${projectColor(model,cube.project_id)}"><div class="cube-top"><span class="project-dot"></span><span>${escapeHtml(label)}</span></div>${editableNameMarkup('cube',cube,state==='selected' ? 'selected' : 'shelf')}<div class="cube-meta"><span>${cubeDurationLabel(cube)}</span>${state==='elsewhere' ? `<span>${compactDate(cube.selected_date)}${cube.start ? ` · ${cube.start}` : ''}</span>` : ''}</div>${['suggestion','elsewhere'].includes(state) ? `<div class="cube-actions"><button class="primary small" data-action="select-cube" data-cube-id="${attr(cube.id)}">${cube.requires_estimate || cube.duration_unknown ? t('Длительность') : state==='elsewhere' ? t('Перенести') : t('Выбрать')}</button></div>` : ''}${mergeDropGlyph(cube)}</article>`;
+  const optional=cube.kind==='calendar_optional',parents=cubeParents(cube),count=new Set(parents.map(part=>part.task_id)).size,draggable=!Number(cube.progress_percent) && !Number(cube.actual_minutes),label=optional ? calendarOfferLabel(cube) : cube.kind==='brainalot'?'Brainalot':count>1 ? ui`${count} задачи` : projectName(model,cube.project_id);
+  return `<article class="cube${optional ? ` calendar-role-${cube.calendar_role}` : ''}${context.cube_id===cube.id ? ' is-active' : ''}" data-cube-id="${attr(cube.id)}" data-cube-state="${state}"${optional ? ` data-calendar-role="${attr(cube.calendar_role)}"` : ''} draggable="${draggable}" style="--project:${projectColor(model,cube.project_id)}"><div class="cube-top"><span class="project-dot"></span><span>${escapeHtml(label)}</span></div>${editableNameMarkup('cube',cube,state==='selected' ? 'selected' : 'shelf')}<div class="cube-meta"><span>${cubeDurationLabel(cube)}</span>${state==='elsewhere' ? `<span>${compactDate(cube.selected_date)}${cube.start ? ` · ${cube.start}` : ''}</span>` : ''}</div>${['suggestion','elsewhere'].includes(state) ? `<div class="cube-actions"><button class="primary small" data-action="select-cube" data-cube-id="${attr(cube.id)}">${state==='elsewhere' ? t('Перенести') : t('Выбрать')}</button></div>` : ''}${mergeDropGlyph(cube)}</article>`;
 }
 function renderMerge() {
   const selected = model.cubes.filter(cube => mergeIds.has(cube.id));
@@ -451,14 +457,15 @@ function renderCubeEditor() {
   const cube = model.cubes.find(item => item.id === context.cube_id);
   if (!cube) return '';
   const optional = cube.kind === 'calendar_optional', sourceDay = cube.source_date || cube.planned_date;
-  const estimate = optional && !cube.selected_date ? ui`<label>Длительность, мин<input type="number" name="minutes" min="1" max="1440" step="1" value="${cube.requires_estimate || cube.duration_unknown ? '' : attr(cube.minutes)}" data-draft="cube-estimate-${attr(cube.id)}" required></label>` : '';
-  return ui`<section class="cube-editor inline-editor${optional ? ` calendar-role-${cube.calendar_role}` : ''}" id="cube-editor" style="${inspectorStyle()}" aria-label="Настройки кубика"><div class="editor-heading"><div><span class="type-label">${optional ? escapeHtml(calendarOfferLabel(cube)) : cube.source_task_allocations?.length>1 ? ui`Кубик · ${new Set(cube.source_task_allocations.map(part=>part.task_id)).size} задачи` : ui`Кубик · ${escapeHtml(taskName(model,cube.task_id))}`}</span><h3 data-inspector-heading tabindex="-1">${editableNameMarkup('cube',cube,'inspector',null)}</h3></div><button class="text-button" data-action="close-cube">Закрыть</button></div><p class="editor-note">${cubeDurationLabel(cube)} · ${Number(cube.progress_percent) || 0}% готово${Number(cube.actual_minutes) ? ui` · факт ${minutesLabel(cube.actual_minutes)}` : ''}${optional && sourceDay ? ui` · предложено ${shortDate(sourceDay)}` : ''}</p>${optional && (cube.requires_estimate || cube.duration_unknown) ? uiMarkup('<p class="editor-note">Укажите длительность.</p>') : ''}<form data-form="cube-placement" data-cube-id="${attr(cube.id)}" class="period-form"><label>Выбранный день<input type="date" name="date" value="${attr(cube.selected_date || context.date)}"${optional && cube.calendar_role === 'optional_day' && sourceDay ? ` min="${sourceDay}" max="${sourceDay}"` : ''} data-draft="cube-date-${attr(cube.id)}" required></label><label>Начало<input type="time" name="start" value="${attr(cube.start || '')}" step="900" data-draft="cube-time-${attr(cube.id)}"></label>${estimate}<button class="primary" type="submit">${cube.selected_date ? t('Сохранить день и время') : t('Выбрать день и время')}</button>${cube.selected_date ? ui`<button type="button" data-action="return-cube" data-cube-id="${attr(cube.id)}">Вернуть на полку</button>` : ''}</form>${cube.source_task_allocations?.length ? ui`<details class="inspector-provenance"><summary>Связанные задачи · ${new Set(cube.source_task_allocations.map(part=>part.task_id)).size}</summary><ul>${cube.source_task_allocations.map(part=>`<li>${escapeHtml(taskName(model,part.task_id))} · ${minutesLabel(part.minutes)}</li>`).join('')}</ul></details>` : ''}${cube.source_title ? ui`<details class="inspector-provenance"><summary>Источник</summary><p>${escapeHtml(cube.source_title)}</p></details>` : ''}${cube.output ? ui`<p class="editor-note">Результат: ${escapeHtml(cube.output)}</p>` : ''}${cube.steps?.length ? ui`<details class="cube-steps"><summary>Шаги работы</summary><ol>${cube.steps.map(step => `<li>${escapeHtml(typeof step === 'string' ? step : step.title || step.text || '')}</li>`).join('')}</ol></details>` : ''}</section>`;
+  const durationEditable=cubeResizePermission(cube).allowed || optional && cube.source_duration_minutes==null;
+  const estimate=durationEditable ? ui`<label>Длительность, мин<input type="number" name="minutes" min="1" max="1440" step="1" value="${attr(cube.minutes || 30)}" data-draft="cube-estimate-${attr(cube.id)}" required></label>` : '';
+  return ui`<section class="cube-editor inline-editor${optional ? ` calendar-role-${cube.calendar_role}` : ''}" id="cube-editor" style="${inspectorStyle()}" aria-label="Настройки кубика"><div class="editor-heading"><div><span class="type-label">${optional ? escapeHtml(calendarOfferLabel(cube)) : cube.source_task_allocations?.length>1 ? ui`Кубик · ${new Set(cube.source_task_allocations.map(part=>part.task_id)).size} задачи` : ui`Кубик · ${escapeHtml(taskName(model,cube.task_id))}`}</span><h3 data-inspector-heading tabindex="-1">${editableNameMarkup('cube',cube,'inspector',null)}</h3></div><button class="text-button" data-action="close-cube">Закрыть</button></div><p class="editor-note">${cubeDurationLabel(cube)} · ${Number(cube.progress_percent) || 0}% готово${Number(cube.actual_minutes) ? ui` · факт ${minutesLabel(cube.actual_minutes)}` : ''}${optional && sourceDay ? ui` · предложено ${shortDate(sourceDay)}` : ''}</p><form data-form="cube-placement" data-cube-id="${attr(cube.id)}" class="period-form"><label>Выбранный день<input type="date" name="date" value="${attr(cube.selected_date || context.date)}"${optional && cube.calendar_role === 'optional_day' && sourceDay ? ` min="${sourceDay}" max="${sourceDay}"` : ''} data-draft="cube-date-${attr(cube.id)}" required></label><label>Начало<input type="time" name="start" value="${attr(cube.start || '')}" step="60" data-draft="cube-time-${attr(cube.id)}"></label>${estimate}${cube.selected_date ? ui`<button type="button" data-action="return-cube" data-cube-id="${attr(cube.id)}">Вернуть на полку</button>` : ''}</form>${cube.source_task_allocations?.length ? ui`<details class="inspector-provenance"><summary>Связанные задачи · ${new Set(cube.source_task_allocations.map(part=>part.task_id)).size}</summary><ul>${cube.source_task_allocations.map(part=>`<li>${escapeHtml(taskName(model,part.task_id))} · ${minutesLabel(part.minutes)}</li>`).join('')}</ul></details>` : ''}${cube.source_title ? ui`<details class="inspector-provenance"><summary>Источник</summary><p>${escapeHtml(cube.source_title)}</p></details>` : ''}${cube.output ? ui`<p class="editor-note">Результат: ${escapeHtml(cube.output)}</p>` : ''}${cube.steps?.length ? ui`<details class="cube-steps"><summary>Шаги работы</summary><ol>${cube.steps.map(step => `<li>${escapeHtml(typeof step === 'string' ? step : step.title || step.text || '')}</li>`).join('')}</ol></details>` : ''}</section>`;
 }
 function renderCalendarEventEditor() {
   const event = model.events.find(item=>item.id === context.calendar_event_id);
   if (!event) return '';
   const movable = canMoveCalendarEvent(event), duration = event.duration_minutes ?? Math.max(0,timeMinutes(event.end)-timeMinutes(event.start));
-  return ui`<section class="calendar-event-editor inline-editor calendar-role-${event.calendar_role || 'fixed'}" id="calendar-event-editor" style="${inspectorStyle()}" data-testid="calendar-event-editor" aria-label="Содержимое события"><div class="editor-heading"><div><span class="type-label">Событие</span><h3 data-inspector-heading tabindex="-1">${editableNameMarkup('event',event,'inspector',null)}</h3></div><button class="text-button" data-action="close-calendar-event">Закрыть</button></div><p class="editor-note">${shortDate(event.date)} · ${escapeHtml(compactEventTimeLabel(event))}${event.conflict ? ' ?' : ''}${duration ? ` · ${minutesLabel(duration)}` : ''}</p>${movable ? ui`<form data-form="calendar-event-move" data-event-id="${attr(event.id)}" class="period-form"><label>День<input type="date" name="date" value="${event.date}" data-draft="event-date-${attr(event.id)}" required></label><label>Начало<input type="time" name="start" value="${attr(event.start)}" step="60" data-draft="event-start-${attr(event.id)}" required></label><button class="primary" type="submit">Перенести</button></form>` : ''}<details class="inspector-provenance"${inspectorProvenance ? ' open' : ''}><summary>Источник</summary><p>${escapeHtml(event.source_title || event.title)}</p><p>${escapeHtml(eventTimeDetails(event))}</p><p>${shortDate(event.source_date || event.date)} · ${escapeHtml(event.source_start || event.start || '')}</p>${event.move_block_reason ? `<p>${escapeHtml(event.move_block_reason)}</p>` : ''}</details></section>`;
+  return ui`<section class="calendar-event-editor inline-editor calendar-role-${event.calendar_role || 'fixed'}" id="calendar-event-editor" style="${inspectorStyle()}" data-testid="calendar-event-editor" aria-label="Содержимое события"><div class="editor-heading"><div><span class="type-label">Событие</span><h3 data-inspector-heading tabindex="-1">${editableNameMarkup('event',event,'inspector',null)}</h3></div><button class="text-button" data-action="close-calendar-event">Закрыть</button></div><p class="editor-note">${shortDate(event.date)} · ${escapeHtml(compactEventTimeLabel(event))}${event.conflict ? ' ?' : ''}${duration ? ` · ${minutesLabel(duration)}` : ''}</p>${movable ? ui`<form data-form="calendar-event-move" data-event-id="${attr(event.id)}" class="period-form"><label>День<input type="date" name="date" value="${event.date}" data-draft="event-date-${attr(event.id)}" required></label><label>Начало<input type="time" name="start" value="${attr(event.start)}" step="60" data-draft="event-start-${attr(event.id)}" required></label></form>` : ''}<details class="inspector-provenance"${inspectorProvenance ? ' open' : ''}><summary>Источник</summary><p>${escapeHtml(event.source_title || event.title)}</p><p>${escapeHtml(eventTimeDetails(event))}</p><p>${shortDate(event.source_date || event.date)} · ${escapeHtml(event.source_start || event.start || '')}</p>${event.move_block_reason ? `<p>${escapeHtml(event.move_block_reason)}</p>` : ''}</details></section>`;
 }
 function renderSelectedDayDetails(events) {
   const tasks = model.tasks.filter(task=>task.owned !== false && model.projects.find(project=>project.id === task.project_id)?.visible !== false && task.start && task.end && task.start <= context.date && task.end >= context.date);
@@ -510,7 +517,7 @@ export function openRulerEditor(rulerId,create=false,anchor){const project=model
 export function closeRulerEditor(){if(rulerEditor)clearDraftPrefix(`ruler:${rulerEditor.id}:`);rulerEditor=null;render();}
 function renderRulerEditor(){
   if(!rulerEditor)return '';const editor=rulerEditor,project=model.projects.find(item=>item.id===editor.id),custom=editor.create || project?.kind==='goal',entries=project?.timeline_entries || [],entry=entries.find(item=>item.id===editor.entryId),entryDraft=editor.newEntry ? {id:editor.entryId,title:'',date:null,event_kind:'milestone',full_completion:null,visible:true} : entry,key=`ruler:${editor.id}:`,box=editor.box,style=box ? `left:${box.left}px;top:${box.top}px;width:${box.width}px;max-height:${box.maxHeight}px;right:auto;bottom:auto;` : '';
-  return ui`<section class="ruler-manager inline-editor" id="ruler-manager" style="${style}" aria-label="Редактор целей и линеек"><header class="editor-heading"><h3>${editor.create ? t('Новая цель') : t('Линейка')}</h3><button class="text-button" data-action="ruler-close">Закрыть</button></header>${!editor.create ? ui`<label class="manager-select-label">Проект<select data-action="ruler-select">${model.projects.map(item=>`<option value="${attr(item.id)}"${item.id===editor.id ? ' selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></label>` : ''}<form data-form="ruler-save" class="ruler-form"><label>Название<input name="title" value="${attr(project?.title || '')}" data-draft="${attr(key)}title" required></label>${custom ? ui`<div class="manager-dates"><label>Начало<input type="date" name="start" value="${attr(project?.start || '')}" data-draft="${attr(key)}start"></label><label>Срок<input type="date" name="end" value="${attr(project?.end || '')}" data-draft="${attr(key)}end"></label></div>` : ''}<details class="manager-description"><summary>Описание</summary><textarea name="description" rows="2" data-draft="${attr(key)}description">${escapeHtml(project?.description || '')}</textarea></details>${!editor.create ? ui`<label class="manager-visible"><input type="checkbox" name="visible"${project?.visible!==false ? ' checked' : ''} data-draft="${attr(key)}visible">Показывать</label>` : ''}<button type="submit" class="primary">${editor.create ? t('Создать') : t('Сохранить')}</button></form>${!editor.create ? ui`<div class="ruler-entry-heading"><h3>Отметки</h3><button data-action="ruler-entry-new" aria-label="Добавить отметку"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10M8 3v10"/></svg></button></div><ul class="ruler-entry-list">${entries.map(item=>ui`<li${item.visible===false ? ' class="is-hidden"' : ''}><button data-action="ruler-entry-edit" data-entry-id="${attr(item.id)}"><time>${item.date ? compactDate(item.date) : '—'}</time><span>${escapeHtml(item.title || item.label || t('Отметка'))}</span></button><button class="manager-icon" data-action="ruler-entry-visible" data-entry-id="${attr(item.id)}" data-visible="${item.visible===false}" aria-label="${item.visible===false ? t('Показать') : t('Скрыть')} отметку" title="${item.visible===false ? t('Показать') : t('Скрыть')}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5Z"/><circle cx="8" cy="8" r="2"/></svg></button><button class="manager-icon" data-action="ruler-entry-delete" data-entry-id="${attr(item.id)}" aria-label="Удалить отметку" title="Удалить"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M6 4V2h4v2M4 4l1 10h6l1-10"/></svg></button></li>`).join('')}</ul>${entryDraft ? ui`<form data-form="ruler-entry-save" class="ruler-form ruler-entry-form" id="ruler-entry-form"><label>Название отметки<input name="title" value="${attr(entryDraft.title || entryDraft.label || '')}" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:title" required></label><div class="manager-dates"><label>Дата<input type="date" name="date" value="${attr(entryDraft.date || '')}" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:date"></label><label>Тип<select name="event_kind" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:kind"><option value="milestone"${entryDraft.event_kind==='milestone' ? ' selected' : ''}>Отметка</option><option value="start"${entryDraft.event_kind==='start' ? ' selected' : ''}>Начало</option><option value="deadline"${entryDraft.event_kind==='deadline' ? ' selected' : ''}>Дедлайн</option></select></label><label>Готовность<select name="full_completion" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:done"><option value="unknown"${entryDraft.full_completion==null ? ' selected' : ''}>Неизвестно</option><option value="false"${entryDraft.full_completion===false ? ' selected' : ''}>Не готово</option><option value="true"${entryDraft.full_completion===true ? ' selected' : ''}>Готово</option></select></label></div><label class="manager-visible"><input name="visible" type="checkbox"${entryDraft.visible!==false ? ' checked' : ''} data-draft="${attr(key)}entry:${attr(entryDraft.id)}:visible">Показывать</label><button type="submit" class="primary">Сохранить отметку</button>${entryDraft.source_date || entryDraft.source_title ? ui`<details class="inspector-provenance"><summary>Источник</summary><p>${escapeHtml(entryDraft.source_title || '')}</p><p>${shortDate(entryDraft.source_date)}</p></details>` : ''}</form>` : ''}<button class="text-button ruler-delete" data-action="ruler-delete">${custom ? t('Удалить цель') : t('Скрыть линейку')}</button>` : ''}</section>`;
+  return ui`<section class="ruler-manager inline-editor" id="ruler-manager" style="${style}" aria-label="Редактор целей и линеек"><header class="editor-heading"><h3>${editor.create ? t('Новая цель') : t('Линейка')}</h3><button class="text-button" data-action="ruler-close">Закрыть</button></header>${!editor.create ? ui`<label class="manager-select-label">Проект<select data-action="ruler-select">${model.projects.map(item=>`<option value="${attr(item.id)}"${item.id===editor.id ? ' selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></label>` : ''}<form data-form="ruler-save" class="ruler-form"><label>Название<input name="title" value="${attr(project?.title || '')}" data-draft="${attr(key)}title" required></label>${custom ? ui`<div class="manager-dates"><label>Начало<input type="date" name="start" value="${attr(project?.start || '')}" data-draft="${attr(key)}start"></label><label>Срок<input type="date" name="end" value="${attr(project?.end || '')}" data-draft="${attr(key)}end"></label></div>` : ''}<details class="manager-description"><summary>Описание</summary><textarea name="description" rows="2" data-draft="${attr(key)}description">${escapeHtml(project?.description || '')}</textarea></details>${!editor.create ? ui`<label class="manager-visible"><input type="checkbox" name="visible"${project?.visible!==false ? ' checked' : ''} data-draft="${attr(key)}visible">Показывать</label>` : ''}${editor.create ? `<button type="submit" class="primary">${t('Создать')}</button>` : ''}</form>${!editor.create ? ui`<div class="ruler-entry-heading"><h3>Отметки</h3><button data-action="ruler-entry-new" aria-label="Добавить отметку"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10M8 3v10"/></svg></button></div><ul class="ruler-entry-list">${entries.map(item=>ui`<li${item.visible===false ? ' class="is-hidden"' : ''}><button data-action="ruler-entry-edit" data-entry-id="${attr(item.id)}"><time>${item.date ? compactDate(item.date) : '—'}</time><span>${escapeHtml(item.title || item.label || t('Отметка'))}</span></button><button class="manager-icon" data-action="ruler-entry-visible" data-entry-id="${attr(item.id)}" data-visible="${item.visible===false}" aria-label="${item.visible===false ? t('Показать') : t('Скрыть')} отметку" title="${item.visible===false ? t('Показать') : t('Скрыть')}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 8s3-5 7-5 7 5 7 5-3 5-7 5-7-5-7-5Z"/><circle cx="8" cy="8" r="2"/></svg></button><button class="manager-icon" data-action="ruler-entry-delete" data-entry-id="${attr(item.id)}" aria-label="Удалить отметку" title="Удалить"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M6 4V2h4v2M4 4l1 10h6l1-10"/></svg></button></li>`).join('')}</ul>${entryDraft ? ui`<form data-form="ruler-entry-save" class="ruler-form ruler-entry-form" id="ruler-entry-form"><label>Название отметки<input name="title" value="${attr(entryDraft.title || entryDraft.label || '')}" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:title" required></label><div class="manager-dates"><label>Дата<input type="date" name="date" value="${attr(entryDraft.date || '')}" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:date"></label><label>Тип<select name="event_kind" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:kind"><option value="milestone"${entryDraft.event_kind==='milestone' ? ' selected' : ''}>Отметка</option><option value="start"${entryDraft.event_kind==='start' ? ' selected' : ''}>Начало</option><option value="deadline"${entryDraft.event_kind==='deadline' ? ' selected' : ''}>Дедлайн</option></select></label><label>Готовность<select name="full_completion" data-draft="${attr(key)}entry:${attr(entryDraft.id)}:done"><option value="unknown"${entryDraft.full_completion==null ? ' selected' : ''}>Неизвестно</option><option value="false"${entryDraft.full_completion===false ? ' selected' : ''}>Не готово</option><option value="true"${entryDraft.full_completion===true ? ' selected' : ''}>Готово</option></select></label></div><label class="manager-visible"><input name="visible" type="checkbox"${entryDraft.visible!==false ? ' checked' : ''} data-draft="${attr(key)}entry:${attr(entryDraft.id)}:visible">Показывать</label>${editor.newEntry ? `<button type="submit" class="primary">${t('Создать отметку')}</button>` : ''}${entryDraft.source_date || entryDraft.source_title ? ui`<details class="inspector-provenance"><summary>Источник</summary><p>${escapeHtml(entryDraft.source_title || '')}</p><p>${shortDate(entryDraft.source_date)}</p></details>` : ''}</form>` : ''}<button class="text-button ruler-delete" data-action="ruler-delete">${custom ? t('Удалить цель') : t('Скрыть линейку')}</button>` : ''}</section>`;
 }
 export async function saveRuler(data){if(!rulerEditor)return null;const editor=rulerEditor,project=model.projects.find(item=>item.id===editor.id),custom=editor.create || project?.kind==='goal',payload={ruler_id:editor.id,title:String(data.title || '').trim(),description:String(data.description ?? project?.description ?? ''),...(custom ? {start:Object.hasOwn(data,'start') ? data.start || null : project?.start || null,end:Object.hasOwn(data,'end') ? data.end || null : project?.end || null} : {}),...(!editor.create ? {visible:data.visible===undefined ? project?.visible!==false : Boolean(data.visible)} : {})};const result=await command(editor.create ? 'ruler_create' : 'ruler_update',payload,{expectedRevision:editor.baseRevision});if(result){for(const field of ['title','description','start','end','visible'])drafts.delete(`ruler:${editor.id}:${field}`);editor.create=false;editor.baseRevision=model.revision;render();}return result;}
 export async function saveRulerEntry(data){if(!rulerEditor?.entryId)return null;const editor=rulerEditor,payload={ruler_id:editor.id,entry_id:editor.entryId,title:String(data.title || '').trim(),date:data.date || null,event_kind:data.event_kind || 'milestone',full_completion:data.full_completion===true || data.full_completion==='true' ? true : data.full_completion===false || data.full_completion==='false' ? false : null,visible:Boolean(data.visible)};const result=await command('ruler_entry_upsert',payload,{expectedRevision:editor.baseRevision});if(result){clearDraftPrefix(`ruler:${editor.id}:entry:${editor.entryId}:`);editor.entryId=null;editor.newEntry=false;editor.baseRevision=model.revision;render();}return result;}
@@ -554,7 +561,7 @@ function syncArrowScroll(event) {const source=event.target;if(!source.matches?.(
 function showArrowTooltip(event) {const marker=event.target.closest('[data-time-entry-id]'),host=document.getElementById('arrow-tooltip-host');if(!marker || !host)return;const ids=new Set((marker.dataset.timeEntryIds || marker.dataset.timeEntryId).split(' ')),rows=projectArrowModel(model).groups.flatMap(group=>group.items).filter(row=>ids.has(row.entryId)),rect=marker.getBoundingClientRect(),width=Math.min(260,(window.innerWidth || 1024)-24),left=rect.right+width+22<(window.innerWidth || 1024) ? rect.right+10 : Math.max(12,rect.left-width-10),top=Math.max(12,Math.min(rect.top,(window.innerHeight || 768)-330));host.innerHTML=`<div class="arrow-tooltip-portal" role="tooltip" style="left:${left}px;top:${top}px;width:${width}px;">${rows.map(axisTaskTooltip).join('<hr>')}</div>`;}
 function hideArrowTooltip() {const host=document.getElementById('arrow-tooltip-host');if(host)host.innerHTML='';}
 function render() {
-  const node = document.getElementById('planner');
+  const node = document.getElementById('planner');const before=internalRender;internalRender=true;try{
   const oldArrowViewport=node.querySelectorAll('[data-arrow-viewport]')[0],arrowScrollMemory=oldArrowViewport ? {top:oldArrowViewport.scrollTop,left:oldArrowViewport.scrollLeft} : null;
   const focused = document.activeElement;
   const focusDraft = focused?.dataset.draft;
@@ -573,6 +580,7 @@ function render() {
   if(focusKey!==lastTimelineFocus && timelineScroll){const block=[...node.querySelectorAll('[data-timeline-id]')].find(item=>item.dataset.timelineId===context.cube_id);if(block)timelineScroll.scrollTop=Math.max(0,block.offsetTop-timelineScroll.clientHeight/3);lastTimelineFocus=focusKey;}
   [...node.querySelectorAll('[data-arrow-panel]')].forEach(settleArrowLabels);
   node.setAttribute('aria-busy',String(busy));
+  }finally{internalRender=before;}
 }
 function clearDraftPrefix(prefix) { for (const key of drafts.keys()) if (key.startsWith(prefix)) drafts.delete(key); }
 async function onClick(event) {
@@ -583,7 +591,7 @@ async function onClick(event) {
   const action = target.dataset.action;
   if(action==='ruler-create'){openRulerEditor(null,true,target);return;}
   if(action==='ruler-edit'){openRulerEditor(target.dataset.rulerId,false,target);return;}
-  if(action==='ruler-close'){closeRulerEditor();return;}
+  if(action==='ruler-close'){if(!rulerEditor?.create&&!rulerEditor?.newEntry)await formAutosave.flush();closeRulerEditor();return;}
   if(action==='ruler-delete'){await rulerAction('ruler_delete');return;}
   if(action==='ruler-entry-new' || action==='ruler-entry-edit'){if(!rulerEditor)return;rulerEditor.newEntry=action==='ruler-entry-new';rulerEditor.entryId=rulerEditor.newEntry ? `${rulerEditor.id}:entry:${crypto.randomUUID()}` : target.dataset.entryId;render();document.getElementById('ruler-entry-form')?.scrollIntoView?.({block:'nearest'});return;}
   if(action==='ruler-entry-delete'){await rulerAction('ruler_entry_delete',target.dataset.entryId);return;}
@@ -602,54 +610,96 @@ async function onClick(event) {
   if (action === 'show-periods') {const expanded = context.expanded_week === target.dataset.weekStart ? null : target.dataset.weekStart; await updateContext({expanded_week:expanded}); if (expanded) document.getElementById('month-period-details')?.scrollIntoView?.({block:'nearest',behavior:'auto'});}
   if (action === 'open-task') {if (target.dataset.axisTask){timelineGroupDate=null;timelineEntryId=null;} await updateContext({task_id:target.dataset.taskId});}
   if (action === 'open-time-group') {timelineGroupDate=target.dataset.axisDateGroup;timelineEntryId=target.dataset.axisEntryId;await updateContext({task_id:target.dataset.firstTaskId});}
-  if (action === 'close-task') await updateContext({task_id:null});
+  if (action === 'close-task') {await formAutosave.flush();await updateContext({task_id:null});}
   if(event.detail>1 && target.closest('[data-title-kind]'))return;
   if (action === 'open-cube') {if(context.cube_id!==target.dataset.cubeId || !target.closest('#cube-editor'))await openCubeContents(target.dataset.cubeId,target.closest('[data-title-kind]') || target);}
-  if (action === 'close-cube') {await updateContext({cube_id:null},{partialInspector:true});restoreInspectorAnchor();}
+  if (action === 'close-cube') {await formAutosave.flush();await updateContext({cube_id:null},{partialInspector:true});restoreInspectorAnchor();}
   if (action === 'clear-period') {clearDraftPrefix('period-'); await command('period_clear',{task_id:target.dataset.taskId});}
-  if (action === 'select-cube') {const cube = model.cubes.find(item => item.id === target.dataset.cubeId); if (cube.requires_estimate || cube.duration_unknown)await openCubeContents(cube.id,target);else await command(cube.selected_date ? 'cube_move' : 'cube_select',{cube_id:cube.id,date:context.date,start:cube.selected_date ? cube.start || null : null});}
+  if (action === 'select-cube') {const cube = model.cubes.find(item => item.id === target.dataset.cubeId);await command('cube_drop',{cube_id:cube.id,date:context.date,start:cube.selected_date ? cube.start || null : null});}
   if (action === 'open-calendar-event' || action==='open-calendar-contents') await openCalendarContents(target.dataset.eventId,target.closest('[data-title-kind]') || target,{sourceDetails:target.classList.contains('event-uncertainty')});
-  if (action === 'close-calendar-event') {await updateContext({calendar_event_id:null},{partialInspector:true});restoreInspectorAnchor();}
-  if (action === 'return-cube') {clearDraftPrefix(`cube-date-${target.dataset.cubeId}`); clearDraftPrefix(`cube-time-${target.dataset.cubeId}`); await command('cube_return',{cube_id:target.dataset.cubeId});}
+  if (action === 'close-calendar-event') {await formAutosave.flush();await updateContext({calendar_event_id:null},{partialInspector:true});restoreInspectorAnchor();}
+  if (action === 'return-cube') {await formAutosave.flush();clearDraftPrefix(`cube-date-${target.dataset.cubeId}`); clearDraftPrefix(`cube-time-${target.dataset.cubeId}`); await command('cube_return',{cube_id:target.dataset.cubeId});}
   if (action === 'toggle-merge') {mergeMode = !mergeMode; if (!mergeMode) mergeIds.clear(); render();}
 }
 async function onChange(event) {
   const target = event.target;
-  if(target.dataset.action==='ruler-select'){openRulerEditor(target.value);return;}
+  const form=target.closest?.('form[data-form]');if(form){if(target.dataset.draft)drafts.set(target.dataset.draft,target.type==='checkbox'?Boolean(target.checked):target.value);if(scheduleEditorAutosave(form,{immediate:true}))return;}
+  if(target.dataset.action==='ruler-select'){await formAutosave.flush();openRulerEditor(target.value);return;}
   if (target.dataset.action === 'show-past') {hidePast = !target.checked; render();}
   if (target.dataset.action === 'project-visibility') await command('project_visibility',{project_id:target.dataset.projectId,visible:target.checked});
   if (target.dataset.action === 'merge-pick') {if (target.checked) mergeIds.add(target.dataset.cubeId); else mergeIds.delete(target.dataset.cubeId); render();}
 }
-async function onSubmit(event) {
-  const form = event.target.closest('form[data-form]'); if (!form) return;
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(form));
-  const type = form.dataset.form;
+const ordinaryForms=new Set(['period','task-rename','cube-rename','cube-placement','calendar-event-move','ruler-save','ruler-entry-save']);
+function editorSnapshot(form){
+  const type=form.dataset.form,editor=type.startsWith('ruler-') && rulerEditor ? {id:rulerEditor.id,entryId:rulerEditor.entryId,create:rulerEditor.create,newEntry:rulerEditor.newEntry} : null;
+  if(!ordinaryForms.has(type) || type==='ruler-save' && editor?.create || type==='ruler-entry-save' && editor?.newEntry)return null;
+  const controls=Array.from(form.elements||[]).filter(control=>control.name && !control.disabled && !['submit','button','reset'].includes(control.type)),data={};
+  for(const control of controls){if(control.type==='radio'&&!control.checked)continue;data[control.name]=control.type==='checkbox'?Boolean(control.checked):control.value;}
+  const draftValues=controls.filter(control=>control.dataset?.draft).map(control=>[control.dataset.draft,control.type==='checkbox'?Boolean(control.checked):control.value]);
+  const changedFields=controls.filter(control=>control.dataset?.draft && drafts.has(control.dataset.draft)).map(control=>control.name);
+  const ids={...form.dataset},identity=ids.cubeId||ids.taskId||ids.eventId||(type==='ruler-entry-save'?editor?.entryId:editor?.id)||'';
+  return {key:`${type}:${identity}`,type,ids,editor,data,draftValues,changedFields,expectedRevision:model.revision,valid:typeof form.checkValidity!=='function'||form.checkValidity()};
+}
+export function scheduleEditorAutosave(form,{immediate=false}={}){const snapshot=editorSnapshot(form);if(snapshot)formAutosave.schedule(snapshot,{immediate});return Boolean(snapshot);}
+function saveError(){return new Error(document.getElementById('notice')?.textContent || t('Не удалось сохранить изменение.'));}
+async function saveEditorSnapshot(snapshot){
+  if(snapshot.valid===false)throw new Error(t('Проверьте введённые значения.'));
+  const {type,data,ids,editor}=snapshot,options={expectedRevision:snapshot.expectedRevision,preserveDrafts:true,autosave:true,changedFields:snapshot.changedFields};
+  await contextQueue;await commandSettled;
   let result;
-  if (type === 'period') {if (data.start > data.end) return notify(t('Конец периода не может быть раньше начала.'),true); clearDraftPrefix(`period-start-${form.dataset.taskId}`); clearDraftPrefix(`period-end-${form.dataset.taskId}`); result = await command('period_set',{task_id:form.dataset.taskId,...data});}
-  if (type === 'task-rename') {clearDraftPrefix(`task-title-${form.dataset.taskId}`); result = await command('task_rename',{task_id:form.dataset.taskId,title:data.title.trim()});}
-  if (type === 'cube-rename') {clearDraftPrefix(`cube-title-${form.dataset.cubeId}`); result = await command('cube_rename',{cube_id:form.dataset.cubeId,title:data.title.trim()});}
-  if (type === 'cube-placement') result = await saveCubePlacement(form.dataset.cubeId,data);
-  if(type==='ruler-save')result=await saveRuler({...data,visible:form.elements.visible?.checked});
-  if(type==='ruler-entry-save')result=await saveRulerEntry({...data,visible:form.elements.visible?.checked});
-  if (type === 'calendar-event-move') {clearDraftPrefix(`event-date-${form.dataset.eventId}`);clearDraftPrefix(`event-start-${form.dataset.eventId}`);result=await moveCalendarEvent(form.dataset.eventId,data);}
-  if (type === 'cube-cancel') result = await command('cube_cancel',{cube_id:form.dataset.cubeId,reason:data.reason.trim()});
-  if (type === 'merge') {const selected = model.cubes.filter(cube => mergeIds.has(cube.id)), check = mergeEligibility(selected); if (!check.ok) return notify(check.reason,true); result = await command('cube_merge',{cube_ids:selected.map(cube => cube.id),title:data.title.trim()}); if (result) {mergeIds.clear(); mergeMode = false; clearDraftPrefix('merge-title'); render();}}
+  if(type==='period'){
+    const current=model.tasks.find(task=>task.id===ids.taskId),start=snapshot.changedFields.includes('start')?data.start:current?.start,end=snapshot.changedFields.includes('end')?data.end:current?.end;
+    if(!start||!end||start>end)throw new Error(t('Конец периода не может быть раньше начала.'));
+    result=await command('period_set',{task_id:ids.taskId,start,end},options);
+  }else if(type==='task-rename'||type==='cube-rename'){
+    const title=String(data.title||'').trim();if(!title)throw new Error(t('Название не может быть пустым.'));
+    result=await command(type==='task-rename'?'task_rename':'cube_rename',{[type==='task-rename'?'task_id':'cube_id']:ids.taskId||ids.cubeId,title},options);
+  }else if(type==='cube-placement')result=await saveCubePlacement(ids.cubeId,data,options);
+  else if(type==='calendar-event-move')result=await moveCalendarEvent(ids.eventId,data,options);
+  else if(type==='ruler-save'){
+    const project=model.projects.find(item=>item.id===editor.id),custom=project?.kind==='goal',title=String(data.title||'').trim();
+    if(!title)throw new Error(t('Название не может быть пустым.'));
+    const patch={ruler_id:editor.id};for(const field of snapshot.changedFields){if(field==='title')patch.title=title;else if(field==='description')patch.description=String(data.description||'');else if(custom&&['start','end'].includes(field))patch[field]=data[field]||null;else if(field==='visible')patch.visible=Boolean(data.visible);}
+    result=Object.keys(patch).length>1?await command('ruler_update',patch,options):model;
+  }else if(type==='ruler-entry-save'){
+    const title=String(data.title||'').trim();if(!title)throw new Error(t('Название не может быть пустым.'));
+    const patch={ruler_id:editor.id,entry_id:editor.entryId};for(const field of snapshot.changedFields){if(field==='title')patch.title=title;else if(field==='date')patch.date=data.date||null;else if(field==='event_kind')patch.event_kind=data.event_kind||'milestone';else if(field==='full_completion')patch.full_completion=data.full_completion==='true'?true:data.full_completion==='false'?false:null;else if(field==='visible')patch.visible=Boolean(data.visible);}
+    result=Object.keys(patch).length>2?await command('ruler_entry_upsert',patch,options):model;
+  }
+  if(!result)throw saveError();
+  for(const [key,value] of snapshot.draftValues)if(drafts.has(key)&&String(drafts.get(key))===String(value))drafts.delete(key);
+  if(editor && rulerEditor?.id===editor.id)rulerEditor.baseRevision=model.revision;
   return result;
 }
-export async function saveCubePlacement(cubeId,data) {
-  let cube = model.cubes.find(item=>item.id === cubeId);
-  if (!cube) {notify(t('Кубик уже изменён. Обновите план.'),true);return null;}
-  if (cube.kind === 'calendar_optional' && !cube.selected_date && (cube.requires_estimate || cube.duration_unknown || (data.minutes && Number(data.minutes) !== Number(cube.minutes)))) {
-    const minutes=Number(data.minutes);
-    if (!Number.isInteger(minutes) || minutes<1 || minutes>1440) {notify(t('Укажите длительность от 1 до 1440 минут.'),true);return null;}
-    const estimated=await command('calendar_offer_estimate',{cube_id:cubeId,minutes});if (!estimated) return null;
-    cube=model.cubes.find(item=>item.id === cubeId);clearDraftPrefix(`cube-estimate-${cubeId}`);
+async function onSubmit(event) {
+  const form=event.target.closest('form[data-form]');if(!form)return;
+  event.preventDefault();
+  if(scheduleEditorAutosave(form,{immediate:true})){await formAutosave.flush();return model;}
+  const data=Object.fromEntries(new FormData(form)),type=form.dataset.form;
+  if(type==='ruler-save')return saveRuler({...data,visible:form.elements.visible?.checked});
+  if(type==='ruler-entry-save')return saveRulerEntry({...data,visible:form.elements.visible?.checked});
+  if(type==='cube-cancel')return command('cube_cancel',{cube_id:form.dataset.cubeId,reason:data.reason.trim()});
+  if(type==='merge'){const selected=model.cubes.filter(cube=>mergeIds.has(cube.id)),check=mergeEligibility(selected);if(!check.ok)return notify(check.reason,true);const result=await command('cube_merge',{cube_ids:selected.map(cube=>cube.id),title:data.title.trim()});if(result){mergeIds.clear();mergeMode=false;clearDraftPrefix('merge-title');render();}return result;}
+}
+export async function saveCubePlacement(cubeId,data,options={}) {
+  let cube=model.cubes.find(item=>item.id===cubeId),result;
+  if(!cube){notify(t('Кубик уже изменён. Обновите план.'),true);return null;}
+  const changed=options.changedFields||['date','start',...(data.minutes!==undefined?['minutes']:[])];
+  data={...data,date:changed.includes('date')?data.date:cube.selected_date||context.date,start:changed.includes('start')?data.start:cube.start||null};const minutes=data.minutes!==undefined?Number(data.minutes):null;
+  if(changed.includes('minutes') && minutes!==Number(cube.minutes)){
+    if(!Number.isInteger(minutes)||minutes<1||minutes>1440){notify(t('Укажите длительность от 1 до 1440 минут.'),true);return null;}
+    if(cube.kind==='calendar_optional'&&!cube.selected_date)result=await command('calendar_offer_estimate',{cube_id:cubeId,minutes},options);
+    else result=await command('cube_resize',{cube_id:cubeId,date:cube.selected_date||null,start:cube.start||null,minutes},options);
+    if(!result)return null;cube=model.cubes.find(item=>item.id===cubeId);
   }
-  const sameDate=cube.selected_date === data.date, action=cube.selected_date ? (sameDate ? 'cube_time' : 'cube_move') : 'cube_select';
-  const payload=action === 'cube_time' ? {cube_id:cubeId,start:data.start || null} : {cube_id:cubeId,date:data.date,start:data.start || null};
-  clearDraftPrefix(`cube-date-${cubeId}`);clearDraftPrefix(`cube-time-${cubeId}`);
-  return command(action,payload);
+  if(changed.some(field=>field==='date'||field==='start')){
+    if(!data.date){notify(t('Требуется дата.'),true);return null;}
+    const sameDate=cube.selected_date===data.date,action=cube.requires_estimate||cube.duration_unknown?'cube_drop':cube.selected_date?(sameDate?'cube_time':'cube_move'):'cube_select';
+    const payload=action==='cube_time'?{cube_id:cubeId,start:data.start||null}:{cube_id:cubeId,date:data.date,start:data.start||null};
+    result=await command(action,payload,options);if(!result)return null;
+  }
+  if(!options.preserveDrafts)for(const key of [`cube-date-${cubeId}`,`cube-time-${cubeId}`,`cube-estimate-${cubeId}`])clearDraftPrefix(key);
+  return result||model;
 }
 function restoreInspectorAnchor() {if(!inspectorReturnAnchor)return;const anchor=[...document.getElementById('planner').querySelectorAll('[data-title-kind]')].find(item=>item.dataset.titleKind===inspectorReturnAnchor.kind && item.dataset.nameId===inspectorReturnAnchor.id && (!inspectorReturnAnchor.location || item.dataset.nameLocation===inspectorReturnAnchor.location));anchor?.querySelector('button')?.focus({preventScroll:true});}
 export async function openCubeContents(cubeId,anchor) {if(!namedObject('cube',cubeId))return null;if(anchor)positionInspector(anchor,'cube',cubeId);await updateContext({cube_id:cubeId,calendar_event_id:null},{partialInspector:true});return context;}
@@ -660,10 +710,11 @@ export async function openCalendarContents(eventId,anchor,options={}) {
   return context;
 }
 export async function openCalendarEvent(eventId) {return openCalendarContents(eventId);}
-export async function moveCalendarEvent(eventId,data) {
+export async function moveCalendarEvent(eventId,data,options={}) {
   const event=model.events.find(item=>item.id === eventId);
   if (!event || !canMoveCalendarEvent(event)) {notify(t('Этот календарный блок закреплён; перенос недоступен.'),true);return null;}
-  const result=await command('calendar_event_move',{event_id:eventId,date:data.date,start:data.start});
+  data={...data,date:options.changedFields&&!options.changedFields.includes('date')?event.date:data.date,start:options.changedFields&&!options.changedFields.includes('start')?event.start:data.start};
+  const result=await command('calendar_event_move',{event_id:eventId,date:data.date,start:data.start},options);
   if (!result) return null;
   await updateContext({date:data.date,week_start:monday(data.date),calendar_event_id:eventId});
   return model;
@@ -754,12 +805,12 @@ async function finishResize() {
   if (!resizeState) return;
   const state = resizeState; resizeState = null;
   if (state.start === state.task.start && state.end === state.task.end) {render(); return;}
-  await command('period_set',{task_id:state.task.id,start:state.start,end:state.end});
+  await formAutosave.flush();const latest=model.tasks.find(task=>task.id===state.task.id);await command('period_set',{task_id:state.task.id,start:state.side==='start'?state.start:latest.start,end:state.side==='end'?state.end:latest.end});
 }
 async function keyResize(event) {
   if(event.target.matches?.('[data-inline-title]')){if(event.key==='Enter'){event.preventDefault();await commitInlineRename(event.target.value);}else if(event.key==='Escape'){event.preventDefault();cancelInlineRename();}return;}
   if(event.key==='F2'){const host=event.target.closest('[data-title-kind]');if(host){event.preventDefault();beginInlineRename(host.dataset.titleKind,host.dataset.nameId,host.dataset.nameLocation,host.getBoundingClientRect());return;}}
-  if(event.key==='Escape' && event.target.closest('#ruler-manager')){event.preventDefault();closeRulerEditor();return;}
+  if(event.key==='Escape' && event.target.closest('#ruler-manager')){event.preventDefault();if(!rulerEditor?.create&&!rulerEditor?.newEntry)await formAutosave.flush();closeRulerEditor();return;}
   const arrowViewport=event.target.closest('[data-arrow-viewport]');if(arrowViewport && ['+','=','-','0'].includes(event.key)){event.preventDefault();const plot=arrowViewport.querySelector('[data-testid="project-time-arrow"]'),current=Number(plot.dataset.pixelsPerDay);zoomArrowPanel(arrowViewport,event.key==='0' ? projectArrowModel(model).pixelsPerDay : current*(event.key==='-' ? 1/1.35 : 1.35),arrowViewport.clientHeight/2);return;}
   const timelineHandle=event.target.closest('[data-timeline-resize]');
   if(timelineHandle && ['ArrowUp','ArrowDown'].includes(event.key)){
@@ -801,9 +852,7 @@ async function dropCube(event) {
     if(eventId){const calendar=model.events.find(item=>item.id===eventId);await moveCalendarEvent(eventId,{date:placement.date,start:placement.start || calendar?.start});return;}
     const cubeId=event.dataTransfer.getData('application/x-work-cube'),cube=model.cubes.find(item=>item.id===cubeId);if(!cube)return;
     const date=placement.date,start=placement.start || cube.start;
-    if(cube.requires_estimate || cube.duration_unknown){drafts.set(`cube-date-${cubeId}`,date);if(start)drafts.set(`cube-time-${cubeId}`,start);await updateContext({cube_id:cubeId,date,week_start:monday(date)});notify(t('Укажите длительность перед размещением необязательного дела.'));document.getElementById('cube-editor')?.scrollIntoView?.({block:'nearest',behavior:'auto'});return;}
-    const action=cube.selected_date ? (cube.selected_date===date && start ? 'cube_time' : 'cube_move') : 'cube_select';
-    await command(action,action==='cube_time' ? {cube_id:cubeId,start} : {cube_id:cubeId,date,start:start || null});
+    await command('cube_drop',{cube_id:cubeId,date,start:start || null});
   }finally{gestureCommitPending=false;await refresh();}
 }
 export function plannerState(){return {model,contextValue:context,gestureActive:gestureActive(),inlineEdit,rulerEditor};}
@@ -817,29 +866,25 @@ export async function prepareLeave(){
     if(inlineEdit)throw new Error(document.getElementById('notice')?.textContent||t('Сохраните название перед переходом.'));
   }
   await contextQueue;await commandSettled;
-  const inputs=[...document.getElementById('planner').querySelectorAll('[data-draft]')];
-  for(const [key,value] of drafts){
-    const input=inputs.find(input=>input.dataset.draft===key);
-    if(input && String(value)===String(input.type==='checkbox'?input.defaultChecked:input.defaultValue))drafts.delete(key);
-  }
+  await formAutosave.flush();
   if(drafts.size){
-    const first=inputs.find(input=>drafts.has(input.dataset.draft));first?.focus?.({preventScroll:false});
-    const message=t('Сохраните изменения в полях перед переходом.');notify(message,true);throw new Error(message);
+    const message=rulerEditor?.create?t('Завершите создание цели перед переходом.'):rulerEditor?.newEntry?t('Завершите создание отметки перед переходом.'):t('Проверьте введённые значения.');
+    notify(message,true);throw new Error(message);
   }
   return {date:context.date,mode:'week'};
 }
 if (hasDOM) {
   const root = document.getElementById('planner');
-  root.addEventListener('click',onClick); root.addEventListener('change',onChange); root.addEventListener('submit',onSubmit);
+  root.addEventListener('click',event=>onClick(event).catch(error=>notify(error.message,true))); root.addEventListener('change',event=>onChange(event).catch(error=>notify(error.message,true))); root.addEventListener('submit',event=>onSubmit(event).catch(error=>notify(error.message,true)));
   root.addEventListener('dblclick',event=>{const host=event.target.closest('[data-title-kind]');if(host){event.preventDefault();event.stopPropagation();beginInlineRename(host.dataset.titleKind,host.dataset.nameId,host.dataset.nameLocation,host.getBoundingClientRect());return;}if(event.target.closest('button,input'))return;const viewport=event.target.closest('[data-arrow-viewport]');if(viewport){event.preventDefault();zoomArrowPanel(viewport,projectArrowModel(model).pixelsPerDay,viewport.clientHeight/2);}});
-  root.addEventListener('focusout',event=>{if(event.target.closest?.('[data-time-entry-id]'))hideArrowTooltip();if(!event.target.matches?.('[data-inline-title]') || event.relatedTarget?.closest?.('.inline-name-editor') || inlineEdit?.kind==='merge')return;void commitInlineRename(event.target.value);});
+  root.addEventListener('focusout',event=>{if(event.target.closest?.('[data-time-entry-id]'))hideArrowTooltip();if(internalRender || event.target.isConnected===false || inlineEdit?.saving || !event.target.matches?.('[data-inline-title]') || event.relatedTarget?.closest?.('.inline-name-editor') || inlineEdit?.kind==='merge')return;void commitInlineRename(event.target.value);});
   root.addEventListener('mouseover',showArrowTooltip);root.addEventListener('focusin',showArrowTooltip);root.addEventListener('mouseout',event=>{const marker=event.target.closest('[data-time-entry-id]');if(marker && event.relatedTarget?.closest?.('[data-time-entry-id]')!==marker)hideArrowTooltip();});
-  root.addEventListener('input',event => {if(event.target.dataset.inlineTitle && inlineEdit)inlineEdit.value=event.target.value;if (event.target.dataset.draft) drafts.set(event.target.dataset.draft,event.target.type==='checkbox' ? event.target.checked : event.target.value);});
+  root.addEventListener('input',event => {if(event.target.dataset.inlineTitle && inlineEdit)inlineEdit.value=event.target.value;if (event.target.dataset.draft) drafts.set(event.target.dataset.draft,event.target.type==='checkbox' ? event.target.checked : event.target.value);const form=event.target.closest?.('form[data-form]');if(form)scheduleEditorAutosave(form);});
   root.addEventListener('keydown',keyResize);root.addEventListener('wheel',onArrowWheel,{passive:false});root.addEventListener('pointerdown',beginResize);root.addEventListener('pointerdown',beginTimelineGesture);root.addEventListener('pointerdown',beginArrowPan);
   root.addEventListener('scroll',syncArrowScroll,true);
   document.addEventListener('pointermove',moveResize);document.addEventListener('pointermove',moveTimelineGesture);document.addEventListener('pointermove',moveArrowPan);document.addEventListener('pointerup',finishResize);document.addEventListener('pointerup',finishTimelineGesture);document.addEventListener('pointerup',finishArrowPan);document.addEventListener('pointercancel',()=>{if(nativeDragActive)return;resizeState=null;timelineGesture=null;arrowPan=null;if(model)render();void refresh();});
   root.addEventListener('dragstart',dragStart);root.addEventListener('dragover',dragOver);root.addEventListener('drop',dropCube);root.addEventListener('dragend',()=>{nativeDragActive=false;currentDragCubeId=null;clearDragHints();void refresh();});
 
   window.addEventListener('resize',()=>{[...document.getElementById('planner').querySelectorAll('[data-arrow-panel]')].forEach(settleArrowLabels);});
-  refresh().then(()=>model?resolveReady(model):rejectReady(new Error(t('План пока недоступен. Подключение повторится автоматически.')))); poll = setInterval(refresh,750); window.addEventListener('pagehide',() => clearInterval(poll),{once:true});
+  refresh().then(()=>model?resolveReady(model):rejectReady(new Error(t('План пока недоступен. Подключение повторится автоматически.')))); poll = setInterval(refresh,750); window.addEventListener('pagehide',() => {clearInterval(poll);formAutosave.dispose();},{once:true});
 }

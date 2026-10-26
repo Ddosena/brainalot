@@ -347,6 +347,8 @@ def enrich(state, events, cubes):
             "source_occurrences": [{"event_id": r["id"], "provider_id": r["provider_id"], "date": r["source_date"], "identity_match": r["identity_match"]} for r in records],
             "historical_facts": [{"cube_id": cube["id"], "minutes": cube["minutes"], **deepcopy(wp._constructor_report(planning, cube))} for cube in factual],
             "duration_unknown": unknown, "requires_estimate": unknown, "all_day": record["all_day"],
+            "duration_provisional": not unknown and record["duration_minutes"] is None,
+            "duration_basis": "local_estimate" if not unknown and record["duration_minutes"] is None else "calendar" if not unknown else "unknown",
             "returned": cube_id in ext.get("placements", {}) and placement.get("date") is None,
             "source_duration_minutes": record["duration_minutes"],
             "progress_percent": report.get("percent", 0), "actual_minutes": report.get("actual_minutes", 0),

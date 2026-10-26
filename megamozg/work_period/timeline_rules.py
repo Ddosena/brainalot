@@ -47,9 +47,12 @@ def resize(state, data, model, place):
     allowed, reason = capabilities(cube)
     if not allowed:
         raise ValidationError(reason)
-    if not cube.get("selected_date") or not cube.get("start"):
-        raise ValidationError("Сначала разместите кубик на времени")
-    if not isinstance(data["start"], str) or not data["start"]:
+    if not cube.get("selected_date"):
+        if cube.get("kind") not in {"brainalot", "prep", "weekly_review"} or data["date"] is not None or data["start"] is not None:
+            raise ValidationError("Сначала разместите кубик на времени")
+    elif cube.get("start") is not None and (not isinstance(data["start"], str) or not data["start"]):
+        raise ValidationError("Для изменения границы укажите точное начало ЧЧ:ММ")
+    elif data["start"] is not None and (not isinstance(data["start"], str) or not data["start"]):
         raise ValidationError("Для изменения границы укажите точное начало ЧЧ:ММ")
     minimum = 0 if cube["kind"] in {"prep", "weekly_review"} else 1
     if type(data["minutes"]) is not int or not minimum <= data["minutes"] <= 1440:
@@ -58,5 +61,6 @@ def resize(state, data, model, place):
     field = "calendar_offer_estimates" if cube["kind"] == "calendar_optional" else "cube_durations"
     ext.setdefault(field, {})[cube["id"]] = data["minutes"]
     # The caller owns a copied state and the WorkStore CAS transaction.
-    place(state, model, {**cube, "minutes": data["minutes"]}, data["date"], data["start"])
+    if cube.get("selected_date"):
+        place(state, model, {**cube, "minutes": data["minutes"]}, data["date"], data["start"])
     return state

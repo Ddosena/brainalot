@@ -373,11 +373,11 @@ async function mainEmbedded() {
   const query=new URLSearchParams(location.search);
   planning=createPlanning($('#planning-root'),{
     get state(){return store.get();},
-    initialMode:query.get('mode')==='history'?'month':'day',initialDate:query.get('date'),embeddedNavigation:true,
+    initialMode:query.get('mode')==='history'?'month':'day',initialDate:query.get('date'),embeddedNavigation:true,liveContext:true,liveRefresh:true,
     action:store.planningAction,pendingDraft:store.getPendingPlanningDraft,deletionState:store.getDeletionState,
     refreshWork:store.refreshRemote,retryDraft:store.retryPlanningDraft,discardDraft:store.discardPlanningDraft,
     openWorkspace:item=>openWorkspace(item),openCubeWorkspace:(item,onlyGroup=null)=>tabs.openWorkspace(item,onlyGroup),
-    readDashboard:()=>sharedApi('/api/dashboard'),toast,
+    readDashboard:async()=>({}),toast,
   });
   store.subscribe(()=>planning.remoteChanged());
   await planning.ready();lifecycle.ready();

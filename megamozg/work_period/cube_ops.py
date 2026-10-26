@@ -8,9 +8,42 @@ import hashlib
 
 from ..core import ValidationError
 from ..shared_state import encoded
+from .. import work_planning as wp
+from . import library_rules
 
 NAMESPACE = "period_planner"
 DELETE_REASON = "Удалено пользователем"
+DETAIL_FIELDS = frozenset({"output", "steps", "comment", "links", "groups", "resource_drafts", "planned_date"})
+
+
+def validate_details(row, patch, planning):
+    """Validate descriptive Work metadata without accepting identity or facts."""
+    if not isinstance(patch, dict) or set(patch) - DETAIL_FIELDS:
+        raise ValidationError("Недопустимые поля содержимого кубика")
+    if row.get("source_unavailable"):
+        raise ValidationError(row.get("availability_block_reason") or "Исходная задача Brainalot недоступна")
+    for field, maximum in (("output", 1000), ("comment", 4000)):
+        if field in patch and (not isinstance(patch[field], str) or len(patch[field]) > maximum):
+            raise ValidationError(f"constructor {field}: неверный текст")
+    if "steps" in patch:
+        steps = patch["steps"]
+        if not isinstance(steps, list) or len(steps) > 20 or any(not isinstance(step, str) or not step.strip() or len(step) > 500 for step in steps):
+            raise ValidationError("constructor steps: до20 шагов")
+    wp._constructor_resources({**row, **patch})
+    if "resource_drafts" in patch:
+        wp._constructor_resources(patch["resource_drafts"], drafts=True)
+    if "planned_date" in patch:
+        if row.get("kind") not in {"task", "brainalot"}:
+            raise ValidationError("Дата этого источника задаётся связанным событием; выберите день размещения")
+        if patch["planned_date"] is not None and wp._day(patch["planned_date"], "planned_date") not in wp._dates(planning["settings"]):
+            raise ValidationError("planned_date: вне горизонта")
+    return deepcopy(patch)
+
+
+def enrich_details(state, cubes):
+    overrides = state.get(NAMESPACE, {}).get("cube_details", {})
+    return [{**deepcopy(row), **{key: deepcopy(value) for key, value in overrides.get(row["id"], {}).items()
+        if key in DETAIL_FIELDS}} for row in cubes]
 
 
 def _fields(data, fields):
@@ -24,14 +57,14 @@ def _title(value):
     return value.strip()
 
 
-def _unstarted(row):
+def _unstarted(row, *, inactive_cleanup=False):
     if row.get("status") == "cancelled":
         raise ValidationError("Кубик уже удалён или отменён; его история сохранена")
     if (row.get("progress_percent") or row.get("actual_minutes")
             or row.get("historical_facts") or row.get("factual") or row.get("started")
             or row.get("status") in {"started", "completed"}):
         raise ValidationError("У кубика уже есть факты выполнения: удаление и объединение запрещены")
-    if not row.get("available"):
+    if not row.get("available") and not (inactive_cleanup and library_rules.can_cleanup(row)):
         raise ValidationError("Кубик недоступен: проверьте остаток и границы ответственности")
 
 
@@ -55,7 +88,7 @@ def delete(state, data, model):
         raise ValidationError("Кубик не найден или уже объединён; обновите экран")
     if row.get("kind") not in {"task", "prep", "weekly_review", "calendar_optional", "brainalot"}:
         raise ValidationError("Этот источник нельзя удалить действием для кубика")
-    _unstarted(row)
+    _unstarted(row, inactive_cleanup=True)
     result = deepcopy(state)
     ext = result.setdefault(NAMESPACE, {})
     ext.setdefault("cancellations", {})[cube_id] = {

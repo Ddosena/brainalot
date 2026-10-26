@@ -4,16 +4,23 @@ import { t } from "./i18n.js";
 // Library notes own their score; a materialized cube must not freeze a copy.
 export function sourceNote(cube,dashboard={}){
   if(cube?.kind!=='brainalot'||!cube.source_ref)return null;
+  const metadata=typeof cube.library_note_version==='string'&&cube.library_note_version?{
+    id:cube.source_ref,kind:'task',version:cube.library_note_version,title:cube.source_title||cube.title,
+    ...(validImportanceScore(cube.library_importance_score)?{importance_score:cube.library_importance_score}:{}),
+    ...(typeof cube.library_importance==='string'?{importance:cube.library_importance}:{}),
+  }:null;
+  if(metadata&&(Object.hasOwn(cube,'library_importance_score')||Object.hasOwn(cube,'library_importance')))return metadata;
   for(const rows of Object.values(dashboard))if(Array.isArray(rows)){
     const note=rows.find(row=>row?.id===cube.source_ref&&row.kind==='task');
     if(note)return note;
   }
-  return null;
+  return metadata;
 }
 
 export function sourceImportanceTarget(cube,planning={},dashboard={}){
   if(cube?.kind==='brainalot'){
-    const note=sourceNote(cube,dashboard);
+    const live=(planning.result?.constructor?.cubes||[]).find(row=>row.kind==='brainalot'&&row.source_ref===cube.source_ref&&row.library_note_version);
+    const note=sourceNote(live||cube,dashboard);
     return {kind:'note',id:cube.source_ref,score:note?importanceScore(note,0):0,
       version:note?.version,editable:!!(note&&typeof note.version==='string'&&note.version)};
   }

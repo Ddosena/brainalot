@@ -1949,5 +1949,10 @@ export default {
   "Сохраните изменения в полях перед переходом.": "Save the edited fields before switching.",
   "4 недели": "4 weeks",
   "Свернуть Work": "Collapse Work",
-  "Brainalot · Work · Неделя": "Brainalot · Work · Week"
+  "Brainalot · Work · Неделя": "Brainalot · Work · Week",
+  "Создать отметку": "Create milestone",
+  "Проверьте введённые значения.": "Check the entered values.",
+  "Требуется дата.": "A date is required.",
+  "Завершите создание цели перед переходом.": "Finish creating the goal before switching.",
+  "Завершите создание отметки перед переходом.": "Finish creating the milestone before switching."
 };

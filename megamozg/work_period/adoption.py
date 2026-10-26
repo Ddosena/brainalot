@@ -14,7 +14,7 @@ DICT_FIELDS = frozenset({'context', 'periods', 'visibility', 'cube_titles', 'tas
     'cancellations', 'merged_cubes', 'merges', 'cube_durations', 'calendar_source',
     'calendar_event_placements', 'calendar_offer_estimates', 'calendar_event_titles', 'course_source',
     'course_task_titles', 'rulers', 'ruler_overrides', 'ruler_entry_overrides', 'ruler_task_completion',
-    'course_catalog', 'retained_cubes', 'retained_events'})
+    'course_catalog', 'retained_cubes', 'retained_events', 'cube_details'})
 LIST_FIELDS = frozenset({'ruler_archive', 'calendar_placement_archive'})
 
 
@@ -252,6 +252,12 @@ def _validate_namespace(state, ext):
     known_events = {row['id'] for row in current_model['events']} | set(metadata)
     known_projects = {row['id'] for row in current_model['projects']}
     known_tasks = set(tasks) | {row['id'] for p in current_model['projects'] for row in p['tasks']}
+    from .cube_ops import validate_details
+    for key, patch in _mapping(ext, 'cube_details').items():
+        row = next((row for row in current_model['cubes'] if row['id'] == key), None)
+        if row is None:
+            _fail('содержимое ссылается на неизвестный кубик')
+        validate_details(row, patch, native)
     for key, period in _mapping(ext, 'periods').items():
         if key not in tasks or not isinstance(period, dict) or set(period) != {'start', 'end'}:
             _fail('период ссылается на неизвестную задачу')

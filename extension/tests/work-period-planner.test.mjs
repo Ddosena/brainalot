@@ -130,7 +130,7 @@ test('repeated pointer drags preserve grab offset and block poll rerenders until
 test('native drag fallback holds polling and resolves minutes while preserving time on a date-only drop',async()=>{
   const cube={id:'work',title:'Работа',kind:'task',task_id:'presentation',project_id:'sculpt',minutes:25,selected_date:base.today,start:'19:00',progress_percent:0,actual_minutes:0,available:true},state={...structuredClone(base),cubes:[cube],context:{mode:'week',date:base.today,week_start:base.today}};let reads=0;const calls=[];
   await withClientTransport(async(url,options)=>{if(url==='/api/model'){reads++;return {ok:true,json:async()=>structuredClone(state)};}const body=JSON.parse(options.body);calls.push(body);cube.start=body.data.start;cube.selected_date=body.data.date || cube.selected_date;state.revision++;return {ok:true,json:async()=>structuredClone(state)};},async(client,nodes)=>{
-    const callbacks=nodes.get('planner').listeners,transferValues=new Map(),dataTransfer={setData:(key,value)=>transferValues.set(key,value),getData:key=>transferValues.get(key)||''},source={dataset:{cubeId:'work'}},block={getBoundingClientRect:()=>({top:960})},target={closest:selector=>selector==='[data-timeline-id]' ? block : selector.includes('data-cube-id') ? source : null};callbacks.dragstart({target,dataTransfer,clientY:980});assert.equal(client.plannerState().gestureActive,true);const before=reads;await client.refresh();assert.equal(reads,before);const canvas={dataset:{date:base.today,startMinute:'660',pixelsPerMinute:'2'},getBoundingClientRect:()=>({top:0})};await callbacks.drop({target:{closest:selector=>selector==='[data-timeline-canvas]' ? canvas : null},dataTransfer,clientY:1000,preventDefault(){}});assert.equal(cube.start,'19:10');callbacks.dragstart({target,dataTransfer,clientY:980});await callbacks.drop({target:{closest:selector=>selector==='.day-cell:not(.is-past)' ? {dataset:{date:'2026-10-27'}} : null},dataTransfer,clientY:0,preventDefault(){}});assert.equal(calls.at(-1).action,'cube_move');assert.equal(calls.at(-1).data.start,'19:10');assert.equal(cube.selected_date,'2026-10-27');assert.equal(client.plannerState().gestureActive,false);
+    const callbacks=nodes.get('planner').listeners,transferValues=new Map(),dataTransfer={setData:(key,value)=>transferValues.set(key,value),getData:key=>transferValues.get(key)||''},source={dataset:{cubeId:'work'}},block={getBoundingClientRect:()=>({top:960})},target={closest:selector=>selector==='[data-timeline-id]' ? block : selector.includes('data-cube-id') ? source : null};callbacks.dragstart({target,dataTransfer,clientY:980});assert.equal(client.plannerState().gestureActive,true);const before=reads;await client.refresh();assert.equal(reads,before);const canvas={dataset:{date:base.today,startMinute:'660',pixelsPerMinute:'2'},getBoundingClientRect:()=>({top:0})};await callbacks.drop({target:{closest:selector=>selector==='[data-timeline-canvas]' ? canvas : null},dataTransfer,clientY:1000,preventDefault(){}});assert.equal(cube.start,'19:10');callbacks.dragstart({target,dataTransfer,clientY:980});await callbacks.drop({target:{closest:selector=>selector==='.day-cell:not(.is-past)' ? {dataset:{date:'2026-10-27'}} : null},dataTransfer,clientY:0,preventDefault(){}});assert.equal(calls.at(-1).action,'cube_drop');assert.equal(calls.at(-1).data.start,'19:10');assert.equal(cube.selected_date,'2026-10-27');assert.equal(client.plannerState().gestureActive,false);
   });
 });
 test('top and bottom resize commands preserve opposite edge and facts through reload, with one CAS refusal',async()=>{
@@ -150,18 +150,26 @@ test('canonical arrow renders both labeled edges, component details and no start
   const state=syntheticPackageFixture();state.projects[0].tasks.find(task=>task.id==='package2').full_completion=true;
   await withClientTransport(async()=>({ok:true,json:async()=>state}),async(client,nodes)=>{const html=nodes.get('planner').innerHTML;assert.equal((html.match(/data-time-task-id="package2"/g)||[]).length,2);assert.ok(html.includes('09 · Начало разработки'));assert.ok(html.includes('15 · Дедлайн'));assert.ok(html.includes('Компонент A'));assert.ok(html.includes('Компонент B'));assert.ok(html.includes('Отдельный срок не указан; используется общее окно пакета.'));assert.ok(!html.includes('data-time-task-id="setup"'));assert.ok(!html.includes('data-time-task-id="first"'));const start=html.match(/<button[^>]+data-time-entry-id="package2:start"[^>]*>(.*?)<\/button>/s)?.[1],deadline=html.match(/<button[^>]+data-time-entry-id="package2:deadline"[^>]*>(.*?)<\/button>/s)?.[1];assert.ok(start?.includes('axis-plain-dot'));assert.ok(deadline?.includes('m3.5 8 3 3 6-6'));let prevented=false;client.onArrowWheel({target:{closest:()=>null},preventDefault(){prevented=true;},deltaY:50});assert.equal(prevented,false);assert.equal(client.plannerState().model.revision,state.revision);});
 });
-test('calendar offer editor requests an explicit estimate and never guesses one before placement',async()=>{
-  const state=structuredClone(base),calls=[];state.revision=1;state.context={mode:'week',date:base.today,week_start:base.today,cube_id:'gray'};state.cubes=[{id:'future',kind:'task',project_id:'sculpt',task_id:'presentation',title:'Будущая работа',minutes:60,planned_date:'2026-11-01',available:true},{id:'sage',kind:'calendar_optional',calendar_role:'evergreen',availability:'any_day',title:'Позвонить родителям',minutes:30,available:true},{id:'gray',kind:'calendar_optional',calendar_role:'optional_day',availability:'day',source_date:base.today,title:'Домашнее задание',minutes:0,duration_unknown:true,requires_estimate:true,available:true}];
+test('unknown calendar drag places one provisional cube at pointer time without an estimate modal',async()=>{
+  const state=structuredClone(base),calls=[];state.context={mode:'week',date:base.today,week_start:base.today,cube_id:null};
+  state.cubes=[{id:'sage',kind:'calendar_optional',calendar_role:'evergreen',availability:'any_day',title:'Synthetic call',minutes:0,duration_unknown:true,requires_estimate:true,source_duration_minutes:null,available:true}];
   await withClientTransport(async(url,options)=>{
-    if (url==='/api/model') return {ok:true,json:async()=>structuredClone(state)};
-    const body=JSON.parse(options.body);calls.push(body);assert.equal(body.expected_revision,state.revision);const offer=state.cubes.find(cube=>cube.id==='gray');
-    if (body.action==='calendar_offer_estimate') {offer.minutes=body.data.minutes;offer.duration_unknown=false;offer.requires_estimate=false;}else if (body.action==='cube_select') {offer.selected_date=body.data.date;offer.start=body.data.start;}
+    if(url==='/api/model')return {ok:true,json:async()=>structuredClone(state)};
+    const body=JSON.parse(options.body);if(url==='/api/context'){state.context={...state.context,...body};state.revision++;return {ok:true,json:async()=>({context:state.context,revision:state.revision})};}
+    calls.push(body);const cube=state.cubes[0];assert.equal(body.expected_revision,state.revision);
+    if(body.action==='cube_drop')Object.assign(cube,{selected_date:body.data.date,start:body.data.start,minutes:30,duration_unknown:false,requires_estimate:false,duration_provisional:true,can_resize:true});
+    else if(body.action==='cube_resize')cube.minutes=body.data.minutes;
     state.revision++;return {ok:true,json:async()=>structuredClone(state)};
   },async(client,nodes)=>{
-    let html=nodes.get('planner').innerHTML;assert.ok(html.indexOf('data-cube-id="gray"')<html.indexOf('data-cube-id="sage"'));assert.ok(html.includes('data-drop-pool="task"'));assert.ok(html.includes('data-drop-pool="other"'));assert.ok(html.includes('Длительность не указана'));assert.match(html,/type="number" name="minutes"[^>]+value=""/);assert.equal(await client.saveCubePlacement('gray',{date:base.today,start:'15:00'}),null);assert.equal(calls.length,0);
-    assert.ok(await client.saveCubePlacement('gray',{date:base.today,start:'15:00',minutes:'45'}));assert.deepEqual(calls.map(call=>call.action),['calendar_offer_estimate','cube_select']);assert.deepEqual(calls.map(call=>call.expected_revision),[1,2]);assert.equal(calls[0].data.minutes,45);assert.equal(state.cubes.find(cube=>cube.id==='gray').selected_date,base.today);html=nodes.get('planner').innerHTML;assert.ok(html.includes('timed-cube calendar-role-optional_day'));assert.ok(!html.includes('data-event-id="gray"'));
+    const canvas={dataset:{date:base.today,startMinute:'660',pixelsPerMinute:'2'},getBoundingClientRect:()=>({top:0})};
+    await nodes.get('planner').listeners.drop({target:{closest:selector=>selector==='[data-timeline-canvas]'?canvas:null},dataTransfer:{getData:key=>key==='application/x-work-cube'?'sage':''},clientY:980,preventDefault(){}});
+    assert.deepEqual(calls.map(call=>call.action),['cube_drop']);assert.deepEqual(calls[0].data,{cube_id:'sage',date:base.today,start:'19:10'});
+    assert.equal(state.cubes[0].minutes,30);assert.equal(state.context.cube_id,null);assert.ok(!nodes.get('planner').innerHTML.includes('id="cube-editor"'));
+    await client.openCubeContents('sage');assert.match(nodes.get('planner').innerHTML,/type="number" name="minutes"[^>]+value="30"/);assert.ok(!nodes.get('planner').innerHTML.includes('>Сохранить день и время<'));
+    await client.saveCubePlacement('sage',{date:base.today,start:'19:10',minutes:'45'},{changedFields:['minutes']});assert.equal(calls.at(-1).action,'cube_resize');assert.equal(state.cubes[0].minutes,45);
   });
 });
+
 test('flexible calendar move uses a typed command while fixed source blocks cannot be submitted',async()=>{
   const state={...structuredClone(base),events:[{id:'fixed',title:'Урок',date:base.today,start:'12:00',end:'13:00',calendar_role:'fixed',movable:false},{id:'flex',title:'Поля',date:base.today,start:'18:00',end:'19:30',duration_minutes:90,calendar_role:'flexible',movable:true}]};const calls=[];
   await withClientTransport(async(url,options)=>{if(url==='/api/model')return {ok:true,json:async()=>structuredClone(state)};const body=JSON.parse(options.body);if(url==='/api/context'){state.context={...state.context,...body};state.revision++;return {ok:true,json:async()=>({context:state.context,revision:state.revision})};}calls.push(body);state.revision++;return {ok:true,json:async()=>structuredClone(state)};},async(client)=>{assert.equal(await client.moveCalendarEvent('fixed',{date:'2026-10-28',start:'14:00'}),null);assert.equal(calls.length,0);assert.ok(await client.moveCalendarEvent('flex',{date:'2026-10-28',start:'14:00'}));assert.equal(calls[0].action,'calendar_event_move');assert.deepEqual(calls[0].data,{event_id:'flex',date:'2026-10-28',start:'14:00'});assert.equal(state.context.calendar_event_id,'flex');});
@@ -284,5 +292,69 @@ test('unified Week has one four-week horizon toggle and no repeated mode or perm
     await client.updateContext({mode:'month'});
     assert.match(toolbar(),/data-mode="week" aria-pressed="true">4 недели/);
     assert.equal((nodes.get('planner').innerHTML.match(/data-testid="day-cell"/g)||[]).length,28);
+  });
+});
+
+
+test('live Library source changes refresh Week while Work revision stays unchanged',async()=>{
+  const state=structuredClone(base);state.source_fingerprint='first';
+  await withClientTransport(async()=>({ok:true,json:async()=>structuredClone(state)}),async(client,nodes)=>{
+    state.cubes[0].title='Updated live note';state.source_fingerprint='second';await client.refresh();
+    assert.equal(client.plannerState().model.revision,1);assert.ok(nodes.get('planner').innerHTML.includes('Updated live note'));
+  });
+});
+
+
+function autosaveForm(type,ids,values){
+  const elements=Object.entries(values).map(([name,value])=>({name,value:String(value),type:'text',disabled:false,dataset:{draft:`${type==='cube-placement'?'cube':type}-${name}-${ids.cubeId||ids.taskId}`}}));
+  const form={dataset:{form:type,...ids},elements,checkValidity:()=>true};for(const element of elements)element.closest=selector=>selector==='form[data-form]'?form:null;return form;
+}
+test('ordinary cube fields autosave and mode leave flushes the last active input without Save or manual guard',async()=>{
+  const state=structuredClone(base),calls=[];state.cubes=[{...state.cubes[0],selected_date:base.today,start:'13:00'}];
+  await withClientTransport(async(url,options)=>{if(url==='/api/model')return {ok:true,json:async()=>structuredClone(state)};const body=JSON.parse(options.body);calls.push(body);state.cubes[0].start=body.data.start;state.revision++;return {ok:true,json:async()=>structuredClone(state)};},async(client,nodes)=>{
+    const form=autosaveForm('cube-placement',{cubeId:'a'},{date:base.today,start:'14:05'}),input=form.elements.find(input=>input.name==='start');
+    nodes.get('planner').listeners.input({target:input});assert.equal(calls.length,0);assert.deepEqual(await client.prepareLeave(),{date:base.today,mode:'week'});
+    assert.equal(calls.length,1);assert.equal(calls[0].action,'cube_time');assert.equal(calls[0].data.start,'14:05');assert.equal(state.cubes[0].start,'14:05');
+  });
+});
+test('invalid editor values retain their draft until corrected, then autosave permits mode leave',async()=>{
+  const state=structuredClone(base),calls=[];
+  await withClientTransport(async(url,options)=>{if(url==='/api/model')return {ok:true,json:async()=>structuredClone(state)};const body=JSON.parse(options.body);calls.push(body);Object.assign(state.tasks[0],body.data);state.revision++;return {ok:true,json:async()=>structuredClone(state)};},async(client,nodes)=>{
+    const form=autosaveForm('period',{taskId:'presentation'},{start:'2026-10-29',end:'2026-10-28'}),input=form.elements[0];nodes.get('planner').listeners.input({target:input});
+    await assert.rejects(client.prepareLeave(),/Конец периода/);assert.equal(calls.length,0);assert.equal(input.value,'2026-10-29');
+    form.elements[1].value='2026-10-30';nodes.get('planner').listeners.input({target:form.elements[1]});await client.prepareLeave();
+    assert.equal(calls.length,1);assert.equal(state.tasks[0].end,'2026-10-30');
+  });
+});
+test('autosave CAS conflict retains typed values and leaving does not blindly retry the write',async()=>{
+  const state=structuredClone(base),calls=[];state.cubes=[{...state.cubes[0],selected_date:base.today,start:'13:00'}];
+  await withClientTransport(async(url,options)=>{if(url==='/api/model')return {ok:true,json:async()=>structuredClone(state)};const body=JSON.parse(options.body);calls.push(body);state.cubes[0].start='15:00';state.revision++;return {ok:false,status:409,json:async()=>({error:'External update'})};},async(client,nodes)=>{
+    const form=autosaveForm('cube-placement',{cubeId:'a'},{date:base.today,start:'14:05'}),input=form.elements[1];nodes.get('planner').listeners.input({target:input});
+    await assert.rejects(client.prepareLeave(),/другом окне/);await assert.rejects(client.prepareLeave(),/другом окне/);
+    assert.equal(calls.length,1);assert.equal(input.value,'14:05');assert.equal(state.cubes[0].start,'15:00');
+  });
+});
+
+
+test('untouched inline name adopts live agent rename while an edited draft stays protected',async()=>{
+  const state=structuredClone(base);
+  await withClientTransport(async()=>({ok:true,json:async()=>structuredClone(state)}),async(client,nodes)=>{
+    const edit=client.beginInlineRename('cube','a','shelf');await edit.ready;
+    state.cubes[0].title='Agent live title';state.revision++;await client.refresh();
+    assert.equal(client.plannerState().inlineEdit.value,'Agent live title');assert.equal(client.plannerState().inlineEdit.conflicted,false);
+    client.plannerState().inlineEdit.value='My dirty draft';state.cubes[0].title='Agent second title';state.revision++;await client.refresh();
+    assert.equal(client.plannerState().inlineEdit.value,'My dirty draft');assert.equal(client.plannerState().inlineEdit.conflicted,true);
+  });
+});
+
+
+test('an internal render focusout cannot write the old untouched name over a live agent title',async()=>{
+  const state=structuredClone(base),calls=[];
+  await withClientTransport(aliasTransport(state,calls),async(client,nodes)=>{
+    client.beginInlineRename('cube','a','shelf');await client.plannerState().inlineEdit.ready;
+    const root=nodes.get('planner');let html=root.innerHTML,fire=false;
+    Object.defineProperty(root,'innerHTML',{get(){return html;},set(value){html=value;if(fire)root.listeners.focusout({target:{isConnected:true,value:'Часть A',matches:()=>true},relatedTarget:null});}});
+    fire=true;state.cubes[0].title='Agent title must survive';state.revision++;await client.refresh();await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(calls.length,0);assert.equal(state.cubes[0].title,'Agent title must survive');assert.equal(client.plannerState().inlineEdit.value,'Agent title must survive');
   });
 });

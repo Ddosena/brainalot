@@ -15,6 +15,16 @@ test('task and library importance are resolved from their live owner, never the 
   assert.equal(sourceImportanceTarget({kind:'brainalot',source_ref:'missing'},planning,dashboard).editable,false);
 });
 
+test('month and unscheduled Library cards resolve current metadata without Dashboard and prefer it over stale rows',()=>{
+  const cube={id:'brainalot-note',kind:'brainalot',source_ref:'note',library_source:true,source_horizon:'month',library_note_version:'current',library_importance_score:4,library_importance:'high',importance_score:1};
+  assert.deepEqual(sourceImportanceTarget(cube,{},{}),{kind:'note',id:'note',score:4,version:'current',editable:true});
+  const stale={today:[{id:'note',kind:'task',version:'old',importance_score:1}]};
+  assert.equal(sourceImportance(cube,{},stale),4);
+  const planning={result:{constructor:{cubes:[{...cube,library_note_version:'newer',library_importance_score:5}]}}};assert.equal(sourceImportance(cube,planning,stale),5);
+  cube.library_importance_score=0;assert.equal(sourceImportance(cube,{},stale),0);
+  delete cube.library_importance_score;cube.library_importance='critical';cube.source_horizon='unscheduled';assert.equal(sourceImportance(cube,{},{}),5);
+});
+
 test('candidate, materialized selected and hidden library cubes inherit live dashboard score without mutation',()=>{
   const date='2030-03-04',cube={id:'saved',kind:'brainalot',source_ref:'note',title:'Saved title',minutes:60,importance_score:1,progress_percent:35,actual_minutes:17};
   const planning={tasks:[],constructor:{},result:{constructor:{cubes:[cube],days:{[date]:{initialized:true,selected_cube_ids:['saved'],possible_cube_ids:[],hidden_cube_ids:[]}}}}};

@@ -40,7 +40,7 @@ export function weekProposals(planning,start){
 }
 export function groupWeekCubes(cubes){const groups=new Map();for(const cube of cubes){const key=JSON.stringify([cube.planned_date,cube.task_id||cube.kind+":"+cube.source_ref]);if(!groups.has(key))groups.set(key,{key,date:cube.planned_date,task_id:cube.task_id,cubes:[]});groups.get(key).cubes.push(cube);}return [...groups.values()];}
 export function createWorkConstructor(root,ctx){
-  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,monthlyDraft=null,monthlyDraftBaseline=null,monthlyEditorOpen=false,monthlySaving=false;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
+  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,monthlyDraft=null,monthlyDraftBaseline=null,monthlyEditorOpen=false,monthlySaving=false,monthlySaveTimer=null,monthlySavePromise=null,monthlySaveError=null;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
   try{const options=JSON.parse(preferences.getItem('brainalot.work.readable.v1')||'{}');setReadableLayout(options.layout);}catch{}
   function sourceImportance(c){return canonicalSourceImportance(c,planning()||{},dashboard);}
   const importanceKey=target=>target.kind+':'+target.id;
@@ -52,7 +52,7 @@ export function createWorkConstructor(root,ctx){
       importanceSaving.add(key);error='';notice=t('Сохраняем важность…');render();
       try{
         await saveSourceImportance(target,value,{action:(name,data)=>commit(name,data),api:ctx.api||sharedApi});
-        if(target.kind==='note')await refreshDashboard();
+        if(target.kind==='note'){await ctx.refreshWork?.();await refreshDashboard();}
         notice=t('Важность сохранена');
       }catch(cause){
         if(target.kind==='note'&&cause.status===409){await refreshDashboard();cause.message=t('Задача изменилась. Важность не перезаписана — проверьте новое значение.');}
@@ -189,15 +189,28 @@ export function createWorkConstructor(root,ctx){
   }
   function monthPlanHtml(){
     const draft=monthPlanDraft(),tasks=planning()?.tasks||[];
-    return '<details class="rc-month-plan" data-month-plan-editor '+(monthlyEditorOpen?'open':'')+'><summary>'+safe(t('План месяца'))+'</summary><div><label>'+safe(t('Месяц'))+'<input type="month" data-field="month-plan-month" data-focus-key="month-plan-month" value="'+safe(draft.month)+'" '+(monthlySaving?'disabled':'')+'></label><div class="rc-month-plan-tasks">'+tasks.map(task=>'<label><input type="checkbox" data-field="month-plan-task" data-task="'+safe(task.id)+'" data-focus-key="month-plan-task-'+safe(task.id)+'" '+(draft.taskIds.includes(task.id)?'checked':'')+' '+(monthlySaving?'disabled':'')+'><span>'+safe(task.title)+'</span></label>').join('')+'</div><button data-action="month-plan-save" '+(monthlySaving||!validPlanMonth(draft.month)?'disabled':'')+'>'+safe(monthlySaving?t('Сохраняем…'):t('Сохранить план месяца'))+'</button></div></details>';
+    return '<details class="rc-month-plan" data-month-plan-editor '+(monthlyEditorOpen?'open':'')+'><summary>'+safe(t('План месяца'))+'</summary><div><label>'+safe(t('Месяц'))+'<input type="month" data-field="month-plan-month" data-focus-key="month-plan-month" value="'+safe(draft.month)+'"></label><div class="rc-month-plan-tasks">'+tasks.map(task=>'<label><input type="checkbox" data-field="month-plan-task" data-task="'+safe(task.id)+'" data-focus-key="month-plan-task-'+safe(task.id)+'" '+(draft.taskIds.includes(task.id)?'checked':'')+'><span>'+safe(task.title)+'</span></label>').join('')+'</div></div></details>';
   }
+  function monthlyChanged(){return Boolean(monthlyDraft&&monthlyDraftBaseline&&(monthlyDraft.month!==monthlyDraftBaseline.month||JSON.stringify([...monthlyDraft.taskIds].sort())!==JSON.stringify([...monthlyDraftBaseline.taskIds].sort())));}
   async function saveMonthPlan(){
-    if(monthlySaving)return;
     const draft=monthPlanDraft(),month=draft.month,known=new Set((planning()?.tasks||[]).map(task=>task.id)),task_ids=[...new Set(draft.taskIds)].filter(id=>known.has(id));
     if(!validPlanMonth(month))throw new Error(t('Выберите существующий месяц.'));
-    monthlySaving=true;render();
-    try{await commit('monthly_plan_approve',{month,task_ids});monthlyDraft=null;monthlyEditorOpen=false;}
+    const sent={month,taskIds:[...task_ids]},sourceDraft=monthlyDraft;monthlySaving=true;render();
+    try{await commit('monthly_plan_approve',{month,task_ids},{quiet:true});monthlyDraftBaseline=copy(sent);if(monthlyDraft===sourceDraft&&monthlyDraft.month===sent.month&&JSON.stringify([...monthlyDraft.taskIds].sort())===JSON.stringify([...sent.taskIds].sort()))monthlyDraft=copy(sent);}
     finally{monthlySaving=false;if(!disposed)render();}
+  }
+  async function flushMonthPlan(){
+    clearTimeout(monthlySaveTimer);monthlySaveTimer=null;
+    if(monthlySavePromise)await monthlySavePromise;
+    if(monthlySaveError)throw monthlySaveError;
+    while(monthlyChanged()){
+      const operation=saveMonthPlan();monthlySavePromise=operation;
+      try{await operation;}catch(error){monthlySaveError=error;throw error;}finally{if(monthlySavePromise===operation)monthlySavePromise=null;}
+    }
+  }
+  function scheduleMonthPlan(){
+    clearTimeout(monthlySaveTimer);monthlySaveError=null;
+    if(monthlyChanged())monthlySaveTimer=setTimeout(()=>{monthlySaveTimer=null;void trackOperation(flushMonthPlan()).catch(reportError);},350);
   }
   function catalogHtml(m){
     const selectedIds=new Set(m.selected.map(c=>c.id)),required=new Set(m.events.filter(e=>e.required).map(e=>e.stable_id||e.occurrence_id||e.id));
@@ -256,9 +269,14 @@ export function createWorkConstructor(root,ctx){
     Object.assign(data,resource);return commit("constructor_cube",data,{quiet});
   }
   function getPopupCube(){return popup?find(popup.id)||drafts.get(popup.id):null;}
+  function publishDayContext(cube=null){
+    if(!ctx.liveContext)return;
+    const date=selectedDate,known=cube&&canonical(cube.id),patch={date,cube_id:known?cube.id:null,task_id:cube?.task_id||null};
+    return trackOperation((async()=>{while(popupSaves.size)await Promise.all([...popupSaves]);await commit('period_context',patch,{quiet:true});})()).catch(reportError);
+  }
   function openPopup(id,element,tray){
     if(Date.now()<suppressClick)return;hideTooltip();const c=find(id);if(!c)return;const existing=drafts.get(id);closePopup();const r=element.getBoundingClientRect();
-    deleteIntent=null;popup={id,tray,anchor:{left:r.left,right:r.right,top:r.top,bottom:r.bottom}};if(!dirtyFields.get(id)?.size)popupBases.set(id,copy(c));drafts.set(id,existing||{...copy(c),...resourcesForEdit(c)});renderPopup();document.querySelector("[data-constructor-popup] h2")?.focus({preventScroll:true});
+    deleteIntent=null;popup={id,tray,anchor:{left:r.left,right:r.right,top:r.top,bottom:r.bottom}};if(!dirtyFields.get(id)?.size)popupBases.set(id,copy(c));drafts.set(id,existing||{...copy(c),...resourcesForEdit(c)});renderPopup();document.querySelector("[data-constructor-popup] h2")?.focus({preventScroll:true});void publishDayContext(c);
   }
   function closePopup(save=true){if(save&&popup&&!popupDeleted()&&!deletionFrozen()&&!deleteBusy&&drafts.has(popup.id))void savePopup().catch(()=>{});popupObserver?.disconnect();popupObserver=null;cancelAnimationFrame(popupFrame);popupFrame=null;document.querySelector("[data-constructor-popup]")?.remove();popup=null;deleteIntent=null;}
   function canDelete(c){return !['history','trophy'].includes(popup?.tray)&&['task','brainalot'].includes(c.kind||'task')&&!isDeletedCube(planning(),c);}
@@ -292,7 +310,7 @@ export function createWorkConstructor(root,ctx){
     }finally{deleteBusy=false;if(!disposed)render();}
   }
   function popupHtml(c){
-    if(popup.tray==="history")return historyPopupHtml(c);const selected=isSelected(c.id),week=popup.tray==="week",type=c.type||typeOf(c),locked=["calendar","weekly_review"].includes(c.kind),min=c.kind==="prep"?0:5,max=c.kind==="prep"?120:240,timer=cubeTimerState(c),factHint=canRecordFacts(c)?"":' title="'+safe(factGuardReason())+'"',factDisabled=canRecordFacts(c)?"":' disabled'+factHint;
+    if(popup.tray==="history")return historyPopupHtml(c);const selected=isSelected(c.id),week=popup.tray==="week",type=c.type||typeOf(c),locked=c.kind==="weekly_review"||c.kind==="calendar"&&c.can_resize!==true,min=c.kind==="prep"?0:5,max=c.kind==="prep"?120:240,timer=cubeTimerState(c),factHint=canRecordFacts(c)?"":' title="'+safe(factGuardReason())+'"',factDisabled=canRecordFacts(c)?"":' disabled'+factHint;
     return '<header><span>'+safe(TYPES[type]||TYPES.task)+" · "+safe(week?t("Подготовка недели"):selected?t("Выбран в день"):t("Возможный кубик"))+'</span><button data-action="popup-close" aria-label="'+safe(t("Закрыть"))+'">'+ic("close")+'</button></header><h2 tabindex="-1">'+safe(c.title)+'</h2><p class="cc-popup-context">'+safe(c.taskTitle||c.sourceLabel||"")+(c.segmentTitle?" → "+safe(c.segmentTitle):"")+'</p>'+importanceControl(c)+'<label class="cc-range">'+safe(t("Длительность"))+'<b data-popup-duration>'+safe(minutes(c.minutes))+'</b><input type="range" data-popup-field="minutes" min="'+min+'" max="'+max+'" step="5" value="'+c.minutes+'" '+(locked?"disabled":"")+' aria-label="'+safe(t("Длительность кубика"))+'"></label><label class="cc-range">'+safe(t("Готовность"))+'<b data-popup-percent>'+formatReadiness(c.progress_percent)+'%</b><input type="range" data-popup-field="progress_percent" min="0" max="100" step="5" value="'+(c.progress_percent||0)+'" aria-label="'+safe(t("Готовность кубика"))+'"'+factDisabled+'></label><label class="cc-actual"'+factHint+'>'+safe(t("Факт, мин"))+'<input type="number" data-popup-field="actual_minutes" min="0" max="100000" value="'+Math.round(c.actual_minutes||0)+'"'+factDisabled+'></label>'+
       (week?'<label>'+safe(t("Дата подготовки"))+'<input type="date" data-popup-field="planned_date" value="'+safe(c.planned_date)+'"></label><p>'+safe(t("Появится в возможных"))+" "+safe(dateLabel(c.planned_date,true))+'</p>':"")+
       (selected?'<section class="cc-popup-timer"><div><b data-timer>'+formatTime(timer.remaining_ms)+'</b><span data-timer-status>'+safe(timer.status)+'</span></div><div><button data-action="timer-start"'+factDisabled+'>'+safe(t("Приступить"))+'</button><button data-action="timer-pause">'+safe(t("Пауза"))+'</button><button data-action="timer-stop">'+safe(t("Стоп"))+'</button><button data-action="done"'+factDisabled+'>'+safe(t("Готово"))+'</button></div><small>'+safe(t("Время не меняет готовность. Следующий кубик запускается вручную."))+'</small></section>':"")+
@@ -342,7 +360,7 @@ export function createWorkConstructor(root,ctx){
       const base=popupBases.get(id)||copy(c),metadataDirty=[...dirty].some(key=>fields.includes(key)||key==="resources");
       if(metadataDirty||!planning()?.constructor?.cubes?.[id])await commit("constructor_cube",()=>{
         const latest=canonical(id);
-        if(planning()?.constructor?.cubes?.[id])return constructorPatch(base,c,latest,dirty);
+        if(planning()?.constructor?.cubes?.[id] || ctx.liveContext&&latest)return constructorPatch(base,c,latest,dirty);
         const create={cube_id:id,...cubeCommand({...c,kind:c.kind||(c.task_id?"task":c.kind),planned_date:c.planned_date||selectedDate}),...resourcesForSave(c)};return create;
       },{quiet:true});
       const report=canonical(id);
@@ -354,7 +372,7 @@ export function createWorkConstructor(root,ctx){
         await commit("cube_progress",()=>{requireRecordableCube(c);const latest=canonical(id);constructorPatch(base,c,latest,new Set([...dirty].filter(key=>["progress_percent","actual_minutes"].includes(key))));const latestPercent=dirty.has("progress_percent")?percent:Number(latest?.progress_percent)||0,latestActual=dirty.has("actual_minutes")?Number(c.actual_minutes)||0:Number(latest?.actual_minutes)||0;return {cube_id:id,percent:latestPercent,actual_minutes:Math.round(latestPercent>=100?Math.max(actual,latestActual):latestActual)};},{quiet:true});if(celebrate)completionFlight(c,origin,celebration);
       }
       popupConflicts.delete(id);const updated=canonical(id);if(updated){const nextBase=copy(popupBases.get(id)||updated);for(const key of dirty){if(key==="resources")Object.assign(nextBase,{links:copy(updated.links||[]),groups:copy(updated.groups||[]),resource_drafts:copy(updated.resource_drafts||{links:updated.links||[],groups:updated.groups||[]})});else nextBase[key]=copy(updated[key]);}if(dirty.has("progress_percent")&&Number(c.progress_percent)>=100)nextBase.actual_minutes=updated.actual_minutes;popupBases.set(id,nextBase);}if(JSON.stringify(drafts.get(id))===sent){drafts.delete(id);dirtyFields.delete(id);}
-      const label=popup?.id===id?document.querySelector("[data-popup-save]"):null;if(label)label.textContent=t("Сохранено в Work");geometries.delete(id);
+      const label=popup?.id===id?document.querySelector("[data-popup-save]"):null;if(label)label.textContent=t("Сохранено в Work");geometries.delete(id);if(deferredRemote&&!drag&&!dirtyFields.get(id)?.size){deferredRemote=false;render();}
     }catch(cause){if(celebration&&completionClaims.release(id,celebration))pendingBlocks.delete(id);if(cause.code==="constructor-edit-conflict"){popupConflicts.set(id,cause.fields||[]);if(popup?.id===id)renderPopup();throw cause;}const saved=canonical(id);if(saved&&drafts.has(id)){drafts.get(id).minutes=saved.minutes;drafts.get(id).planned_date=saved.planned_date;updateGeometry(find(id));}const label=document.querySelector("[data-popup-save]");if(label)label.textContent=error||cause.message;throw cause;}
   }
   function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>void savePopup().catch(()=>{}),500);}
@@ -415,7 +433,7 @@ export function createWorkConstructor(root,ctx){
     }
   }
   function bindWheel(){const strip=$(".cc-task-strip");strip?.addEventListener("wheel",event=>{if(Math.abs(event.deltaX)>Math.abs(event.deltaY)||strip.scrollWidth<=strip.clientWidth)return;const next=clamp(strip.scrollLeft+event.deltaY,0,strip.scrollWidth-strip.clientWidth);if(next!==strip.scrollLeft){event.preventDefault();strip.scrollLeft=next;}},{passive:false});}
-  const snapSlot=(id,duration,desired)=>nearestPlanningSlot(planning(),occupied(id),duration,desired);
+  const snapSlot=(id,duration,desired)=>{const cube=find(id);return cube?.duration_unknown||cube?.requires_estimate?Math.round(desired/5)*5:nearestPlanningSlot(planning(),occupied(id),duration,desired);};
   function occupied(exclude){const m=model();return [...m.events.filter(e=>e.required).map(e=>({start:clock(e.start),minutes:clock(e.end)-clock(e.start)})),...m.selected.filter(c=>c.id!==exclude&&c.start!=null).map(c=>({start:clock(c.start),minutes:c.minutes}))];}
   function boundsHit(element,x,y,margin=0){if(!element)return false;const r=element.getBoundingClientRect();return x>=r.left-margin&&x<=r.right+margin&&y>=r.top-margin&&y<=r.bottom+margin;}
   function cubeElement(id){return [...document.querySelectorAll("[data-ccube]")].find(el=>el.dataset.ccube===id);}
@@ -477,7 +495,7 @@ export function createWorkConstructor(root,ctx){
     if(name==='delete-confirm')return deleteConfirmed();
     if(name==='delete-cancel'){deleteIntent=null;renderPopup();return;}
     if(["mode-day","mode-week","mode-month"].includes(name)){closePopup();mode=name==="mode-day"?"day":name==="mode-week"?"week":"month";render();return;}
-    if(name==="previous"||name==="next"||name==="today"||name==="preview-date"){closePopup();selectedDate=name==="today"?todayIn(planning()?.settings?.timezone):name==="preview-date"?button.dataset.date:shiftDate(selectedDate,name==="previous"?-1:1);mode="day";error="";render();return;}
+    if(name==="previous"||name==="next"||name==="today"||name==="preview-date"){closePopup();selectedDate=name==="today"?todayIn(planning()?.settings?.timezone):name==="preview-date"?button.dataset.date:shiftDate(selectedDate,name==="previous"?-1:1);mode="day";error="";render();void publishDayContext();return;}
     if(name==="goal-close")return commit("constructor_goal_status",{scope:button.dataset.scope,date:button.dataset.goalDate,status:button.dataset.status});
     if(name==="initialize")return commit("constructor_day",{date:selectedDate});
     if(name==="goal-editor"){const key=button.dataset.scope+':'+button.dataset.goalDate;goalEditor=goalEditor===key?null:key;render();if(goalEditor)$('[data-goal-title="'+button.dataset.scope+'"]')?.focus({preventScroll:true});return;}
@@ -546,7 +564,7 @@ export function createWorkConstructor(root,ctx){
       draft[field]=["minutes","actual_minutes","progress_percent"].includes(field)?Math.max(0,Number(el.value)||0):field==="steps"?el.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):el.value;
       if(field==="minutes"){geometries.set(c.id,draft.minutes);updateGeometry(find(c.id));const label=document.querySelector("[data-popup-duration]");if(label)label.textContent=minutes(draft.minutes);}
       if(field==="progress_percent"){const label=document.querySelector("[data-popup-percent]");if(label)label.textContent=formatReadiness(draft.progress_percent)+"%";}
-      if(field!=="minutes"&&field!=="progress_percent"&&field!=="planned_date")scheduleSave();
+      scheduleSave();
     }else if(el.dataset.groupTitle){const dirty=dirtyFields.get(c.id)||new Set();dirty.add("resources");dirtyFields.set(c.id,dirty);const group=draft.groups?.find(g=>g.id===el.dataset.groupTitle);if(group)group.title=el.value;scheduleSave();}
     else if(el.dataset.linkField){const dirty=dirtyFields.get(c.id)||new Set();dirty.add("resources");dirtyFields.set(c.id,dirty);const group=draft.groups?.find(g=>g.id===el.dataset.group),list=group?.links||draft.links,link=list?.find(l=>l.id===el.dataset.link);if(link)link[el.dataset.linkField]=el.value;
       const row=el.closest("[data-link-row]"),valid=validUrl(link?.url),anchor=row?.querySelector("[data-resource-anchor]"),label=row?.querySelector("[data-link-error]");if(anchor){if(valid){anchor.href=valid;anchor.removeAttribute("aria-disabled");}else{anchor.removeAttribute("href");anchor.setAttribute("aria-disabled","true");}}if(label)label.textContent=valid?"":t("Нужен полный http:// или https:// URL с адресом сайта.");scheduleSave();
@@ -555,19 +573,19 @@ export function createWorkConstructor(root,ctx){
   function handleChange(event){
     const el=event.target;if(!root.contains(el)&&!el.closest("[data-constructor-popup]"))return;
     if((deletionFrozen()||deleteBusy||popupDeleted())&&!['date','history-month','search'].includes(el.dataset.field))return;
-    if(el.dataset.field==='month-plan-month'){const draft=monthPlanDraft(),plan=approvedMonthlyPlan(planning());draft.month=el.value;draft.taskIds=plan?.month===el.value?[...plan.task_ids]:[];render();return;}
-    if(el.dataset.field==='month-plan-task'){const draft=monthPlanDraft();draft.taskIds=el.checked?[...new Set([...draft.taskIds,el.dataset.task])]:draft.taskIds.filter(id=>id!==el.dataset.task);render();return;}
+    if(el.dataset.field==='month-plan-month'){const draft=monthPlanDraft(),plan=approvedMonthlyPlan(planning());draft.month=el.value;draft.taskIds=plan?.month===el.value?[...plan.task_ids]:[];render();scheduleMonthPlan();return;}
+    if(el.dataset.field==='month-plan-task'){const draft=monthPlanDraft();draft.taskIds=el.checked?[...new Set([...draft.taskIds,el.dataset.task])]:draft.taskIds.filter(id=>id!==el.dataset.task);render();scheduleMonthPlan();return;}
     if(el.dataset.field==='source-importance'){const c=find(el.dataset.id)||historyCubes(planning(),{includeArchived:true}).find(cube=>cube.id===el.dataset.id);if(c)void changeSourceImportance(c,Number(el.value)).catch(reportError);return;}
     if(el.dataset.field==='source-task'){const operation=taskChangeSerial.catch(()=>{}).then(()=>toggleTask(el.dataset.task));taskChangeSerial=operation;void operation.catch(reportError);return;}
     if(el.dataset.field==='task-focus'){taskChoice().focusTask=el.value;stage=null;render();return;}
     if(el.dataset.goalTitle){const scope=el.dataset.goalTitle;void commit("constructor_goal",{scope,date:el.dataset.goalDate,title:el.value}).catch(reportError);return;}
-    if(el.dataset.field==="history-month"){historyMonth=el.value;historyPath=[];render();return;}if(el.dataset.field==="date"){closePopup();selectedDate=el.value;render();return;}
+    if(el.dataset.field==="history-month"){historyMonth=el.value;historyPath=[];render();return;}if(el.dataset.field==="date"){closePopup();selectedDate=el.value;render();void publishDayContext();return;}
     if(el.dataset.field==="energy"){void (async()=>{await ensureDay();await commit("day_budget",{date:selectedDate,minutes:Math.round(Number(el.value)*60)});})().catch(reportError);return;}
     if(el.dataset.field==="goal"){void commit("constructor_day",{date:selectedDate,goal:el.value}).catch(reportError);return;}
     if(el.dataset.field==="event-required"){void commit("calendar_required",{event_id:el.dataset.event,required:el.checked}).catch(reportError);return;}
     if(el.dataset.popupField){void savePopup().then(()=>render()).catch(()=>{});}
   }
-  function cleanupDrag(){const orbit=$(".cc-orbit-host");if(orbit&&!disposed){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}if(drag?.source){drag.source.style.opacity="";drag.source.classList.remove("is-resizing");}drag?.ghost?.remove();drag=null;$(".cc-snap")?.remove();for(const el of root.querySelectorAll(".is-drop"))el.classList.remove("is-drop");}
+  function cleanupDrag(){const orbit=$(".cc-orbit-host");if(orbit&&!disposed){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}if(drag?.source){drag.source.style.opacity="";drag.source.classList.remove("is-resizing");}drag?.ghost?.remove();drag=null;deferredRemote=false;$(".cc-snap")?.remove();for(const el of root.querySelectorAll(".is-drop"))el.classList.remove("is-drop");}
   function pointerDown(event){
     if(deletionFrozen()||deleteBusy)return;
     if(event.button!==0||!root.contains(event.target))return;const element=event.target.closest("[data-ccube]");if(!element||element.dataset.tray==="week"||!writable())return;
@@ -620,7 +638,7 @@ export function createWorkConstructor(root,ctx){
         return constructorPatch(previous.base,{...latest,minutes:previous.minutes},latest,new Set(["minutes"]));
       }).catch(reportError);return;
     }
-    if(!drag||event.pointerId!==drag.pointer)return;const previous=drag,origin=drag.ghost?.getBoundingClientRect();if(!previous.active){drag=null;return;}suppressClick=Date.now()+450;const bin=[...root.querySelectorAll("[data-trash]")].find(el=>boundsHit(el,event.clientX,event.clientY)),left=$('[data-physical="selected"]'),right=$('[data-catalog-drop]'),timeline=$(".cc-timeline"),overTimeline=boundsHit(timeline,event.clientX,event.clientY,45),ringMinute=overTimeline?null:orbitDropAt(event.clientX,event.clientY);cleanupDrag();
+    if(!drag||event.pointerId!==drag.pointer)return;const previous=drag,origin=drag.ghost?.getBoundingClientRect();if(!previous.active){drag=null;if(deferredRemote){deferredRemote=false;render();}return;}suppressClick=Date.now()+450;const bin=[...root.querySelectorAll("[data-trash]")].find(el=>boundsHit(el,event.clientX,event.clientY)),left=$('[data-physical="selected"]'),right=$('[data-catalog-drop]'),timeline=$(".cc-timeline"),overTimeline=boundsHit(timeline,event.clientX,event.clientY,45),ringMinute=overTimeline?null:orbitDropAt(event.clientX,event.clientY);cleanupDrag();
     void (async()=>{
       if(bin){await ensureDay();await hideCube(previous.id,bin,origin);return;}
       if(overTimeline){if(previous.snap===null)throw new Error(t("Нет свободного места нужной длительности."));await placeOnTimeline(previous.id,previous.snap,origin);return;}
@@ -676,12 +694,14 @@ export function createWorkConstructor(root,ctx){
     const cube=event.target.closest?.("[data-ccube]");if(cube&&["Enter"," "].includes(event.key)){event.preventDefault();openPopup(cube.dataset.ccube,cube,cube.dataset.tray);}
   }
   function updateTimers(){const c=getPopupCube(),el=document.querySelector("[data-constructor-popup]");if(!c||!el)return;const state=cubeTimerState(c),clockEl=el.querySelector("[data-timer]"),status=el.querySelector("[data-timer-status]");if(clockEl)clockEl.textContent=formatTime(state.remaining_ms);if(status)status.textContent=(state.status==="running"?t("Идёт работа"):state.status==="paused"?t("Пауза"):state.status==="finished"?t("Время вышло"):t("Не запущен"));}
+  let deferredRemote=false;
   function remoteChanged(){
+    if(drag){deferredRemote=true;return;}
     void Promise.resolve(ctx.pendingDraft?.()).then(next=>{if(!disposed&&JSON.stringify(next||null)!==JSON.stringify(pending)){pending=next||null;render();}}).catch(()=>{});
-    if(!monthlyEditorOpen)monthlyDraft=null;
+    if(!monthlyEditorOpen&&!monthlyChanged())monthlyDraft=null;
     if(popupDeleted()){clearTimeout(saveTimer);deleteIntent=null;notice=deletedMessage();render();return;}
     if(deletionFrozen()||deletionState().conflicts.length){clearTimeout(saveTimer);render();return;}
-    if(document.activeElement?.closest?.("[data-constructor-popup]")){notice=t("Work обновился. Ваш ввод сохранён в редакторе.");return;}render();
+    if(popup&&dirtyFields.get(popup.id)?.size){notice=t("Work обновился. Ваш ввод сохранён в редакторе.");return;}if(popup){const latest=canonical(popup.id);if(latest){popupBases.set(popup.id,copy(latest));drafts.set(popup.id,{...copy(latest),...resourcesForEdit(latest)});}}render();
   }
   function outerDown(event){if(popup&&!event.target.closest("[data-constructor-popup]")&&!event.target.closest("[data-ccube]"))closePopup();}
   function toggle(event){if(event.target.matches?.("[data-month-plan-editor]"))monthlyEditorOpen=event.target.open;if(event.target.matches?.(".rc-task-choice"))taskPanelOpen=event.target.open;if(event.target.closest?.("[data-constructor-popup]"))schedulePopupPosition();}
@@ -698,8 +718,8 @@ export function createWorkConstructor(root,ctx){
     await serial;
     if(await ctx.pendingDraft?.())throw new Error(t('Сначала разрешите неподтверждённый запрос Work.'));
     if([...dirtyFields.values()].some(fields=>fields.size))throw new Error(t('Сохраните изменения кубика перед переходом.'));
-    if(monthlyDraft){const baseline=monthlyDraftBaseline,tasks=[...baseline.taskIds].sort();if(monthlyDraft.month!==baseline.month||JSON.stringify([...monthlyDraft.taskIds].sort())!==JSON.stringify(tasks)){monthlyEditorOpen=true;render();throw new Error(t('Сохраните месячный план перед переходом.'));}}
+    await flushMonthPlan();
     return {date:selectedDate,mode:mode==='month'?'history':'day'};
   }
-  return {render,remoteChanged,prepareLeave,destroy(){disposed=true;disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};
+  return {render,remoteChanged,prepareLeave,destroy(){disposed=true;clearTimeout(monthlySaveTimer);disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};
 }

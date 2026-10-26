@@ -630,7 +630,7 @@ def test_malformed_source_commands_have_validation_errors_and_no_commit(planner,
 
 def test_transaction_boundary_rejects_accidental_native_writes(planner, monkeypatch):
     before = planner.snapshot()
-    def wrong_target(state, action, data):
+    def wrong_target(state, action, data, library_notes=None):
         state['items'].append({'id': 'unwanted', 'title': 'Should not commit'})
         return state
     monkeypatch.setattr(model, 'apply_command', wrong_target)

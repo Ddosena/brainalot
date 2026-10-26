@@ -20,11 +20,12 @@ from . import timeline_rules
 from . import course_rules
 from . import cube_ops
 from . import ruler_rules
+from . import library_rules
 
 NAMESPACE = "period_planner"
 ACTIONS = frozenset({"period_set", "period_clear", "project_visibility", "cube_select", "cube_return",
     "cube_move", "cube_time", "cube_merge", "cube_rename", "cube_cancel", "task_rename",
-    "calendar_source_import", "calendar_event_move", "calendar_offer_estimate", "cube_resize", "course_source_import", "calendar_event_rename", "assignment_rename", "cube_delete"}) | ruler_rules.ACTIONS
+    "calendar_source_import", "calendar_event_move", "calendar_offer_estimate", "cube_resize", "cube_drop", "course_source_import", "calendar_event_rename", "assignment_rename", "cube_delete"}) | ruler_rules.ACTIONS
 CONTEXT_FIELDS = frozenset({"mode", "date", "week_start", "cube_id", "task_id", "project_id", "window_start", "expanded_week", "calendar_event_id"})
 
 
@@ -110,12 +111,13 @@ def _source_catalog(planning, retained=None):
     return rows
 
 
-def cube_rows(state):
+def cube_rows(state, library_notes=None):
     planning, ext = state["planning"], extension(state)
     tasks = {row["id"]: row for row in planning["tasks"]}
     catalog_owned = {row["work_task_id"]: row.get("owned_by_user", True)
         for row in course_rules.catalog_items(state) if row.get("work_task_id")}
     rows = _source_catalog(planning, ext.get("retained_cubes"))
+    rows = library_rules.catalog(state, rows, library_notes)
     native_sources = deepcopy(rows)
     rows.update(deepcopy(ext.get("merged_cubes", {})))
     absorbed = {cid for merge in ext.get("merges", {}).values() for cid in merge["source_ids"]}
@@ -171,7 +173,7 @@ def cube_rows(state):
             progress_percent=percent, actual_minutes=row.get("actual_minutes", 0),
             kind=row.get("kind", "task"), candidate=bool(row.get("candidate") and cid not in ext.get("placements", {})),
             status="cancelled" if canceled or deleted else "completed" if percent >= 100 else "started" if percent or row.get("actual_minutes") else "selected" if selected else "available",
-            available=not (canceled or deleted or exempt or percent >= 100 or row.get("allocation_stale")),
+            available=not (canceled or deleted or exempt or percent >= 100 or row.get("allocation_stale") or row.get("source_unavailable")),
             output=row.get("output", ""), steps=row.get("steps", []),
             source_ids=deepcopy(row.get("source_ids") or [cid]), returned=placement is not None and placement.get("date") is None)
         row["end"] = hhmm(clock(start) + row["minutes"]) if start else None
@@ -240,12 +242,13 @@ def read_model(snapshot):
     state = snapshot["state"]
     planning, ext = state["planning"], extension(state)
     settings = planning["settings"]
-    cubes = cube_rows(state)
+    cubes = cube_rows(state, snapshot.get("library_notes"))
     native_events = _event_rows(planning, ext.get("calendar_source", {}).get("events"))
     native_event_ids = {event["id"] for event in native_events}
     native_events.extend(deepcopy(event) for event_id, event in ext.get("retained_events", {}).items()
         if event_id not in native_event_ids)
     events, cubes, calendar_warnings = calendar_rules.enrich(state, native_events, cubes)
+    cubes = cube_ops.enrich_details(state, cubes)
     cubes = timeline_rules.enrich(state, cubes)
     by_task = {}
     for cube in cubes:
@@ -381,7 +384,7 @@ def read_model(snapshot):
                 **{key: value["budget_minutes"] for key, value in planning.get("manual_days", {}).items()}}}}
 
 
-def apply_context(state, data):
+def apply_context(state, data, library_notes=None):
     if not isinstance(data, dict) or set(data) - CONTEXT_FIELDS:
         raise ValidationError("Неизвестное поле контекста")
     updated = {**context(state), **data}
@@ -404,7 +407,7 @@ def apply_context(state, data):
         if updated[field] is not None:
             if date.fromisoformat(day(updated[field])).weekday():
                 raise ValidationError("Начало недели должно быть понедельником")
-    model = read_model({"state": state, "revision": 0})
+    model = read_model({"state": state, "revision": 0, "library_notes": library_notes})
     # Timeline history has source-only materials without an executable Work task.
     # They can be selected for inspection; typed task edits still resolve only
     # model.tasks in apply_command, so this does not authorize historical writes.
@@ -427,7 +430,7 @@ def _editable_cube(row, *, placement=False):
     if row.get("actual_minutes") or row.get("progress_percent"):
         raise ValidationError("У кубика уже есть факты: менять его состав или размещение нельзя")
     if not row.get("available"):
-        raise ValidationError("Кубик недоступен: проверьте остаток и границы ответственности")
+        raise ValidationError(row.get("availability_block_reason") or "Кубик недоступен: проверьте остаток и границы ответственности")
 
 
 def _place(state, model, row, target, start):
@@ -464,11 +467,37 @@ def _place(state, model, row, target, start):
     state.setdefault(NAMESPACE, {}).setdefault("placements", {})[row["id"]] = {"date": target, "start": start}
 
 
-def apply_command(state, action, data):
+def apply_command(state, action, data, library_notes=None):
     if action not in ACTIONS:
         raise ValidationError("Неизвестная команда периодного плана")
-    model = read_model({"state": state, "revision": 0})
+    model = read_model({"state": state, "revision": 0, "library_notes": library_notes})
     ext = state.setdefault(NAMESPACE, {})
+    if action == "cube_drop":
+        _fields(data, {"cube_id", "date", "start"})
+        row = next((cube for cube in model["cubes"] if cube["id"] == data["cube_id"]), None)
+        if row is None:
+            raise ValidationError("Кубик не найден; обновите экран")
+        _editable_cube(row, placement=True)
+        day(data["date"])
+        if data["start"] is not None:
+            clock(data["start"])
+        if row["kind"] == "calendar_optional" and row.get("duration_unknown"):
+            # The owner's direct drop explicitly authorizes a provisional local
+            # duration. Fit only at this exact start, never jump to another slot.
+            failure = None
+            for minutes in (30, 25, 20, 15, 10, 5):
+                proposed = {**row, "minutes": minutes, "duration_unknown": False, "requires_estimate": False}
+                try:
+                    _place(state, model, proposed, data["date"], data["start"])
+                except ValidationError as exc:
+                    failure = exc
+                    continue
+                ext.setdefault("calendar_offer_estimates", {})[row["id"]] = minutes
+                return state
+            raise failure or ValidationError("В выбранной точке нет пяти свободных минут")
+        library_rules.retain(state, row)
+        _place(state, model, row, data["date"], data["start"])
+        return state
     if action in ruler_rules.ACTIONS:
         return ruler_rules.apply(state, action, data, model)
     if action == "cube_delete":
@@ -476,6 +505,9 @@ def apply_command(state, action, data):
     if action == "cube_merge":
         return cube_ops.merge(state, data, model, _place)
     if action == "cube_resize":
+        row = next((cube for cube in model["cubes"] if cube["id"] == data.get("cube_id")), None)
+        if row:
+            library_rules.retain(state, row)
         return timeline_rules.resize(state, data, model, _place)
     if action == "course_source_import":
         _fields(data, {"source"})
@@ -563,14 +595,18 @@ def apply_command(state, action, data):
     row = next((c for c in model["cubes"] if c["id"] == data["cube_id"]), None)
     if row is None:
         raise ValidationError("Кубик не найден или уже объединён; обновите экран")
+    library_rules.retain(state, row)
     if action == "cube_rename":
+        if row.get("source_unavailable"):
+            raise ValidationError(row.get("availability_block_reason") or "Исходная задача Brainalot недоступна")
         title = text(data["title"])
         ext.setdefault("cube_titles", {})[row["id"]] = title
         if row.get("kind") == "calendar_optional":
             for occurrence in row.get("source_occurrences", []):
                 ext.setdefault("calendar_event_titles", {})[occurrence["event_id"]] = title
         return state
-    _editable_cube(row, placement=True)
+    if not (action in {"cube_return", "cube_cancel"} and library_rules.can_cleanup(row)):
+        _editable_cube(row, placement=True)
     if action == "cube_return":
         ext.setdefault("placements", {})[row["id"]] = {"date": None, "start": None}
     elif action == "cube_cancel":
@@ -618,14 +654,21 @@ class PeriodPlanner:
 
     def __init__(self, store):
         self.store = store
+        self.library = library_rules.LibraryReader(store.root)
 
-    def _model(self, snapshot):
+    def _model(self, snapshot, library_notes=None):
+        if library_notes is None:
+            library_notes = self.library.notes()
+        snapshot = {**snapshot, "library_notes": library_notes}
         ready = isinstance((snapshot.get("state") or {}).get("planning"), dict)
         result = read_model(snapshot) if ready else _empty_projection(snapshot)
         result["initialized"] = snapshot["initialized"]
         result["planning_initialized"] = ready
         result["provenance"] = {"source": "work", "training_copy": False,
             "source_revision": snapshot["revision"]}
+        source_rows = [{key: note.get(key) for key in ("id", "version", "kind", "status", "title", "due", "planning_horizon")}
+            for note in sorted(library_notes, key=lambda note: note["id"])]
+        result["source_fingerprint"] = hashlib.sha256(encoded(source_rows).encode("utf-8")).hexdigest()
         if snapshot.get("deletion_state") is not None:
             result["deletion_state"] = deepcopy(snapshot["deletion_state"])
         return result
@@ -638,7 +681,7 @@ class PeriodPlanner:
 
     def day_model(self):
         from .day import day_model
-        return day_model(self.snapshot())
+        return day_model({**self.snapshot(), "library_notes": self.library.notes()})
 
     def day_command(self, command):
         from .day import day_command
@@ -652,8 +695,10 @@ class PeriodPlanner:
         # Validate JSON before opening the transaction or computing its receipt.
         encoded(command)
 
-    def _write(self, command, scope, transform, *, context_only=False):
+    def _write(self, command, scope, transform, *, context_only=False, library_notes=None):
         from ..work_delete import recover, ensure_writable
+        if library_notes is None:
+            library_notes = self.library.notes()
         recover(self.store)
         with self.store.db() as db:
             ensure_writable(db)
@@ -686,20 +731,22 @@ class PeriodPlanner:
             images = [{key: image[key] for key in ("id", "blob", "mime")} for image in snapshot["images"]]
             descriptors = self.store._validate(db, digest, images)
             db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (revision + 1, int(time.time()*1000), digest, encoded(descriptors)))
-            result = {"context": context(state), "revision": revision + 1} if context_only else self._model(self.store._read(db))
+            result = {"context": context(state), "revision": revision + 1} if context_only else self._model(self.store._read(db), library_notes)
             return self.store.remember(db, scope, command, result)
 
     def command(self, command):
         self._envelope(command, {"request_id", "expected_revision", "action", "data"})
         if not isinstance(command["action"], str) or command["action"] not in ACTIONS or not isinstance(command["data"], dict):
             raise ValidationError("Нужны известная команда периодного плана и объект data")
-        return self._write(command, "period-planner", lambda state: apply_command(state, command["action"], command["data"]))
+        library_notes = self.library.notes()
+        return self._write(command, "period-planner", lambda state: apply_command(state, command["action"], command["data"], library_notes), library_notes=library_notes)
 
     def set_context(self, command):
         self._envelope(command, {"request_id", "expected_revision", "patch"})
         if not isinstance(command["patch"], dict):
             raise ValidationError("Контекст: нужен объект patch")
-        return self._write(command, "period-planner-context", lambda state: apply_context(state, command["patch"]), context_only=True)
+        library_notes = self.library.notes()
+        return self._write(command, "period-planner-context", lambda state: apply_context(state, command["patch"], library_notes), context_only=True, library_notes=library_notes)
 
     def adopt(self, command):
         """Adopt an explicitly reviewed namespace blob without importing native Work."""

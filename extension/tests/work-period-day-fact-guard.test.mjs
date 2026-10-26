@@ -4,7 +4,7 @@ import {createWorkConstructor} from '../work-constructor.js';
 import {todayIn} from '../work-constructor-model.js';
 import {timeClient} from '../time-client.js';
 
-async function fixture(exercise,{date=todayIn()}={}){
+async function fixture(exercise,{date=todayIn(),liveContext=false,beforeAction}={}){
   const keys=['document','window','innerWidth','innerHeight','matchMedia','requestAnimationFrame','cancelAnimationFrame'];
   const previous=Object.fromEntries(keys.map(key=>[key,globalThis[key]])),timers={refresh:timeClient.refresh,command:timeClient.command};
   const handlers=new Map(),calls=[],timeCalls=[],messages=[];
@@ -16,7 +16,7 @@ async function fixture(exercise,{date=todayIn()}={}){
   Object.assign(globalThis,{document,window:{addEventListener(){},removeEventListener(){}},innerWidth:1440,innerHeight:900,matchMedia:()=>({matches:true}),requestAnimationFrame:()=>1,cancelAnimationFrame(){}});
   timeClient.refresh=async()=>{timeCalls.push('refresh');return {status:'idle',task:null};};
   timeClient.command=async(name,data)=>{timeCalls.push(name);return {status:name==='start'?'running':'idle',task:data?.task};};
-  const app=createWorkConstructor(root,{state:{planning},initialDate:date,async action(action,data){calls.push({action,data});if(action==='cube_progress'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,{progress_percent:data.percent,actual_minutes:data.actual_minutes});}if(action==='constructor_cube'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,data);}return {state:{planning}};},async pendingDraft(){return null;},async readDashboard(){return {};},toast(message){messages.push(message);}});
+  const app=createWorkConstructor(root,{state:{planning},initialDate:date,liveContext,async action(action,data){calls.push({action,data});await beforeAction?.(action,data);if(action==='cube_progress'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,{progress_percent:data.percent,actual_minutes:data.actual_minutes});}if(action==='constructor_cube'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,data);}return {state:{planning}};},async pendingDraft(){return null;},async readDashboard(){return {};},toast(message){messages.push(message);}});
   const settle=async()=>{await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));};
   const click=async(action,id,extra={})=>{const button={dataset:{action,...(id?{id}:{}),...extra},closest(selector){return selector==='[data-action]'?this:null;},getBoundingClientRect(){return {left:100,right:218,top:200,bottom:252};}};handlers.get('click')[0]({target:button,preventDefault(){}});await settle();};
   const input=(field,value)=>{const control={dataset:{popupField:field},value:String(value),closest(){return document.popup;}};handlers.get('input')[0]({target:control});return control;};
@@ -83,13 +83,51 @@ test('untouched monthly draft does not block Day navigation across a month bound
   },{date:'2026-10-31'});
 });
 
-test('an edited monthly month or task selection still blocks leaving and reverting permits it',async()=>{
-  await fixture(async({app,change})=>{
+test('human month and checkbox edits autosave without a Save button and leave flushes only valid changes',async()=>{
+  await fixture(async({app,change,calls,document})=>{
     const month={dataset:{field:'month-plan-month'},value:'2026-12',closest(){return null;}};
-    await change(month);await assert.rejects(app.prepareLeave(),/Сохраните месячный план/);
-    month.value='2026-10';await change(month);await assert.doesNotReject(app.prepareLeave());
+    await change(month);await app.prepareLeave();assert.deepEqual(calls.at(-1),{action:'monthly_plan_approve',data:{month:'2026-12',task_ids:[]}});
     const task={dataset:{field:'month-plan-task',task:'task'},checked:true,closest(){return null;}};
-    await change(task);await assert.rejects(app.prepareLeave(),/Сохраните месячный план/);
-    task.checked=false;await change(task);await assert.doesNotReject(app.prepareLeave());
+    await change(task);await app.prepareLeave();assert.deepEqual(calls.at(-1),{action:'monthly_plan_approve',data:{month:'2026-12',task_ids:['task']}});
+    month.value='2026-99';await change(month);await assert.rejects(app.prepareLeave(),/Выберите существующий месяц/);
+    month.value='2026-11';await change(month);await assert.doesNotReject(app.prepareLeave());assert.equal(calls.at(-1).data.month,'2026-11');
   },{date:'2026-10-31'});
+});
+test('reverting an uncommitted month field does not approve a plan',async()=>{
+  await fixture(async({app,change,calls})=>{
+    const month={dataset:{field:'month-plan-month'},value:'2026-12',closest(){return null;}};await change(month);month.value='2026-10';await change(month);await app.prepareLeave();assert.deepEqual(calls,[]);
+  },{date:'2026-10-31'});
+});
+
+test('Day inspection publishes stable focus through the same serialized Work action queue',async()=>{
+  await fixture(async({app,click,input,calls})=>{
+    await click('inspect','native');await app.prepareLeave();
+    assert.equal(calls[0].action,'period_context');assert.deepEqual(calls[0].data,{date:todayIn(),cube_id:'native',task_id:'task'});
+    input('title','Queued title');await click('inspect','retained');await app.prepareLeave();
+    const actions=calls.slice(1).map(call=>call.action);assert.deepEqual(actions,['constructor_cube','period_context']);
+  },{liveContext:true});
+});
+
+
+test('an untouched open Day popup adopts agent updates without requiring blur or reopen',async()=>{
+  await fixture(async({app,click,native,document,calls})=>{
+    await click('inspect','native');native.title='Agent updated open card';app.remoteChanged();
+    assert.ok(document.popup.innerHTML.includes('Agent updated open card'));await app.prepareLeave();assert.equal(calls.length,0);
+  });
+});
+test('dirty Day popup text survives a live same-field update and cannot silently overwrite it',async()=>{
+  await fixture(async({app,click,input,native,document})=>{
+    await click('inspect','native');const control=input('title','Owner draft');native.title='Agent competing title';app.remoteChanged();
+    assert.equal(control.value,'Owner draft');await assert.rejects(app.prepareLeave(),error=>error.code==='constructor-edit-conflict');assert.equal(native.title,'Agent competing title');
+  });
+});
+
+
+test('monthly autosave preserves a newer checkbox edit made while the prior approval is in flight',async()=>{
+  let release,approvals=0;
+  await fixture(async({app,change,calls,settle})=>{
+    const month={dataset:{field:'month-plan-month'},value:'2026-12',closest(){return null;}};await change(month);const leaving=app.prepareLeave();await settle();assert.equal(typeof release,'function');
+    await change({dataset:{field:'month-plan-task',task:'task'},checked:true,closest(){return null;}});release();await leaving;
+    assert.deepEqual(calls.filter(call=>call.action==='monthly_plan_approve').map(call=>call.data),[{month:'2026-12',task_ids:[]},{month:'2026-12',task_ids:['task']}]);
+  },{date:'2026-10-31',beforeAction:async action=>{if(action==='monthly_plan_approve'&&++approvals===1)await new Promise(resolve=>{release=resolve;});}});
 });

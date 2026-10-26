@@ -9,6 +9,7 @@ from ..shared_state import encoded
 from .. import work_planning as wp
 from . import calendar_rules
 from . import timeline_rules
+from . import cube_ops
 
 
 FACT_GUARD = 'У этого блока нет исполняемого исходного кубика Work; факты и таймер изменяйте после явной подготовки исходного этапа'
@@ -22,6 +23,9 @@ def _native_ids(planning, cube):
         refs = set(cube.get('source_ids', []))
         return next((key for key, row in cubes.items() if row.get('kind') == 'calendar' and row.get('source_ref') in refs), None)
     if _proven_task_source(planning, cube['id']) is not None:
+        return cube['id']
+    if (cube.get('kind') == 'brainalot' and cube.get('library_source') and cube.get('source_active')
+            and type(cube.get('minutes')) is int and 5 <= cube['minutes'] <= 240 and cube['minutes'] % 5 == 0):
         return cube['id']
     return None
 
@@ -72,7 +76,7 @@ def _rows(snapshot):
             row['report_date'] = next(iter(dates))
         if native_id in native_cubes:
             row['report_date'] = wp._constructor_report(planning, native_cubes[native_id]).get('date')
-        row['period_can_record_progress'] = bool(row['period_native_cube_ids'] and row['status'] != 'cancelled' and not row.get('allocation_stale') and (row.get('available') or row.get('progress_percent') or row.get('actual_minutes')))
+        row['period_can_record_progress'] = bool(row['period_native_cube_ids'] and row['status'] != 'cancelled' and not row.get('allocation_stale') and not row.get('source_unavailable') and (row.get('available') or row.get('progress_percent') or row.get('actual_minutes')))
         row['period_read_only'] = not row['period_can_record_progress']
         if row['kind'] == 'calendar_optional':
             row.update(kind='calendar', source_ref=native_id and planning['constructor']['cubes'][native_id].get('source_ref') or row['id'])
@@ -103,11 +107,13 @@ def day_model(snapshot):
     """Project the accepted Day UI without mutating or returning persistent state."""
     state = snapshot.get('state') or {}
     planning = deepcopy(state.get('planning'))
+    eligible_library = any(note.get('kind') == 'task' and note.get('status') == 'active' for note in snapshot.get('library_notes') or [])
     result = {'revision': snapshot['revision'], 'initialized': snapshot['initialized'],
-        'enabled': bool(state.get('period_planner')), 'planning': planning}
+        'enabled': bool(planning and (state.get('period_planner') or eligible_library)), 'planning': planning}
     if snapshot.get('deletion_state') is not None:
         result['deletion_state'] = deepcopy(snapshot['deletion_state'])
     if not planning or not result['enabled']:
+        result['fingerprint'] = hashlib.sha256(encoded(planning).encode('utf-8')).hexdigest()
         return result
     effective, rows = _rows(snapshot)
     catalog = {row['id']: row for row in rows if row['status'] != 'cancelled'}
@@ -194,6 +200,7 @@ def day_model(snapshot):
         'days': days, 'goals': goals, 'goal_cubes': catalog, 'weeks': records['week']}
     result['period_guards'] = {row['id']: {'can_record_progress': row['period_can_record_progress'],
         'native_cube_id': row['period_native_cube_id'], 'native_cube_ids': row['period_native_cube_ids']} for row in rows}
+    result['fingerprint'] = hashlib.sha256(encoded(planning).encode('utf-8')).hexdigest()
     return result
 
 
@@ -261,7 +268,16 @@ def _facts(state, command, rows):
         # materialize the batch once. A first recalculation cannot invalidate a
         # later sibling's already proven ID halfway through this transaction.
         missing = [key for key in row['period_native_cube_ids'] if key not in native.get('constructor', {}).get('cubes', {})]
-        specs = [_proven_task_source(native, key) for key in missing]
+        specs = []
+        active_library = {note['id'] for note in command.get('_library_notes', [])
+            if note.get('kind') == 'task' and note.get('status') == 'active'}
+        for key in missing:
+            spec = _proven_task_source(native, key)
+            library_row = next((item for item in rows if item['id'] == key and item.get('kind') == 'brainalot'
+                and item.get('source_ref') in active_library), None)
+            if spec is None and library_row is not None:
+                spec = deepcopy(library_row)
+            specs.append(spec)
         if any(spec is None for spec in specs):
             raise ValidationError(FACT_GUARD)
         if specs:
@@ -272,7 +288,7 @@ def _facts(state, command, rows):
                 wp._constructor_cube_update(native, {'cube_id': key, **{field: deepcopy(spec[field]) for field in allowed if field in spec}})
             wp._constructor_allocation(native, before_materialize)
             state['planning'] = native = wp.calculate(native, reason='period_day_materialize')
-            _, rows = _rows({'state': state, 'revision': 0, 'initialized': True})
+            _, rows = _rows({'state': state, 'revision': 0, 'initialized': True, 'library_notes': command.get('_library_notes')})
             row = next(item for item in rows if item['id'] == row['id'])
         transient = _temporary_native(native, rows)
         baseline = deepcopy(transient)
@@ -293,7 +309,7 @@ def _facts(state, command, rows):
     else:
         transient = _temporary_native(native, rows)
         baseline = deepcopy(transient)
-        projection = day_model({'state': state, 'revision': 0, 'initialized': True})['planning']
+        projection = day_model({'state': state, 'revision': 0, 'initialized': True, 'library_notes': command.get('_library_notes')})['planning']
         scope = data.get('scope')
         key = data.get('date')
         goal = next((goal for goal in projection['result']['constructor']['goals'] if goal['scope'] == scope and goal['date'] == key), None)
@@ -322,15 +338,20 @@ def _facts(state, command, rows):
 
 
 def _transform(state, command):
-    from .model import apply_command, read_model
+    from .model import apply_command as period_apply_command, apply_context, read_model
     action, data = command['action'], command['data']
+    library_notes = command.get('_library_notes')
+    def apply_command(document, name, payload):
+        return period_apply_command(document, name, payload, library_notes)
+    if action == 'period_context':
+        return apply_context(state, data, library_notes)
     fields = {'constructor_select': {'cube_id', 'date', 'cube', 'start'}, 'constructor_return': {'cube_id'},
         'constructor_timeline': {'cube_id', 'date', 'start'}, 'constructor_hide': {'cube_id', 'date', 'hidden'},
         'cube_delete': {'cube_id', 'expected_note_version'}, 'cube_progress': {'cube_id', 'percent', 'actual_minutes'},
         'constructor_goal_status': {'scope', 'date', 'status'}}
     if action in fields and set(data) - fields[action]:
         raise ValidationError('Неизвестные поля команды дня')
-    snapshot = {'state': state, 'revision': 0, 'initialized': True}
+    snapshot = {'state': state, 'revision': 0, 'initialized': True, 'library_notes': library_notes}
     effective, rows = _rows(snapshot)
     cube_id = data.get('cube_id')
     row = next((row for row in rows if row['id'] == cube_id or row.get('period_native_cube_id') == cube_id), None)
@@ -363,11 +384,25 @@ def _transform(state, command):
                     _place(state, effective, {**current, 'minutes': minutes}, current['selected_date'], current.get('start'))
         native_cube = state['planning'].get('constructor', {}).get('cubes', {}).get(row.get('period_native_cube_id'), {})
         defaults = {'output': '', 'steps': [], 'comment': '', 'links': [], 'groups': []}
+        if (not native_cube and row.get('library_source') and not row.get('planned_date')
+                and {'kind', 'source_ref'} <= set(native_data)
+                and native_data.get('planned_date') in (row.get('selected_date'), state.get('period_planner', {}).get('context', {}).get('date'))):
+            # The legacy editor fills a proposal date for every unsaved source.
+            # A Library horizon is not permission to schedule it by inspection.
+            native_data.pop('planned_date', None)
         for field in list(native_data):
             if field != 'cube_id' and native_data[field] == native_cube.get(field, row.get(field, defaults.get(field))):
                 native_data.pop(field)
+        prior_details = state.get('period_planner', {}).get('cube_details', {}).get(row['id'], {})
+        details = {field: value for field, value in native_data.items() if field in cube_ops.DETAIL_FIELDS
+            and (not native_cube or field in prior_details)}
+        if details:
+            checked = cube_ops.validate_details(row, details, state['planning'])
+            state.setdefault('period_planner', {}).setdefault('cube_details', {}).setdefault(row['id'], {}).update(checked)
+            for field in details:
+                native_data.pop(field)
         if set(native_data) != {'cube_id'}:
-            if not row.get('period_native_cube_id'):
+            if not native_cube:
                 raise ValidationError(FACT_GUARD)
             native_data['cube_id'] = row['period_native_cube_id']
             state['planning'] = wp.apply_action(state['planning'], 'constructor_cube', native_data)
@@ -378,12 +413,11 @@ def _transform(state, command):
             if not isinstance(cube, dict):
                 raise ValidationError('Нужен объект исходного кубика')
             if cube.get('kind') == 'brainalot':
-                from ..core import Store
-                note = next((note for note in Store(command['_root']).list_notes() if note['id'] == cube.get('source_ref')), None)
+                note = next((note for note in library_notes or [] if note['id'] == cube.get('source_ref')), None)
                 if note is None or note.get('kind') != 'task' or note.get('status') != 'active':
                     raise ValidationError('Brainalot: исходная активная задача не найдена')
             state['planning'] = wp.apply_action(state['planning'], 'constructor_cube', {**cube, 'cube_id': cube_id})
-            effective = read_model({'state': state, 'revision': 0})
+            effective = read_model({'state': state, 'revision': 0, 'library_notes': library_notes})
             row = next((row for row in effective['cubes'] if row['id'] == cube_id), None)
         if row is None:
             raise ValidationError(FACT_GUARD)
@@ -392,9 +426,11 @@ def _transform(state, command):
             raise ValidationError('Кубик не найден в действующем плане; обновите экран')
         target_id = row['id']
         if action == 'constructor_select':
-            return apply_command(state, 'cube_move' if row.get('selected_date') else 'cube_select',
-                {'cube_id': target_id, 'date': data['date'], **({'start': data['start']} if 'start' in data else {})})
+            return apply_command(state, 'cube_drop',
+                {'cube_id': target_id, 'date': data['date'], 'start': data.get('start')})
         if action == 'constructor_return':
+            if row.get('source_unavailable'):
+                return apply_command(state, 'cube_return', {'cube_id': target_id})
             if row.get('progress_percent') or row.get('actual_minutes') or row.get('historical_facts'):
                 state['period_planner'].setdefault('placements', {})[target_id] = {'date': None, 'start': None}
                 return state
@@ -402,7 +438,7 @@ def _transform(state, command):
         if action == 'constructor_timeline':
             if data.get('date') not in (None, row.get('selected_date')):
                 raise ValidationError('timeline: кубик уже находится на другой дате')
-            return apply_command(state, 'cube_time', {'cube_id': target_id, 'start': data['start']})
+            return apply_command(state, 'cube_drop', {'cube_id': target_id, 'date': row.get('selected_date'), 'start': data['start']})
         if action == 'cube_delete':
             return apply_command(state, 'cube_delete', {'cube_id': target_id})
         if type(data.get('hidden')) is not bool:
@@ -425,6 +461,7 @@ def day_command(planner, command):
     if not isinstance(command['action'], str) or not isinstance(command['data'], dict):
         raise ValidationError('Нужны действие и объект data')
     store = planner.store
+    library_notes = planner.library.notes()
     recover(store)
     with store.db() as db:
         ensure_writable(db)
@@ -435,16 +472,20 @@ def day_command(planner, command):
         current = store._version(db)
         store.check_revision(command, current['revision'] if current else 0)
         snapshot = store._read(db, current)
-    if not (snapshot.get('state') or {}).get('period_planner'):
+        snapshot['library_notes'] = library_notes
+    eligible_library = any(note.get('kind') == 'task' and note.get('status') == 'active' for note in library_notes)
+    if not (snapshot.get('state') or {}).get('period_planner') and command['action'] != 'period_context' and not eligible_library:
         return store.planning_operation(command)
     action, data = command['action'], command['data']
     effective, rows = _rows(snapshot)
     row = next((row for row in rows if row['id'] == data.get('cube_id') or row.get('period_native_cube_id') == data.get('cube_id')), None)
     coordinated = {'constructor_select', 'constructor_return', 'constructor_timeline', 'constructor_hide',
-        'cube_delete', 'cube_progress', 'constructor_goal_status'}
+        'cube_delete', 'cube_progress', 'constructor_goal_status', 'period_context'}
     if action == 'constructor_cube' and (row is not None or data.get('cube_id') in snapshot['state']['planning'].get('constructor', {}).get('cubes', {})):
         coordinated.add(action)
-    if action == 'cube_delete' and row and row.get('kind') == 'brainalot' and row.get('period_native_cube_id'):
+    if (action == 'cube_delete' and row and row.get('kind') == 'brainalot'
+            and not row.get('source_unavailable')
+            and row.get('period_native_cube_id') in snapshot['state']['planning'].get('constructor', {}).get('cubes', {})):
         return store.planning_operation(command)
     if action not in coordinated:
         if data.get('cube_id') and row is None and data['cube_id'] in snapshot['state']['planning'].get('constructor', {}).get('cubes', {}):
@@ -464,7 +505,7 @@ def day_command(planner, command):
         snapshot = store._read(db, current)
         before = deepcopy(snapshot['state'])
         try:
-            state = _transform(deepcopy(before), {**command, '_root': store.root})
+            state = _transform(deepcopy(before), {**command, '_root': store.root, '_library_notes': library_notes})
         except ValidationError:
             raise
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
