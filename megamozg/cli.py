@@ -130,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--agent", default="agent", help="Кто предлагает: codex или claude")
     listing_proposals = work_commands.add_parser("proposals", help="Предложения и их статус")
     listing_proposals.add_argument("--status", default="pending", choices=["pending", "accepted", "rejected", "all"])
+    period = work_commands.add_parser("period", help="Планировщик Work: контекст, линейки и кубики")
+    period_commands = period.add_subparsers(dest="period_command", required=True, parser_class=Parser)
+    for name in ("model", "snapshot", "context", "command", "adopt"):
+        operation = period_commands.add_parser(name)
+        if name in {"context", "command", "adopt"}:
+            operation.add_argument("--file", type=Path, required=name in {"command", "adopt"}, help="UTF-8 JSON типизированной операции с CAS/request_id")
     plan = work_commands.add_parser("plan", help="Локальный план Work без чтения корпуса курсов")
     plan_commands = plan.add_subparsers(dest="plan_command", required=True, parser_class=Parser)
     plan_commands.add_parser("status", help="Компактное состояние, риски и ближайшие дни")
@@ -152,6 +158,23 @@ def _chats_command(root: Path, args) -> dict:
     from . import telegram_chats
     from .chats import ChatStore
     from .work_inbox import WorkInbox
+    if args.command == "work" and args.work_command == "period":
+        from .work_store import WorkStore
+        from .work_period import PeriodPlanner
+        planner = PeriodPlanner(WorkStore(root))
+        if args.period_command == "model":
+            return planner.model()
+        if args.period_command == "snapshot":
+            return planner.snapshot()
+        if args.period_command == "context" and not args.file:
+            current = planner.model()
+            return {"revision": current["revision"], "context": current["context"], "provenance": current.get("provenance", {})}
+        command = json.loads(_read_input(None, args.file, "JSON команды планировщика Work"))
+        if args.period_command == "context":
+            return planner.set_context(command)
+        if args.period_command == "adopt":
+            return planner.adopt(command)
+        return planner.command(command)
     if args.command == "work" and args.work_command == "plan":
         from uuid import uuid4
         from .work_store import WorkStore

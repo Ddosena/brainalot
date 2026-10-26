@@ -1,5 +1,7 @@
 import { createWorkConstructor } from "./work-constructor.js?v=constructor-20261023-a";
 import { t } from "./i18n.js";
+import { sharedApi } from "./time-client.js";
+import { createDayBridge } from "./work-period/day-bridge.js";
 const numeric=value=>Number.isFinite(Number(value))?Number(value):0;
 export const clampDate = (day, start, end) => !start || !end ? day : day < start ? start : day > end ? end : day;
 
@@ -60,4 +62,4 @@ export function taskRemaining(task, planning) {
 
 
 // The canonical Work transport remains owned by work-store; the constructor only projects it.
-export function createPlanning(root,ctx){return createWorkConstructor(root,ctx);}
+export function createPlanning(root,ctx){return createDayBridge(root,ctx,{createConstructor:createWorkConstructor,api:ctx.api||sharedApi,loadingText:t('Загружаем план…')});}

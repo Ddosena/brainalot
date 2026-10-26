@@ -398,14 +398,18 @@ async function sendPlanningDraft(draft) {
           remote.revision !== draft.body.expected_revision + 1) {
         throw new Error("Planning response is not a confirmed Work revision");
       }
-      // The planning endpoint changes only state.planning. Local board, drawer,
+      // Planning also coordinates period placements. Local board, drawer,
       // and image edits made during the request stay in memory and flush at the
       // new revision; the canonical server snapshot remains cached separately.
       absorbDeletionState(remote);
       if(draft.body.action==='cube_delete'&&remote.revision<revision){await del(draft.key);status('saved');notify({from:'remote'});remoteCb?.();return remote;}
       await put("canonical-cache", { revision: remote.revision, state: copy(remote.state) });
       await del(draft.key);
-      if (dirty) state.planning = copy(remote.state.planning);
+      if (dirty) {
+        state.planning = copy(remote.state.planning);
+        if (Object.hasOwn(remote.state, 'period_planner')) state.period_planner = copy(remote.state.period_planner);
+        else delete state.period_planner;
+      }
       else state = copy(remote.state);
       revision = remote.revision;
       initialized = true;

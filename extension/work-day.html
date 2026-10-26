@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="ru" data-work-enabled="false">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brainalot · Work · День</title>
+<link rel="icon" href="icons/icon-32.png">
+<link rel="stylesheet" href="work.css">
+<link rel="stylesheet" href="work-planning.css">
+<link rel="stylesheet" href="work-constructor.css?v=constructor-20261023-a">
+<link rel="stylesheet" href="work-trophy-art.css?v=constructor-20261023-a">
+
+<link rel="stylesheet" href="work-day-orbit.css">
+<link rel="stylesheet" href="work-readable-cubes.css">
+<link rel="stylesheet" href="time-ui.css">
+<style>
+html[data-work-enabled="false"] body > :not(#work-paused):not(script) { display: none !important; }
+html[data-work-enabled="true"] #work-paused { display: none !important; }
+#work-paused { display: grid; place-content: center; min-height: 100vh; padding: 2rem; text-align: center; font-family: system-ui, sans-serif; }
+#work-paused p { max-width: 34rem; line-height: 1.5; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="brand-title">Brainalot · <span class="brand-mode">Work</span></div>
+    <div class="brand-date" id="today-label"></div>
+  </div>
+  <div class="countdowns" id="countdowns"></div>
+  <div class="top-actions">
+    <div class="range-label" id="range-label"></div>
+    <div class="nav">
+      <button class="icon-btn" id="prev" title="Назад" aria-label="Назад" data-i18n-attr="title,aria-label"></button>
+      <button id="go-today" data-i18n="Сегодня">Сегодня</button>
+      <button class="icon-btn" id="next" title="Вперёд" aria-label="Вперёд" data-i18n-attr="title,aria-label"></button>
+    </div>
+    <div class="seg" id="range-seg">
+      <button data-days="7" data-i18n="Неделя">Неделя</button>
+      <button data-days="14" data-i18n="2 недели">2 недели</button>
+    </div>
+    <button class="primary" id="add-task"></button>
+    <button id="work-fullscreen" type="button" title="Развернуть Work" aria-label="Развернуть Work" data-i18n-attr="title,aria-label">Развернуть</button>
+    <div class="menu-wrap">
+      <button class="icon-btn" id="menu-btn" title="Ещё" aria-label="Ещё" data-i18n-attr="title,aria-label"></button>
+      <div class="menu" id="menu" hidden>
+        <button data-act="export" data-i18n="Сохранить копию данных">Сохранить копию данных</button>
+        <button data-act="import" data-i18n="Загрузить копию…">Загрузить копию…</button>
+      </div>
+    </div>
+    <input type="file" id="import-file" accept="application/json,.json" hidden>
+  </div>
+</header>
+<nav class="work-mode-tabs" id="work-mode-tabs" aria-label="Режим Work">
+  <a href="work.html" style="align-self:center;padding:8px 12px;color:inherit;">План</a>
+  <button type="button" id="mode-plan" aria-controls="planning-root" aria-selected="false">План</button>
+  <button type="button" id="mode-projects" aria-controls="cal-wrap" aria-selected="true">Проекты и доска</button>
+</nav>
+<div class="banner" id="banner" hidden></div>
+<main class="planning-root" id="planning-root" hidden></main>
+<section class="cal-wrap" id="cal-wrap"><div class="cal" id="calendar"></div></section>
+<div class="splitter" id="splitter" title="Потяните, чтобы поменять высоту календаря" data-i18n-attr="title"></div>
+<section class="board-wrap" id="board-wrap"></section>
+<aside class="drawer" id="drawer" inert></aside>
+<div class="toast" id="toast" hidden></div>
+<main id="work-paused" role="status">
+  <h1 data-i18n="Work временно отключён">Work временно отключён</h1>
+  <p data-i18n="Work временно отключён. Ваши задачи, доски и изображения сохранены.">Work временно отключён. Ваши задачи, доски и изображения сохранены.</p>
+</main>
+<script type="module" src="work-day-paused.js?v=constructor-20261023-a"></script>
+</body>
+</html>

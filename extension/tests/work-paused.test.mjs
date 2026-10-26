@@ -14,7 +14,7 @@ test("Work is enabled and keeps the conditional pause loader", async () => {
   assert.match(page, /Ваши задачи, доски и изображения сохранены/);
   const loader = await source("work-paused.js");
   assert.ok(loader.includes('if (WORK_ENABLED)'));
-  assert.match(loader, /if \(WORK_ENABLED\) \{\s+await import\("\.\/work-app\.js(?:\?v=[a-z0-9-]+)?"\);/);
+  assert.match(loader, /if \(WORK_ENABLED\) \{\s+await import\("\.\/work-period\/bootstrap\.js"\);/);
 });
 
 test("Work is available and the retained pause helpers still protect data", async () => {

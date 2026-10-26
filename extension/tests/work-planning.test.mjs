@@ -145,7 +145,7 @@ function browserStorage() {
 }
 
 function planningServer() {
-  let revision = 0, dropOnce = false, hold = null;
+  let revision = 0, dropOnce = false, hold = null, periodChange = null;
   let state = { version: 1, projects: [{ id: "kept" }], items: [], boards: [], view: {},
     planning: { version: 1, settings: {}, result: { days: [], cubes: [] }, completed_cubes: {} } };
   const blobs = new Map(), chunks = new Map(), receipts = new Map();
@@ -173,13 +173,15 @@ function planningServer() {
         throw Object.assign(new Error("selected cubes do not fit"), { status: 422 });
       }
       if (hold) { hold.enter(); await hold.promise; hold = null; }
-      if (body.action === "day_budget") state = { ...state, planning: { ...state.planning,
+      if (body.action === 'constructor_timeline') { /* The period namespace carries this placement. */ }
+      else if (body.action === "day_budget") state = { ...state, planning: { ...state.planning,
         settings: { ...state.planning.settings, budget_minutes: body.data.minutes } } };
       else state = { ...state, planning: { ...state.planning,
         completed_cubes: { ...state.planning.completed_cubes, [body.data.cube_id]: {
           task_id: "synthetic", date: "2030-03-04", planned_minutes: 90, percent: body.data.percent,
           actual_minutes: body.data.actual_minutes ?? 0,
         } } } };
+      if (periodChange) {state.period_planner = structuredClone(periodChange);periodChange = null;}
       revision++;
       const response = snapshot(); receipts.set(body.request_id, { body, response });
       if (dropOnce) { dropOnce = false; throw new Error("reply lost after commit"); }
@@ -189,6 +191,7 @@ function planningServer() {
   };
   return { api, readImage: async () => { throw new Error("no images"); },
     snapshot, dropNextReply: () => { dropOnce = true; },
+    changePeriodOnReply: value => {periodChange = value;},
     externalChange: () => { state.projects.push({ id: "other-tab" }); revision++; },
     holdNextPlanning: () => {
       let release, entered;
@@ -198,6 +201,27 @@ function planningServer() {
     },
   };
 }
+
+test('concurrent board save retains the Day response period placement', async () => {
+  browserStorage();
+  const server = planningServer();
+  const store = await import(`../work-store.js?period-board=${Date.now()}`);
+  store.setWorkTransport(server);
+  await store.load();
+  const placement = {placements: {c: {date: '2030-03-05', start: '15:00'}}};
+  server.changePeriodOnReply(placement);
+  const gate = server.holdNextPlanning();
+  const action = store.planningAction('constructor_timeline', {cube_id: 'c', date: '2030-03-05', start: '15:00'});
+  await gate.reached;
+  store.update(state => state.projects.push({id: 'local-board-edit'}));
+  const flushed = store.flush();
+  gate.release();
+  await action;
+  await flushed;
+  assert.equal(server.snapshot().state.projects.at(-1).id, 'local-board-edit');
+  assert.deepEqual(server.snapshot().state.period_planner, placement);
+  assert.deepEqual(store.get().period_planner, placement);
+});
 
 test("planning CAS preserves intervening board edits and retries the same durable request", async () => {
   const stores = browserStorage(), server = planningServer();

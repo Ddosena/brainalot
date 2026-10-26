@@ -51,7 +51,7 @@ def internal_view(path: str) -> str:
         return "library" if parse_qs(parsed.query).get("library-window") == ["1"] else "home"
     if page == "capture.html":
         return "capture"
-    if page == "work.html":
+    if page in {"work.html", "work-day.html"}:
         return "work"
     if page in {"library", "capture", "work", "home"}:
         return page

@@ -16,6 +16,7 @@ import {sourceImportance as canonicalSourceImportance,sourceImportanceTarget,sav
 import {isDeletedCube,normalizeDeletionState,confirmedCubeDelete} from './work-deletions.js';
 
 const safe=value=>esc(String(value??"")),copy=value=>structuredClone(value);
+const factGuardReason=()=>t("У блока нет исходного кубика Work для фактов и таймера.");
 export function compactTimelineDate(value){
   if(!/^\d{4}-\d{2}-\d{2}$/.test(String(value)))return '';
   const date=new Date(value+'T12:00:00Z');if(Number.isNaN(date.getTime())||date.toISOString().slice(0,10)!==value)return '';
@@ -101,6 +102,8 @@ export function createWorkConstructor(root,ctx){
   const decorated=c=>{const task=planning()?.tasks?.find(x=>x.id===c.task_id),segment=planning()?.task_segments?.find(x=>x.id===c.segment_id);return {...c,importance_score:sourceImportance(c),title:c.title||task?.title||"",steps:c.steps||[],output:c.output||"",comment:c.comment||"",taskTitle:task?.title||"",course:task?.course||"",segmentTitle:segment?.title||"",type:typeOf(c,segment),links:c.links||[],groups:c.groups||[]};};
   const allCubes=()=>[...model().selected,...model().possible,...model().hidden,...weekProposals(planning()||{},weekStart||nextMonday(selectedDate)),...virtualTasks(),...futureCandidates()];
   const find=id=>{const raw=canonical(id)||allCubes().find(c=>c.id===id);return raw?decorated({...raw,...drafts.get(id)}):null;};
+  const canRecordFacts=c=>{const latest=canonical(c?.id)||c;return latest?.period_can_record_progress!==false&&latest?.period_read_only!==true;};
+  function requireRecordableCube(c){if(!canRecordFacts(c))throw new Error(factGuardReason());}
   const isSelected=id=>model().selected.some(c=>c.id===id);
   const writable=()=>selectedDate>=todayIn(planning()?.settings?.timezone);
   const toast=message=>ctx.toast?.(message);
@@ -287,10 +290,10 @@ export function createWorkConstructor(root,ctx){
     }finally{deleteBusy=false;if(!disposed)render();}
   }
   function popupHtml(c){
-    if(popup.tray==="history")return historyPopupHtml(c);const selected=isSelected(c.id),week=popup.tray==="week",type=c.type||typeOf(c),locked=["calendar","weekly_review"].includes(c.kind),min=c.kind==="prep"?0:5,max=c.kind==="prep"?120:240,timer=cubeTimerState(c);
-    return '<header><span>'+safe(TYPES[type]||TYPES.task)+" · "+safe(week?t("Подготовка недели"):selected?t("Выбран в день"):t("Возможный кубик"))+'</span><button data-action="popup-close" aria-label="'+safe(t("Закрыть"))+'">'+ic("close")+'</button></header><h2 tabindex="-1">'+safe(c.title)+'</h2><p class="cc-popup-context">'+safe(c.taskTitle||c.sourceLabel||"")+(c.segmentTitle?" → "+safe(c.segmentTitle):"")+'</p>'+importanceControl(c)+'<label class="cc-range">'+safe(t("Длительность"))+'<b data-popup-duration>'+safe(minutes(c.minutes))+'</b><input type="range" data-popup-field="minutes" min="'+min+'" max="'+max+'" step="5" value="'+c.minutes+'" '+(locked?"disabled":"")+' aria-label="'+safe(t("Длительность кубика"))+'"></label><label class="cc-range">'+safe(t("Готовность"))+'<b data-popup-percent>'+formatReadiness(c.progress_percent)+'%</b><input type="range" data-popup-field="progress_percent" min="0" max="100" step="5" value="'+(c.progress_percent||0)+'" aria-label="'+safe(t("Готовность кубика"))+'"></label><label class="cc-actual">'+safe(t("Факт, мин"))+'<input type="number" data-popup-field="actual_minutes" min="0" max="100000" value="'+Math.round(c.actual_minutes||0)+'"></label>'+
+    if(popup.tray==="history")return historyPopupHtml(c);const selected=isSelected(c.id),week=popup.tray==="week",type=c.type||typeOf(c),locked=["calendar","weekly_review"].includes(c.kind),min=c.kind==="prep"?0:5,max=c.kind==="prep"?120:240,timer=cubeTimerState(c),factHint=canRecordFacts(c)?"":' title="'+safe(factGuardReason())+'"',factDisabled=canRecordFacts(c)?"":' disabled'+factHint;
+    return '<header><span>'+safe(TYPES[type]||TYPES.task)+" · "+safe(week?t("Подготовка недели"):selected?t("Выбран в день"):t("Возможный кубик"))+'</span><button data-action="popup-close" aria-label="'+safe(t("Закрыть"))+'">'+ic("close")+'</button></header><h2 tabindex="-1">'+safe(c.title)+'</h2><p class="cc-popup-context">'+safe(c.taskTitle||c.sourceLabel||"")+(c.segmentTitle?" → "+safe(c.segmentTitle):"")+'</p>'+importanceControl(c)+'<label class="cc-range">'+safe(t("Длительность"))+'<b data-popup-duration>'+safe(minutes(c.minutes))+'</b><input type="range" data-popup-field="minutes" min="'+min+'" max="'+max+'" step="5" value="'+c.minutes+'" '+(locked?"disabled":"")+' aria-label="'+safe(t("Длительность кубика"))+'"></label><label class="cc-range">'+safe(t("Готовность"))+'<b data-popup-percent>'+formatReadiness(c.progress_percent)+'%</b><input type="range" data-popup-field="progress_percent" min="0" max="100" step="5" value="'+(c.progress_percent||0)+'" aria-label="'+safe(t("Готовность кубика"))+'"'+factDisabled+'></label><label class="cc-actual"'+factHint+'>'+safe(t("Факт, мин"))+'<input type="number" data-popup-field="actual_minutes" min="0" max="100000" value="'+Math.round(c.actual_minutes||0)+'"'+factDisabled+'></label>'+
       (week?'<label>'+safe(t("Дата подготовки"))+'<input type="date" data-popup-field="planned_date" value="'+safe(c.planned_date)+'"></label><p>'+safe(t("Появится в возможных"))+" "+safe(dateLabel(c.planned_date,true))+'</p>':"")+
-      (selected?'<section class="cc-popup-timer"><div><b data-timer>'+formatTime(timer.remaining_ms)+'</b><span data-timer-status>'+safe(timer.status)+'</span></div><div><button data-action="timer-start">'+safe(t("Приступить"))+'</button><button data-action="timer-pause">'+safe(t("Пауза"))+'</button><button data-action="timer-stop">'+safe(t("Стоп"))+'</button><button data-action="done">'+safe(t("Готово"))+'</button></div><small>'+safe(t("Время не меняет готовность. Следующий кубик запускается вручную."))+'</small></section>':"")+
+      (selected?'<section class="cc-popup-timer"><div><b data-timer>'+formatTime(timer.remaining_ms)+'</b><span data-timer-status>'+safe(timer.status)+'</span></div><div><button data-action="timer-start"'+factDisabled+'>'+safe(t("Приступить"))+'</button><button data-action="timer-pause">'+safe(t("Пауза"))+'</button><button data-action="timer-stop">'+safe(t("Стоп"))+'</button><button data-action="done"'+factDisabled+'>'+safe(t("Готово"))+'</button></div><small>'+safe(t("Время не меняет готовность. Следующий кубик запускается вручную."))+'</small></section>':"")+
       '<div class="cc-popup-actions">'+(week?'<button class="cc-primary" data-action="preview-date" data-date="'+safe(c.planned_date)+'">'+safe(t("Посмотреть в плане"))+" "+safe(dateLabel(c.planned_date))+'</button>':selected?'<button data-action="return" data-id="'+safe(c.id)+'">'+safe(t("В возможные"))+'</button><button data-action="'+(c.start==null?"on-timeline":"float")+'" data-id="'+safe(c.id)+'">'+safe(c.start==null?t("На шкалу"):t("В россыпь"))+'</button>':'<button class="cc-primary" data-action="select" data-id="'+safe(c.id)+'" '+(c.allocation_stale?'disabled':'')+'>'+safe(t("В день"))+'</button>')+(!week?'<button data-action="hide" data-id="'+safe(c.id)+'">'+safe(t("Не сегодня"))+'</button>':"")+'</div>'+resourcesHtml(c)+
       '<details class="cc-popup-details" data-fold="details"><summary>'+safe(t("Подробности"))+'</summary><label>'+safe(t("Название"))+'<input data-popup-field="title" maxlength="300" value="'+safe(c.title)+'"></label><label>'+safe(t("Шаги"))+'<textarea data-popup-field="steps" rows="2">'+safe((c.steps||[]).join("\n"))+'</textarea></label><label>'+safe(t("Ожидаемый результат"))+'<textarea data-popup-field="output" rows="2">'+safe(c.output)+'</textarea></label><label>'+safe(t("Комментарий агенту"))+'<textarea data-popup-field="comment" rows="2">'+safe(c.comment)+'</textarea></label></details><p class="cc-popup-save" data-popup-save>'+safe(popupConflicts.has(c.id)?t("Поле изменилось в другой вкладке. Черновик сохранён — выберите нужную версию."):t("Изменения сохраняются в Work"))+'</p>'+(popupConflicts.has(c.id)?'<div class="cc-popup-actions"><button data-action="popup-latest">'+safe(t("Взять актуальную версию"))+'</button><button data-action="popup-overwrite">'+safe(t("Сохранить мой вариант"))+'</button></div>':'')+deleteControls(c);
   }
@@ -324,7 +327,13 @@ export function createWorkConstructor(root,ctx){
     return enqueuePopupSave(id,()=>savePopupNow(id,tray));
   }
   async function savePopupNow(id,tray){
-    if(disposed)return;const draft=drafts.get(id);if(!draft||!dirtyFields.get(id)?.size)return;const sent=JSON.stringify(draft),dirty=new Set(dirtyFields.get(id)||[]),c={...find(id),...copy(draft)};let celebration=null;
+    if(disposed)return;const draft=drafts.get(id);if(!draft||!dirtyFields.get(id)?.size)return;
+    const dirty=new Set(dirtyFields.get(id)||[]);
+    // A refreshed Day projection can revoke factual identity after a draft was
+    // opened. Drop only those stale fact fields; metadata remains editable.
+    if(!canRecordFacts(canonical(id)||find(id)))for(const key of ["progress_percent","actual_minutes"]){dirty.delete(key);dirtyFields.get(id)?.delete(key);delete draft[key];}
+    if(!dirty.size){drafts.delete(id);dirtyFields.delete(id);return;}
+    const sent=JSON.stringify(draft),c={...find(id),...copy(draft)};let celebration=null;
     requireMutableCube(c);
     try{
       if(tray!=="week"&&!model().initialized)await ensureDay();
@@ -336,10 +345,11 @@ export function createWorkConstructor(root,ctx){
       },{quiet:true});
       const report=canonical(id);
       if(dirty.has("progress_percent")||dirty.has("actual_minutes")){
+        requireRecordableCube(c);
         const percent=dirty.has("progress_percent")?Math.round(clamp(c.progress_percent,0,100)):Number(report?.progress_percent)||0;
         let actual=dirty.has("actual_minutes")?Number(c.actual_minutes)||0:Number(report?.actual_minutes)||0;celebration=completionClaims.reserve(id,report,{progress_percent:percent});const celebrate=!!celebration,origin=celebrate?cubeElement(id)?.getBoundingClientRect():null;if(celebrate)pendingBlocks.add(id);
         if(percent>=100)actual=Math.max(actual,await measureStoppedCube(c));
-        await commit("cube_progress",()=>{const latest=canonical(id);constructorPatch(base,c,latest,new Set([...dirty].filter(key=>["progress_percent","actual_minutes"].includes(key))));const latestPercent=dirty.has("progress_percent")?percent:Number(latest?.progress_percent)||0,latestActual=dirty.has("actual_minutes")?Number(c.actual_minutes)||0:Number(latest?.actual_minutes)||0;return {cube_id:id,percent:latestPercent,actual_minutes:Math.round(latestPercent>=100?Math.max(actual,latestActual):latestActual)};},{quiet:true});if(celebrate)completionFlight(c,origin,celebration);
+        await commit("cube_progress",()=>{requireRecordableCube(c);const latest=canonical(id);constructorPatch(base,c,latest,new Set([...dirty].filter(key=>["progress_percent","actual_minutes"].includes(key))));const latestPercent=dirty.has("progress_percent")?percent:Number(latest?.progress_percent)||0,latestActual=dirty.has("actual_minutes")?Number(c.actual_minutes)||0:Number(latest?.actual_minutes)||0;return {cube_id:id,percent:latestPercent,actual_minutes:Math.round(latestPercent>=100?Math.max(actual,latestActual):latestActual)};},{quiet:true});if(celebrate)completionFlight(c,origin,celebration);
       }
       popupConflicts.delete(id);const updated=canonical(id);if(updated){const nextBase=copy(popupBases.get(id)||updated);for(const key of dirty){if(key==="resources")Object.assign(nextBase,{links:copy(updated.links||[]),groups:copy(updated.groups||[]),resource_drafts:copy(updated.resource_drafts||{links:updated.links||[],groups:updated.groups||[]})});else nextBase[key]=copy(updated[key]);}if(dirty.has("progress_percent")&&Number(c.progress_percent)>=100)nextBase.actual_minutes=updated.actual_minutes;popupBases.set(id,nextBase);}if(JSON.stringify(drafts.get(id))===sent){drafts.delete(id);dirtyFields.delete(id);}
       const label=popup?.id===id?document.querySelector("[data-popup-save]"):null;if(label)label.textContent=t("Сохранено в Work");geometries.delete(id);
@@ -357,10 +367,11 @@ export function createWorkConstructor(root,ctx){
     const orbit=$(".cc-orbit-host");if(orbit){const m=model();orbit.innerHTML=orbitHtml({...m,selected:m.selected.map(item=>item.id===c.id?{...item,...c}:item)});mountOrbitFeatures(orbit);}
   }
   async function measureStoppedCube(c){
-    await stopCubeTimer(c);const saved=Number(canonical(c.id)?.actual_minutes)||0,measured=await recordedCubeMinutes(c),actual=Math.max(saved,measured,Number(drafts.get(c.id)?.actual_minutes)||0);
+    requireRecordableCube(c);await stopCubeTimer(c);const saved=Number(canonical(c.id)?.actual_minutes)||0,measured=await recordedCubeMinutes(c),actual=Math.max(saved,measured,Number(drafts.get(c.id)?.actual_minutes)||0);
     return actual;
   }
   async function stopAndMeasure(c){
+    if(!canRecordFacts(c)){if(["running","paused"].includes(cubeTimerState(c).status))await stopCubeTimer(c);return;}
     const saved=Number(canonical(c.id)?.actual_minutes)||0,actual=await measureStoppedCube(c);
     if(actual>saved)await commit("cube_progress",{cube_id:c.id,percent:Number(c.progress_percent)||0,actual_minutes:actual},{quiet:true});
   }
@@ -500,7 +511,7 @@ export function createWorkConstructor(root,ctx){
     if(name==="week-add")return weekAdd();
     if(name==="week-split")return weekSplit();
     if(name.startsWith("timer-")||name==="done"){
-      if(!c)return;await savePopup();
+      if(!c)return;if(name==="timer-start"||name==="done")requireRecordableCube(c);await savePopup();if(name==="timer-start"||name==="done")requireRecordableCube(c);
       if(name==="timer-start")await startCubeTimer(c);else if(name==="timer-pause")await pauseCubeTimer(c);else await stopAndMeasure(c);
       if(name==="done"&&Number(canonical(c.id)?.progress_percent)<100){const celebration=completionClaims.reserve(c.id,canonical(c.id),{progress_percent:100}),celebrate=!!celebration,origin=cubeElement(c.id)?.getBoundingClientRect();if(celebrate)pendingBlocks.add(c.id);try{await commit("cube_progress",{cube_id:c.id,percent:100,actual_minutes:Math.max(Number(c.actual_minutes)||0,await recordedCubeMinutes(c))});drafts.delete(c.id);if(celebrate)completionFlight(c,origin,celebration);}catch(cause){if(celebration&&completionClaims.release(c.id,celebration))pendingBlocks.delete(c.id);render();throw cause;}}updateTimers();if(popup)renderPopup();return;
     }
@@ -527,7 +538,7 @@ export function createWorkConstructor(root,ctx){
     if(el.dataset.field==="search"){search=el.value;render();return;}
     if(el.dataset.field==="energy"){const label=$("[data-energy]");if(label)label.textContent=el.value;return;}
     if(!popup)return;
-    const c=getPopupCube(),draft=drafts.get(c.id)||copy(c);drafts.set(c.id,draft);
+    const c=getPopupCube();if(["progress_percent","actual_minutes"].includes(el.dataset.popupField)&&!canRecordFacts(c))return;const draft=drafts.get(c.id)||copy(c);drafts.set(c.id,draft);
     if(el.dataset.popupField){
       const field=el.dataset.popupField;const dirty=dirtyFields.get(c.id)||new Set();dirty.add(field);dirtyFields.set(c.id,dirty);
       draft[field]=["minutes","actual_minutes","progress_percent"].includes(field)?Math.max(0,Number(el.value)||0):field==="steps"?el.value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean):el.value;

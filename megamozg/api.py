@@ -29,6 +29,7 @@ from .chats import ChatStore
 from .work_inbox import WorkInbox
 from .shared_state import SharedState
 from .work_store import WorkStore
+from .work_period import PeriodPlanner
 from .time_tracking import TimeStore
 from .browser_bridge import BrowserBridge
 from .spotify import SpotifyController
@@ -45,6 +46,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     work_inbox = WorkInbox(root, chats) if features.WORK_ENABLED else None
     shared = SharedState(root)
     work = WorkStore(root) if features.WORK_ENABLED else None
+    period = PeriodPlanner(work) if work is not None else None
     timer = TimeStore(root)
     browser = BrowserBridge(root)
     spotify = spotify_controller if spotify_controller is not None else SpotifyController(
@@ -340,6 +342,38 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     def work_state(request: Request):
         return conditional_json(request, work.read())
 
+    @app.get("/api/work/period/model")
+    def work_period_model():
+        return period.model()
+
+    @app.get("/api/work/period/day")
+    def work_period_day():
+        return period.day_model()
+
+    @app.get("/api/work/period/snapshot")
+    def work_period_snapshot():
+        return period.snapshot()
+
+    @app.get("/api/work/period/context")
+    def work_period_context():
+        current = period.model()
+        return {"context": current["context"], "revision": current["revision"], "provenance": current.get("provenance", {})}
+
+    @app.post("/api/work/period/context")
+    async def work_period_context_update(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "patch"})
+        return await run_in_threadpool(period.set_context, data)
+
+    @app.post("/api/work/period/command")
+    async def work_period_command(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "action", "data"})
+        return await run_in_threadpool(period.command, data)
+
+    @app.post("/api/work/period/adopt")
+    async def work_period_adopt(request: Request):
+        data = await payload(request, {"request_id", "expected_revision", "source_blob"})
+        return await run_in_threadpool(period.adopt, data)
+
     @app.post("/api/work/blobs/{blob}/chunks")
     async def work_chunk(blob: str, request: Request):
         data = await payload(request, {"index", "total", "content_base64"})
@@ -353,7 +387,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     @app.post("/api/work/planning")
     async def work_planning(request: Request):
         data = await payload(request, {"request_id", "expected_revision", "action", "data"})
-        return await run_in_threadpool(work.planning_operation, data)
+        return await run_in_threadpool(period.day_command, data)
 
     @app.get("/api/work/images/{image_id}")
     def work_image(image_id: str):
