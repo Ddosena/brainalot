@@ -10,7 +10,11 @@ await initI18n();
 if (!await syncLocale()) {
   applyDocument();
   configurePeriodTransport(createConnection(globalThis.chrome));
-  await import('./app.js');
+  const planner=await import('./app.js');
+  const {installWorkViewLifecycle}=await import('../work-view-lifecycle.js');
+  const lifecycle=installWorkViewLifecycle({prepareLeave:planner.prepareLeave});
+  planner.onModelReady(()=>lifecycle.ready());
+  try{await planner.ready();lifecycle.ready();}catch(error){lifecycle.ready(error);}
   globalThis.chrome?.storage?.onChanged?.addListener(changes => {
     if (localeChange(changes)) globalThis.location?.reload();
   });

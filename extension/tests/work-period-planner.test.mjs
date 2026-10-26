@@ -272,3 +272,17 @@ test('context selection during an in-flight work edit waits for its own new revi
     release();await Promise.all([edit,selection]);assert.deepEqual(calls.map(call=>call.body.expected_revision),[1,2]);assert.equal(client.plannerState().contextValue.mode,'month');
   },{rawContext:true});
 });
+
+
+test('unified Week has one four-week horizon toggle and no repeated mode or permanent hint',async()=>{
+  const state=structuredClone(base),calls=[];
+  await withClientTransport(aliasTransport(state,calls),async(client,nodes)=>{
+    const toolbar=()=>nodes.get('planner').innerHTML.match(/<header class="planner-toolbar">([\s\S]*?)<\/header>/)[1];
+    assert.equal((toolbar().match(/data-action="set-mode"/g)||[]).length,1);
+    assert.match(toolbar(),/data-mode="month" aria-pressed="false">4 недели/);
+    assert.ok(!toolbar().includes('Период задачи →'));assert.ok(!toolbar().includes('>Неделя<'));
+    await client.updateContext({mode:'month'});
+    assert.match(toolbar(),/data-mode="week" aria-pressed="true">4 недели/);
+    assert.equal((nodes.get('planner').innerHTML.match(/data-testid="day-cell"/g)||[]).length,28);
+  });
+});

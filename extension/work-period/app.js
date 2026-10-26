@@ -2,6 +2,12 @@ import {t,localeTag} from '../i18n.js';
 import {ui,uiMarkup} from './ui-text.js';
 import {periodRequest} from './transport.js';
 const DAY_MS = 86400000;
+let resolveReady,rejectReady;
+const firstModel=new Promise((resolve,reject)=>{resolveReady=resolve;rejectReady=reject;});
+firstModel.catch(()=>{});
+export const ready=()=>firstModel;
+const readyListeners=new Set();let modelAnnounced=false;
+export function onModelReady(callback){readyListeners.add(callback);if(modelAnnounced)callback();return ()=>readyListeners.delete(callback);}
 export const ARROW_TOP_GUTTER=24,ARROW_BOTTOM_GUTTER=96;
 export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 export function addDays(date, days) { return new Date(Date.parse(`${date}T12:00:00Z`) + days * DAY_MS).toISOString().slice(0,10); }
@@ -284,7 +290,7 @@ function notify(message, error = false) {
   const node = document.getElementById('notice');
   node.hidden = false; node.className = `notice ${error ? 'is-error' : 'is-success'}`; node.textContent = message;
 }
-function setSync(message, error = false) { const node = document.getElementById('sync-status'); node.textContent = message; node.classList.toggle('is-error',error); }
+function setSync(message, error = false) { const node = document.getElementById('sync-status'); if(node){node.textContent = message; node.classList.toggle('is-error',error);} }
 function normalizeModel(value) { return {...value,projects:value.projects || [],tasks:value.tasks || [],cubes:value.cubes || [],events:value.events || [],warnings:value.warnings || [],settings:value.settings || {}}; }
 function acceptModel(value, force = false) {
   const next = normalizeModel(value);
@@ -296,6 +302,7 @@ function acceptModel(value, force = false) {
   if(inlineEdit && !inlineEdit.saving && namedObject(inlineEdit.kind,inlineEdit.id)?.title!==inlineEdit.original)inlineEdit.conflicted=true;
   mergeIds = new Set([...mergeIds].filter(id => model.cubes.some(cube => cube.id === id && cube.available !== false)));
   render(); setSync(ui`Сохранено · версия ${model.revision}`);
+  if(!modelAnnounced){modelAnnounced=true;for(const callback of readyListeners)callback();}
 }
 export async function refresh(force=false) {
   if (fetchPending || busy || contextPending || (!force && gestureActive())) {if(fetchPending || gestureActive())refreshQueued=true;return;}
@@ -556,7 +563,7 @@ function render() {
   const scrollPositions = [...node.querySelectorAll('.cube-grid,.project-task-list,.ribbon-area,.timeline-scroll,[data-arrow-viewport]')].map(item => item.scrollTop);
   const start = context.mode === 'month' ? context.window_start || context.week_start : context.week_start;
   const end = addDays(start,context.mode === 'month' ? 27 : 6);
-  node.innerHTML = ui`<div class="planner-layout"><div class="planning-main"><header class="planner-toolbar"><div><h1>План работы</h1><p>Период задачи → выбор дня → кубики и время</p></div><div class="view-switch" aria-label="Масштаб плана"><button data-action="set-mode" data-mode="week" aria-pressed="${context.mode === 'week'}">Неделя</button><button data-action="set-mode" data-mode="month" aria-pressed="${context.mode === 'month'}">Месяц</button></div></header><div class="calendar-nav"><div class="range-navigation"><button class="triangle-button" data-action="navigate" data-direction="-1" aria-label="${context.mode==='month' ? t('Предыдущие четыре недели') : t('Предыдущая неделя')}">${icon('left')}</button><span class="range-label">${shortDate(start)} — ${shortDate(end)}</span><button class="triangle-button" data-action="navigate" data-direction="1" aria-label="${context.mode==='month' ? t('Следующие четыре недели') : t('Следующая неделя')}">${icon('right')}</button></div><label class="past-toggle"><input type="checkbox" data-action="show-past"${hidePast ? '' : ' checked'}>Прошедшие даты</label></div>${model.warnings.length ? ui`<details class="warnings"><summary>Уточнения к плану · ${model.warnings.length}</summary><ul>${model.warnings.map(warning => `<li>${escapeHtml(typeof warning === 'string' ? warning : warning.message || warning.title || JSON.stringify(warning))}</li>`).join('')}</ul></details>` : ''}${renderCalendar()}${renderTaskEditor()}${renderWorkspace()}</div>${renderProjects()}</div><div id="inline-name-editor-host">${renderInlineNameEditor()}</div><div id="arrow-tooltip-host"></div><div id="ruler-manager-host">${renderRulerEditor()}</div>`;
+  node.innerHTML = ui`<div class="planner-layout"><div class="planning-main"><header class="planner-toolbar"><div><h1>План работы</h1></div><div class="view-switch" aria-label="Масштаб плана"><button data-action="set-mode" data-mode="${context.mode==='month'?'week':'month'}" aria-pressed="${context.mode==='month'}">${t('4 недели')}</button></div></header><div class="calendar-nav"><div class="range-navigation"><button class="triangle-button" data-action="navigate" data-direction="-1" aria-label="${context.mode==='month' ? t('Предыдущие четыре недели') : t('Предыдущая неделя')}">${icon('left')}</button><span class="range-label">${shortDate(start)} — ${shortDate(end)}</span><button class="triangle-button" data-action="navigate" data-direction="1" aria-label="${context.mode==='month' ? t('Следующие четыре недели') : t('Следующая неделя')}">${icon('right')}</button></div><label class="past-toggle"><input type="checkbox" data-action="show-past"${hidePast ? '' : ' checked'}>Прошедшие даты</label></div>${model.warnings.length ? ui`<details class="warnings"><summary>Уточнения к плану · ${model.warnings.length}</summary><ul>${model.warnings.map(warning => `<li>${escapeHtml(typeof warning === 'string' ? warning : warning.message || warning.title || JSON.stringify(warning))}</li>`).join('')}</ul></details>` : ''}${renderCalendar()}${renderTaskEditor()}${renderWorkspace()}</div>${renderProjects()}</div><div id="inline-name-editor-host">${renderInlineNameEditor()}</div><div id="arrow-tooltip-host"></div><div id="ruler-manager-host">${renderRulerEditor()}</div>`;
   [...node.querySelectorAll('[data-draft]')].forEach(input => {if (drafts.has(input.dataset.draft)) {if(input.type==='checkbox')input.checked=Boolean(drafts.get(input.dataset.draft));else input.value = drafts.get(input.dataset.draft);}});
   if (focusDraft) {const restore = [...node.querySelectorAll('[data-draft]')].find(input => input.dataset.draft === focusDraft); if (restore) {restore.focus({preventScroll:true}); try {if (selection?.[0] !== null) restore.setSelectionRange(...selection);} catch { /* Date and time inputs do not have a text selection. */ }}}
   else if(focusTimeline){const restore=[...node.querySelectorAll('[data-timeline-resize]')].find(item=>item.dataset.timelineResize===focusTimeline.edge && item.dataset.cubeId===focusTimeline.id);restore?.focus({preventScroll:true});}
@@ -800,6 +807,27 @@ async function dropCube(event) {
   }finally{gestureCommitPending=false;await refresh();}
 }
 export function plannerState(){return {model,contextValue:context,gestureActive:gestureActive(),inlineEdit,rulerEditor};}
+export async function prepareLeave(){
+  if(gestureActive())throw new Error(t('Завершите перемещение кубика перед переходом.'));
+  await contextQueue;await commandSettled;
+  if(inlineEdit){
+    await inlineEdit.ready;
+    if(inlineEdit.saving)await commandSettled;
+    else await commitInlineRename(inlineEdit.value);
+    if(inlineEdit)throw new Error(document.getElementById('notice')?.textContent||t('Сохраните название перед переходом.'));
+  }
+  await contextQueue;await commandSettled;
+  const inputs=[...document.getElementById('planner').querySelectorAll('[data-draft]')];
+  for(const [key,value] of drafts){
+    const input=inputs.find(input=>input.dataset.draft===key);
+    if(input && String(value)===String(input.type==='checkbox'?input.defaultChecked:input.defaultValue))drafts.delete(key);
+  }
+  if(drafts.size){
+    const first=inputs.find(input=>drafts.has(input.dataset.draft));first?.focus?.({preventScroll:false});
+    const message=t('Сохраните изменения в полях перед переходом.');notify(message,true);throw new Error(message);
+  }
+  return {date:context.date,mode:'week'};
+}
 if (hasDOM) {
   const root = document.getElementById('planner');
   root.addEventListener('click',onClick); root.addEventListener('change',onChange); root.addEventListener('submit',onSubmit);
@@ -813,5 +841,5 @@ if (hasDOM) {
   root.addEventListener('dragstart',dragStart);root.addEventListener('dragover',dragOver);root.addEventListener('drop',dropCube);root.addEventListener('dragend',()=>{nativeDragActive=false;currentDragCubeId=null;clearDragHints();void refresh();});
 
   window.addEventListener('resize',()=>{[...document.getElementById('planner').querySelectorAll('[data-arrow-panel]')].forEach(settleArrowLabels);});
-  refresh(); poll = setInterval(refresh,750); window.addEventListener('pagehide',() => clearInterval(poll),{once:true});
+  refresh().then(()=>model?resolveReady(model):rejectReady(new Error(t('План пока недоступен. Подключение повторится автоматически.')))); poll = setInterval(refresh,750); window.addEventListener('pagehide',() => clearInterval(poll),{once:true});
 }

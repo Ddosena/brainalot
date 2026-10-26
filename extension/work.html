@@ -1,32 +1,9 @@
 <!doctype html>
-<html lang="ru" data-work-enabled="false">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0d202b">
-  <title>Brainalot · Work</title>
-  <link rel="icon" href="icons/icon-32.png">
-  <link rel="stylesheet" href="work-period/styles.css">
-</head>
-<body>
-  <header class="app-header">
-    <a class="brand" href="panel.html" aria-label="Brainalot">
-      <svg viewBox="0 0 28 30" aria-hidden="true"><path d="m14 2 12 7v13l-12 7-12-7V9Z M2 9l12 7 12-7 M14 16v13"/></svg>
-      <span>Brainalot <b>Work</b></span>
-    </a>
-    <nav class="work-navigation" aria-label="Режим Work" data-i18n-attr="aria-label">
-      <a href="work.html" aria-current="page" data-i18n="План">План</a>
-      <a href="work-day.html" data-i18n="День">День</a>
-    </nav>
-    <output id="sync-status" class="sync-status" aria-live="polite" data-i18n="Подключение…">Подключение…</output>
-  </header>
-  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-  <main id="planner" aria-busy="true"><div class="loading-state" data-i18n="Загружаем план…">Загружаем план…</div></main>
-  <main id="work-paused" role="status">
-    <h1 data-i18n="Work временно отключён">Work временно отключён</h1>
-    <p data-i18n="Work временно отключён. Ваши задачи, доски и изображения сохранены.">Work временно отключён. Ваши задачи, доски и изображения сохранены.</p>
-  </main>
-  <noscript data-i18n="Для планирования нужен JavaScript.">Для планирования нужен JavaScript.</noscript>
-  <script type="module" src="work-paused.js"></script>
-</body>
-</html>
+<html lang="ru" data-work-enabled="false"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brainalot · Work</title><link rel="icon" href="icons/icon-32.png"><link rel="stylesheet" href="work-shell.css"></head><body>
+<header class="work-shell-bar"><span class="work-shell-brand"><svg viewBox="0 0 28 30" aria-hidden="true"><path d="m14 2 12 7v13l-12 7-12-7V9Z M2 9l12 7 12-7 M14 16v13"/></svg><span>Brainalot <b>Work</b></span></span>
+<nav class="work-shell-modes" aria-label="Режим Work" data-i18n-attr="aria-label"><button data-work-mode="day" aria-pressed="true" data-i18n="День" disabled>День</button><button data-work-mode="week" aria-pressed="false" data-i18n="Неделя" disabled>Неделя</button></nav>
+<div class="work-shell-secondary" id="day-tools"><button class="work-shell-icon" data-work-mode="history" aria-label="История" title="История" data-i18n-attr="aria-label,title" disabled><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5v4h4M3 9a7 7 0 1 1 1 5M10 6v5l3 2"/></svg></button></div>
+<button class="work-shell-icon" id="work-shell-fullscreen" aria-label="Развернуть Work" title="Развернуть Work" data-i18n-attr="aria-label,title"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 8V3h5M12 3h5v5M17 12v5h-5M8 17H3v-5"/></svg></button></header>
+<div class="work-shell-feedback"><output class="work-shell-status" id="work-shell-status" role="status" aria-live="polite"></output><button id="work-shell-retry" hidden data-i18n="Повторить">Повторить</button></div><iframe id="work-view" title="Work"></iframe>
+<main id="work-paused" role="status"><h1 data-i18n="Work временно отключён">Work временно отключён</h1><p data-i18n="Work временно отключён. Ваши задачи, доски и изображения сохранены.">Work временно отключён. Ваши задачи, доски и изображения сохранены.</p></main>
+<script type="module" src="work-paused.js"></script></body></html>

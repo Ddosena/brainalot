@@ -48,7 +48,7 @@ test('late older reads cannot replace a newer Day projection', async () => {
 
 test('failed initial projection never exposes an editable raw schedule', async () => {
   const f = fixture(async () => {throw new Error('Unavailable');});
-  await f.bridge.ready();
+  await assert.rejects(f.bridge.ready(),/Unavailable/);
   assert.equal(f.ctx(), undefined);
   assert.equal(f.root.textContent, 'Unavailable');
 });

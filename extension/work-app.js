@@ -12,6 +12,7 @@ import { createDrawer } from "./work-drawer.js";
 import { createBoard } from "./work-board.js";
 import { createPlanning } from "./work-planning.js?v=constructor-20261023-a";
 import { applyDocument, localeChange, syncLocale, t } from "./i18n.js";
+import {installWorkViewLifecycle} from './work-view-lifecycle.js';
 
 const $ = s => document.querySelector(s);
 const THEME_KEY = "panel:theme";
@@ -362,7 +363,29 @@ function bindChrome() {
   });
 }
 
+async function mainEmbedded() {
+  const lifecycle=installWorkViewLifecycle({async prepareLeave(){if(!planning)throw new Error(t('План пока не загружен'));const result=await planning.prepareLeave();await store.flush();if(await store.getPendingPlanningDraft())throw new Error(t('Сначала разрешите неподтверждённый запрос Work.'));return result;}});
+  try{
+  applyDocument();
+  if(await syncLocale())return;
+  await store.load();
+  if(!store.isInitialized())throw new Error(t('План пока не загружен'));
+  const query=new URLSearchParams(location.search);
+  planning=createPlanning($('#planning-root'),{
+    get state(){return store.get();},
+    initialMode:query.get('mode')==='history'?'month':'day',initialDate:query.get('date'),embeddedNavigation:true,
+    action:store.planningAction,pendingDraft:store.getPendingPlanningDraft,deletionState:store.getDeletionState,
+    refreshWork:store.refreshRemote,retryDraft:store.retryPlanningDraft,discardDraft:store.discardPlanningDraft,
+    openWorkspace:item=>openWorkspace(item),openCubeWorkspace:(item,onlyGroup=null)=>tabs.openWorkspace(item,onlyGroup),
+    readDashboard:()=>sharedApi('/api/dashboard'),toast,
+  });
+  store.subscribe(()=>planning.remoteChanged());
+  await planning.ready();lifecycle.ready();
+  }catch(error){lifecycle.ready(error);throw error;}
+}
+
 async function main() {
+  if(new URLSearchParams(location.search).get('embedded-work')==='1')return mainEmbedded();
   applyDocument();
   if (globalThis.chrome?.storage) {
     if (await syncLocale()) return;

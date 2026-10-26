@@ -33,9 +33,11 @@ test('transport preserves conflict status and refuses arbitrary routes without s
   await assert.rejects(transport('/api/other'),/Unknown Work endpoint/);assert.equal(calls,1);
 });
 
-test('primary Plan and retained Day use bundled relative entries and their feature guard', async () => {
+test('common Work shell and bundled children keep their feature guard', async () => {
   const plan=await source('work.html'),day=await source('work-day.html'),boot=await source('work-period/bootstrap.js');
-  assert.match(plan,/href="work-day.html"[^>]*>День/);assert.match(plan,/href="work.html" aria-current="page"/);
+  assert.match(plan,/data-work-mode="day"/);assert.match(plan,/data-work-mode="week"/);assert.match(plan,/id="work-view"/);
+  assert.doesNotMatch(day,/mode-projects|board-wrap|work-mode-tabs/);
+  assert.match(await source('work-period.html'),/id="sync-status" hidden/);
   assert.match(day,/src="work-day-paused.js/);assert.match(await source('work-day-paused.js'),/await import\("\.\/work-app.js/);
   assert.match(await source('work-paused.js'),/if \(WORK_ENABLED\)/);
   assert.ok(boot.indexOf("await import('../desktop-platform.js')")<boot.indexOf('configurePeriodTransport(createConnection'));

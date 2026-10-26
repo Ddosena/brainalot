@@ -47,7 +47,7 @@ export function createWorkConstructor(root,ctx){
   function importanceControl(c){const target=sourceImportanceTarget(c,planning()||{},dashboard);return sourceImportanceControl(c,target.score,{editable:target.editable&&(target.kind!=='note'||!dashboardError),saving:importanceSaving.has(importanceKey(target))});}
   function changeSourceImportance(c,value){
     const target=sourceImportanceTarget(c,planning()||{},dashboard),key=importanceKey(target);
-    return importanceWrites(key,async()=>{
+    return trackOperation(importanceWrites(key,async()=>{
       if(disposed)return;
       importanceSaving.add(key);error='';notice=t('Сохраняем важность…');render();
       try{
@@ -58,13 +58,15 @@ export function createWorkConstructor(root,ctx){
         if(target.kind==='note'&&cause.status===409){await refreshDashboard();cause.message=t('Задача изменилась. Важность не перезаписана — проверьте новое значение.');}
         throw cause;
       }finally{importanceSaving.delete(key);if(!disposed)render();}
-    });
+    }));
   }
   function poolPinned(){if(!poolPins.has(selectedDate)){let value=false;try{value=JSON.parse(preferences.getItem('brainalot.work.pool.v1:'+selectedDate)||'{}').pinned===true;}catch{}poolPins.set(selectedDate,value);}return poolPins.get(selectedDate);}
   function setPoolPinned(value){const previousTop=$('#cc-selected')?.getBoundingClientRect?.().top;poolPins.set(selectedDate,value);try{preferences.setItem('brainalot.work.pool.v1:'+selectedDate,JSON.stringify({pinned:value}));}catch{}render();const tray=$('#cc-selected'),bounds=tray?.getBoundingClientRect?.(),scroller=value?root:document.scrollingElement||document.documentElement;if(bounds&&scroller&&Number.isFinite(previousTop)){const safeTop=value?(root.getBoundingClientRect?.().top||0)+($('.cc-goal-strip')?.getBoundingClientRect?.().height||0)+($('.cc-timeline-panel')?.getBoundingClientRect?.().height||0)+16:0;scroller.scrollTop+=bounds.top-Math.max(previousTop,safeTop);}}
   function requirePoolEditing(){if(poolPinned())throw new Error(t('Пул закреплён. Нажмите «Изменить пул», чтобы изменить состав.'));}
-  let selectedDate=null,mode="day",historyMonth=null,historyPath=[],weekStart=null,weekKey=null,stage=null,hours=2,search="",busy=0,error="",notice="",pending=null,dashboard={},dashboardError="",serial=Promise.resolve(),popup=null,popupObserver=null,popupFrame=0,saveTimer=null,drag=null,suppressClick=0,disposed=false,resizeTimer=null,lastUndo=null;
+  let selectedDate=/^\d{4}-\d{2}-\d{2}$/.test(ctx.initialDate||"")?ctx.initialDate:null,mode=ctx.initialMode==="month"?"month":"day",historyMonth=null,historyPath=[],weekStart=null,weekKey=null,stage=null,hours=2,search="",busy=0,error="",notice="",pending=null,dashboard={},dashboardError="",serial=Promise.resolve(),popup=null,popupObserver=null,popupFrame=0,saveTimer=null,drag=null,suppressClick=0,disposed=false,resizeTimer=null,lastUndo=null;
   let deleteIntent=null,deleteBusy=false;
+  const pendingActions=new Set(),popupSaves=new Set();
+  const trackOperation=operation=>{pendingActions.add(operation);operation.then(()=>pendingActions.delete(operation),()=>pendingActions.delete(operation));return operation;};
   const popupBases=new Map(),popupConflicts=new Map(),dirtyFields=new Map(),drafts=new Map(),geometries=new Map(),physics=new Map(),pendingBlocks=new Set(),returned=new Map(),scrolls={tasks:0,week:0,catalog:0},sourceScrolls=new Map();
   const planning=()=>ctx.state?.planning;
   const deletionState=()=>normalizeDeletionState(ctx.deletionState?.());
@@ -137,7 +139,7 @@ export function createWorkConstructor(root,ctx){
     if(!p){root.innerHTML='<div class="work-constructor cc-empty"><h2>'+safe(t("План пока не загружен"))+'</h2><p>'+safe(t("Проекты, доска, заметки и изображения сохраняются."))+'</p></div>';return;}
     selectedDate??=todayIn(p.settings?.timezone);weekStart??=nextMonday(selectedDate);historyMonth??=selectedDate.slice(0,7);const m=model();
     root.innerHTML='<div class="work-constructor" data-testid="work-constructor" data-collecting="'+(mode==='day'&&!poolPinned())+'" data-work-style="'+safe(workStyle)+'" data-card-layout="'+readableLayout()+'">'+
-      '<nav class="cc-tabs"><button data-action="mode-day" aria-selected="'+(mode==='day')+'">'+safe(t('День'))+'</button><button data-action="mode-week" aria-selected="'+(mode==='week')+'">'+safe(t('Неделя'))+'</button><button data-action="mode-month" aria-selected="'+(mode==='month')+'">'+safe(t('История'))+'</button><span class="cc-save-state" role="status">'+safe(error||notice||(busy?t('Сохраняем…'):''))+'</span></nav>'+deletionBanner()+(pending?'<section class="cc-warning" role="alert">'+safe(t('Изменение не подтверждено.'))+' <button data-action="retry">'+safe(t('Повторить'))+'</button>'+(pending.action==='cube_delete'?'<button data-action="deletion-check">'+safe(t('Проверить состояние'))+'</button>':'<button data-action="discard">'+safe(t('Отменить запрос'))+'</button>')+'</section>':'')+
+      '<nav class="cc-tabs"'+(ctx.embeddedNavigation?' data-embedded-navigation="true"':'')+'>'+(!ctx.embeddedNavigation?'<button data-action="mode-day" aria-selected="'+(mode==='day')+'">'+safe(t('День'))+'</button><button data-action="mode-week" aria-selected="'+(mode==='week')+'">'+safe(t('Неделя'))+'</button><button data-action="mode-month" aria-selected="'+(mode==='month')+'">'+safe(t('История'))+'</button>':'')+'<span class="cc-save-state" role="status">'+safe(error||notice||(busy?t('Сохраняем…'):''))+'</span></nav>'+deletionBanner()+(pending?'<section class="cc-warning" role="alert">'+safe(t('Изменение не подтверждено.'))+' <button data-action="retry">'+safe(t('Повторить'))+'</button>'+(pending.action==='cube_delete'?'<button data-action="deletion-check">'+safe(t('Проверить состояние'))+'</button>':'<button data-action="discard">'+safe(t('Отменить запрос'))+'</button>')+'</section>':'')+
       (mode==="day"?goalsHtml()+'<div class="cc-results-row">'+pedestalShelf(planning(),selectedDate,pendingBlocks,shelfStyle)+awardsPanel(planning(),selectedDate)+'</div>'+timelineHtml(m)+(!m.initialized?'<section class="cc-warning"><strong>'+safe(t("Этот день ещё использует прежний план"))+'</strong><p>'+safe(t("Включите конструктор явно: существующие уроки, выбранные кубики и факты сохранятся. Подготовки станут предложениями до выбора."))+'</p><button class="cc-primary" data-action="initialize" data-testid="initialize-constructor">'+safe(t("Включить конструктор для этого дня"))+'</button></section>':"")+dayHtml(m):mode==="week"?goalsHtml()+weekHtml():goalsHtml()+monthHtml(planning(),historyMonth,historyPath))+'</div>';
     const host=$('.work-constructor'),goals=$('.cc-goal-strip');if(host&&goals)host.style.setProperty('--cc-goal-height',Math.ceil(goals.getBoundingClientRect().height)+'px');if(host&&$('.cc-timeline-panel'))host.style.setProperty('--cc-timeline-height',Math.ceil($('.cc-timeline-panel').getBoundingClientRect().height)+'px');
     for(const [selector,key] of [[".cc-task-strip","tasks"],[".cc-week-scroll","week"]])if($(selector)){const el=$(selector);el.style.scrollBehavior="auto";el.scrollLeft=scrolls[key];el.style.scrollBehavior="";}
@@ -324,7 +326,7 @@ export function createWorkConstructor(root,ctx){
   }
   function savePopup(){
     clearTimeout(saveTimer);if(!popup)return Promise.resolve();const {id,tray}=popup;
-    return enqueuePopupSave(id,()=>savePopupNow(id,tray));
+    const operation=enqueuePopupSave(id,()=>savePopupNow(id,tray));popupSaves.add(operation);operation.then(()=>popupSaves.delete(operation),()=>popupSaves.delete(operation));return operation;
   }
   async function savePopupNow(id,tray){
     if(disposed)return;const draft=drafts.get(id);if(!draft||!dirtyFields.get(id)?.size)return;
@@ -528,7 +530,7 @@ export function createWorkConstructor(root,ctx){
     if(anchor){event.preventDefault();const row=anchor.closest("[data-link-row]"),input=row?.querySelector('[data-link-field="url"]'),c=getPopupCube();if(!input||!validUrl(input.value)){toast(t("Нужен полный http:// или https:// URL с адресом сайта."));return;}const title=row.querySelector('[data-link-field="title"]')?.value||c.title;
       void (async()=>{await savePopup();const group={id:"single",title,links:[{title,url:validUrl(input.value)}],color:"cyan"};const result=await (ctx.openCubeWorkspace||ctx.openWorkspace)?.({id:"work-cube:"+c.id,title:c.title,groups:[group]},group);if(result?.ok===false)throw new Error(t("Браузер не открыл ссылку."));})().catch(reportError);return;
     }
-    const button=event.target.closest("[data-action]");if(button){event.preventDefault();void Promise.resolve(action(button,event)).catch(reportError);return;}
+    const button=event.target.closest("[data-action]");if(button){event.preventDefault();void trackOperation(Promise.resolve(action(button,event))).catch(reportError);return;}
     const cube=event.target.closest("[data-ccube]");if(cube&&Date.now()>=suppressClick)openPopup(cube.dataset.ccube,cube,cube.dataset.tray);
   }
   function reportError(cause){error=cause?.message||String(cause);toast(error);render();}
@@ -687,5 +689,17 @@ export function createWorkConstructor(root,ctx){
   document.addEventListener("visibilitychange",orbitVisibility);document.addEventListener("click",handleClick);document.addEventListener("input",handleInput);document.addEventListener("change",handleChange);document.addEventListener("pointermove",pointerMove,{passive:false});document.addEventListener("pointerup",pointerUp);document.addEventListener("pointercancel",pointerCancel);document.addEventListener("pointerdown",outerDown);document.addEventListener("keydown",keyDown);document.addEventListener("toggle",toggle,true);document.addEventListener("scroll",refreshHoverFromPoint,true);document.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerdown",pointerDown);root.addEventListener("focusin",focusHover);root.addEventListener("focusout",blurHover);window.addEventListener("resize",resize);
   const unsubscribe=timeClient.subscribe(updateTimers);
   render();void refreshPending().catch(reportError);void refreshDashboard();
-  return {render,remoteChanged,destroy(){disposed=true;disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};
+  async function prepareLeave(){
+    if(drag?.active)throw new Error(t('Завершите перемещение кубика перед переходом.'));
+    await taskChangeSerial;
+    while(pendingActions.size)await Promise.all([...pendingActions]);
+    await savePopup();
+    while(popupSaves.size)await Promise.all([...popupSaves]);
+    await serial;
+    if(await ctx.pendingDraft?.())throw new Error(t('Сначала разрешите неподтверждённый запрос Work.'));
+    if([...dirtyFields.values()].some(fields=>fields.size))throw new Error(t('Сохраните изменения кубика перед переходом.'));
+    if(monthlyDraft){const approved=approvedMonthlyPlan(planning()),month=approved?.month||selectedDate.slice(0,7),tasks=[...(approved?.task_ids||[])].sort();if(monthlyDraft.month!==month||JSON.stringify([...monthlyDraft.taskIds].sort())!==JSON.stringify(tasks)){monthlyEditorOpen=true;render();throw new Error(t('Сохраните месячный план перед переходом.'));}}
+    return {date:selectedDate,mode:mode==='month'?'history':'day'};
+  }
+  return {render,remoteChanged,prepareLeave,destroy(){disposed=true;disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};
 }

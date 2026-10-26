@@ -1936,5 +1936,18 @@ export default {
   "Не удалось подключиться к Brainalot.": "Could not connect to Brainalot.",
   "Подключение Work ещё не готово.": "The Work connection is not ready yet.",
   "Brainalot · Work · День": "Brainalot · Work · Day",
-  "У блока нет исходного кубика Work для фактов и таймера.": "This block has no source Work cube for progress records or a timer."
+  "У блока нет исходного кубика Work для фактов и таймера.": "This block has no source Work cube for progress records or a timer.",
+  "Не удалось открыть Work. Обновите окно и повторите попытку.": "Could not open Work. Reload the window and try again.",
+  "Work ещё сохраняет изменения. Попробуйте перейти ещё раз.": "Work is still saving changes. Try switching again.",
+  "Сохраните изменения перед переходом.": "Save your changes before switching.",
+  "Переход отменён.": "Navigation cancelled.",
+  "Не удалось изменить размер Work.": "Could not resize Work.",
+  "Завершите перемещение кубика перед переходом.": "Finish moving the cube before switching.",
+  "Сохраните изменения кубика перед переходом.": "Save the cube changes before switching.",
+  "Сохраните месячный план перед переходом.": "Save the monthly plan before switching.",
+  "Сохраните название перед переходом.": "Save the name before switching.",
+  "Сохраните изменения в полях перед переходом.": "Save the edited fields before switching.",
+  "4 недели": "4 weeks",
+  "Свернуть Work": "Collapse Work",
+  "Brainalot · Work · Неделя": "Brainalot · Work · Week"
 };

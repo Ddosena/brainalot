@@ -2,7 +2,7 @@
 // Raw work-store snapshots remain raw, so board saves cannot persist a projection.
 export function createDayBridge(root, ctx, {createConstructor, api, loadingText = ''}) {
   let delegate = null, effective = null, disposed = false, readNumber = 0, acceptedRead = 0;
-  let pending = null;
+  let pending = null,initialError=null;
   const projected = Object.create(ctx);
   Object.defineProperty(projected, 'state', {get() {
     return {...ctx.state, planning: effective?.planning ?? null};
@@ -17,6 +17,7 @@ export function createDayBridge(root, ctx, {createConstructor, api, loadingText 
     }
     if (effective && result.revision < effective.revision) return;
     effective = result;
+    initialError=null;
     if (!delegate) delegate = createConstructor(root, projected);
   }
   projected.action = async (...args) => {
@@ -34,6 +35,7 @@ export function createDayBridge(root, ctx, {createConstructor, api, loadingText 
       if (!disposed) delegate?.[method]?.();
     }).catch(error => {
       if (disposed) return;
+      initialError=error;
       if (delegate) ctx.toast?.(error.message);
       else root.textContent = error.message || loadingText;
     });
@@ -44,7 +46,8 @@ export function createDayBridge(root, ctx, {createConstructor, api, loadingText 
   return {
     render() {return schedule('render');},
     remoteChanged() {return schedule('remoteChanged');},
-    ready() {return pending;},
+    async ready() {await pending;if(!delegate)throw initialError||new Error(loadingText);},
+    async prepareLeave() {await pending;return delegate?.prepareLeave?.();},
     destroy() {disposed = true; delegate?.destroy();},
   };
 }
