@@ -40,7 +40,7 @@ export function weekProposals(planning,start){
 }
 export function groupWeekCubes(cubes){const groups=new Map();for(const cube of cubes){const key=JSON.stringify([cube.planned_date,cube.task_id||cube.kind+":"+cube.source_ref]);if(!groups.has(key))groups.set(key,{key,date:cube.planned_date,task_id:cube.task_id,cubes:[]});groups.get(key).cubes.push(cube);}return [...groups.values()];}
 export function createWorkConstructor(root,ctx){
-  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,monthlyDraft=null,monthlyEditorOpen=false,monthlySaving=false;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
+  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,monthlyDraft=null,monthlyDraftBaseline=null,monthlyEditorOpen=false,monthlySaving=false;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
   try{const options=JSON.parse(preferences.getItem('brainalot.work.readable.v1')||'{}');setReadableLayout(options.layout);}catch{}
   function sourceImportance(c){return canonicalSourceImportance(c,planning()||{},dashboard);}
   const importanceKey=target=>target.kind+':'+target.id;
@@ -184,7 +184,7 @@ export function createWorkConstructor(root,ctx){
     return '<article class="rc-source-card '+(on?'is-taken ':'')+(done?'is-done':'')+'" data-row-id="'+safe(c.id)+'" '+(pendingBlocks.has(c.id)?'style="visibility:hidden"':'')+'><button class="rc-source-open" data-action="'+(done?'history-inspect':'inspect')+'" data-id="'+safe(c.id)+'" data-ccube="'+safe(c.id)+'" data-tray="'+(done?'history':on?'selected':'possible')+'" data-focus-key="source-'+safe(c.id)+'" data-ctooltip="'+safe(tooltip)+'" aria-label="'+safe(c.title+' · '+source+' · '+minutes(compactCardMinutes(c,done)))+'">'+sourceCardContents(c,{typeLabel:TYPES[type]||TYPES.task,selected:on,done,source})+'</button></article>';
   }
   function monthPlanDraft(){
-    if(!monthlyDraft){const plan=approvedMonthlyPlan(planning());monthlyDraft={month:plan?.month||selectedDate.slice(0,7),taskIds:[...(plan?.task_ids||[])]};}
+    if(!monthlyDraft){const plan=approvedMonthlyPlan(planning());monthlyDraft={month:plan?.month||selectedDate.slice(0,7),taskIds:[...(plan?.task_ids||[])]};monthlyDraftBaseline=copy(monthlyDraft);}
     return monthlyDraft;
   }
   function monthPlanHtml(){
@@ -698,7 +698,7 @@ export function createWorkConstructor(root,ctx){
     await serial;
     if(await ctx.pendingDraft?.())throw new Error(t('Сначала разрешите неподтверждённый запрос Work.'));
     if([...dirtyFields.values()].some(fields=>fields.size))throw new Error(t('Сохраните изменения кубика перед переходом.'));
-    if(monthlyDraft){const approved=approvedMonthlyPlan(planning()),month=approved?.month||selectedDate.slice(0,7),tasks=[...(approved?.task_ids||[])].sort();if(monthlyDraft.month!==month||JSON.stringify([...monthlyDraft.taskIds].sort())!==JSON.stringify(tasks)){monthlyEditorOpen=true;render();throw new Error(t('Сохраните месячный план перед переходом.'));}}
+    if(monthlyDraft){const baseline=monthlyDraftBaseline,tasks=[...baseline.taskIds].sort();if(monthlyDraft.month!==baseline.month||JSON.stringify([...monthlyDraft.taskIds].sort())!==JSON.stringify(tasks)){monthlyEditorOpen=true;render();throw new Error(t('Сохраните месячный план перед переходом.'));}}
     return {date:selectedDate,mode:mode==='month'?'history':'day'};
   }
   return {render,remoteChanged,prepareLeave,destroy(){disposed=true;disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};

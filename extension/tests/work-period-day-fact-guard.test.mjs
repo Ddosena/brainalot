@@ -4,10 +4,10 @@ import {createWorkConstructor} from '../work-constructor.js';
 import {todayIn} from '../work-constructor-model.js';
 import {timeClient} from '../time-client.js';
 
-async function fixture(exercise){
+async function fixture(exercise,{date=todayIn()}={}){
   const keys=['document','window','innerWidth','innerHeight','matchMedia','requestAnimationFrame','cancelAnimationFrame'];
   const previous=Object.fromEntries(keys.map(key=>[key,globalThis[key]])),timers={refresh:timeClient.refresh,command:timeClient.command};
-  const handlers=new Map(),calls=[],timeCalls=[],messages=[],date=todayIn();
+  const handlers=new Map(),calls=[],timeCalls=[],messages=[];
   const native={id:'native',kind:'task',task_id:'task',title:'Native cube',minutes:60,planned_date:date,selected_date:date,start:null,progress_percent:0,actual_minutes:0};
   const retained={...native,id:'retained',title:'Merged or retained block',period_can_record_progress:false,period_read_only:true};
   const planning={settings:{timezone:'Europe/Moscow',day_limit_minutes:300},tasks:[{id:'task',title:'Source task',course:'qa',estimate_minutes:{central:600}}],completed_cubes:{},constructor:{version:1,cubes:{native:{...native}},days:{[date]:{initialized:true}}},result:{days:[{date,focus_task_id:'task'}],cubes:[],tasks:[{id:'task',remaining_minutes:600}],task_pool:[],constructor:{cubes:[native,retained],days:{[date]:{date,initialized:true,selected_cube_ids:['native','retained'],possible_cube_ids:[],hidden_cube_ids:[],actual_minutes:0,credited_minutes:0,selected_minutes:120,fixed_minutes:0,total_work_minutes:120,budget_minutes:300,available_minutes:180,over_cap_minutes:0,events:[]}}}}};
@@ -16,9 +16,9 @@ async function fixture(exercise){
   Object.assign(globalThis,{document,window:{addEventListener(){},removeEventListener(){}},innerWidth:1440,innerHeight:900,matchMedia:()=>({matches:true}),requestAnimationFrame:()=>1,cancelAnimationFrame(){}});
   timeClient.refresh=async()=>{timeCalls.push('refresh');return {status:'idle',task:null};};
   timeClient.command=async(name,data)=>{timeCalls.push(name);return {status:name==='start'?'running':'idle',task:data?.task};};
-  const app=createWorkConstructor(root,{state:{planning},async action(action,data){calls.push({action,data});if(action==='cube_progress'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,{progress_percent:data.percent,actual_minutes:data.actual_minutes});}if(action==='constructor_cube'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,data);}return {state:{planning}};},async pendingDraft(){return null;},async readDashboard(){return {};},toast(message){messages.push(message);}});
+  const app=createWorkConstructor(root,{state:{planning},initialDate:date,async action(action,data){calls.push({action,data});if(action==='cube_progress'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,{progress_percent:data.percent,actual_minutes:data.actual_minutes});}if(action==='constructor_cube'){const row=planning.result.constructor.cubes.find(row=>row.id===data.cube_id);Object.assign(row,data);}return {state:{planning}};},async pendingDraft(){return null;},async readDashboard(){return {};},toast(message){messages.push(message);}});
   const settle=async()=>{await new Promise(resolve=>setImmediate(resolve));await new Promise(resolve=>setImmediate(resolve));};
-  const click=async(action,id)=>{const button={dataset:{action,...(id?{id}:{})},closest(selector){return selector==='[data-action]'?this:null;},getBoundingClientRect(){return {left:100,right:218,top:200,bottom:252};}};handlers.get('click')[0]({target:button,preventDefault(){}});await settle();};
+  const click=async(action,id,extra={})=>{const button={dataset:{action,...(id?{id}:{}),...extra},closest(selector){return selector==='[data-action]'?this:null;},getBoundingClientRect(){return {left:100,right:218,top:200,bottom:252};}};handlers.get('click')[0]({target:button,preventDefault(){}});await settle();};
   const input=(field,value)=>{const control={dataset:{popupField:field},value:String(value),closest(){return document.popup;}};handlers.get('input')[0]({target:control});return control;};
   const change=async control=>{handlers.get('change')[0]({target:control});await settle();};
   try{await settle();await exercise({app,document,planning,native,retained,calls,timeCalls,messages,click,input,change,settle});}
@@ -72,4 +72,24 @@ test('the read-only capability independently blocks facts while returning the bl
     await click('return');assert.ok(calls.some(call=>call.action==='constructor_return' && call.data.cube_id==='retained'));
     assert.ok(!calls.some(call=>call.action==='cube_progress'));assert.deepEqual(timeCalls,[]);
   });
+});
+
+
+test('untouched monthly draft does not block Day navigation across a month boundary',async()=>{
+  await fixture(async({app,click,calls})=>{
+    await click('next');
+    assert.deepEqual(await app.prepareLeave(),{date:'2026-11-01',mode:'day'});
+    assert.deepEqual(calls,[]);
+  },{date:'2026-10-31'});
+});
+
+test('an edited monthly month or task selection still blocks leaving and reverting permits it',async()=>{
+  await fixture(async({app,change})=>{
+    const month={dataset:{field:'month-plan-month'},value:'2026-12',closest(){return null;}};
+    await change(month);await assert.rejects(app.prepareLeave(),/Сохраните месячный план/);
+    month.value='2026-10';await change(month);await assert.doesNotReject(app.prepareLeave());
+    const task={dataset:{field:'month-plan-task',task:'task'},checked:true,closest(){return null;}};
+    await change(task);await assert.rejects(app.prepareLeave(),/Сохраните месячный план/);
+    task.checked=false;await change(task);await assert.doesNotReject(app.prepareLeave());
+  },{date:'2026-10-31'});
 });
