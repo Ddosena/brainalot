@@ -42,6 +42,7 @@ export function fullCubeInfo(c,{importance=0,typeLabel=t("Задача")}={}){
   const steps=Array.isArray(c.steps)?c.steps:[],resources=c.resource_drafts||c,groups=Array.isArray(resources.groups)?resources.groups:[],links=[...(Array.isArray(resources.links)?resources.links:[]),...groups.flatMap(group=>Array.isArray(group.links)?group.links:[])].filter(link=>link&&(link.title||link.url));
   if(steps.length||links.length)lines.push([steps.length?t('Шагов: {count}',{count:steps.length}):'',links.length?t('Материалов: {count}',{count:links.length}):''].filter(Boolean).join(' · '));if(c.allocation_stale)lines.push(t('Предложение устарело. Пересчитайте план перед выбором.'));return lines.filter(Boolean).join('\n');
 }
+export function timelineCubeInfo(c,options){return fullCubeInfo(c,options).replace(/\s*\n\s*/g,' · ');}
 const numberOrder=value=>typeof value==='number'&&Number.isFinite(value)?value:null;
 export function orderSourceCubes(cubes,segments=[]){
   const segmentById=new Map(segments.map((segment,index)=>[segment.id,{segment,index}]));
@@ -80,6 +81,6 @@ export function hoverCubeContents(c,{typeLabel=t("Задача"),done=Number(c.p
   return '<span class="rc-hover-art">'+renderAwardArt(variant,{compact:true,categoryColor:color})+'</span><span class="rc-hover-copy"><strong>'+esc(c.title||typeLabel)+'</strong>'+(showSource?'<small>'+esc(source)+'</small>':'')+(output?'<span class="rc-hover-output">'+esc(output)+'</span>':'')+'<span class="rc-hover-meta">'+esc(t("{String} мин",{String:String(compactCardMinutes(c,done))}))+(done&&c.status!=='cancelled'&&!c.cancelled?'<svg class="rc-done-check" viewBox="0 0 16 16" aria-hidden="true"><path d="m2.5 8 3.5 3.5 7.5-8"/></svg>':'')+'</span></span>';
 }
 export function hoverCubePosition(rect,viewport,preview){
-  const width=Math.min(236,Math.max(0,viewport.width-16)),height=preview.height;
+  const width=Math.min(118,Math.max(0,viewport.width-16)),height=preview.height;
   return {width,left:Math.max(8,Math.min(rect.left-(width-rect.width)/2,viewport.width-width-8)),top:Math.max(8,Math.min(rect.top-(height-rect.height)/2,viewport.height-height-8))};
 }

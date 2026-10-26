@@ -2,6 +2,7 @@
 // t("…"), data-i18n and the local service; an empty value falls back to Russian.
 // Refresh the key list with `node tools/i18n/cli.mjs extract --update`.
 export default {
+  "До сна · {remaining}": "Until sleep · {remaining}",
   "До 01:00 · {remaining}": "Until 01:00 · {remaining}",
   "Текущее время {time}": "Current time {time}",
   "Удаление не выполнено. Обновите данные перед новой попыткой.": "Deletion was not completed. Refresh the data before trying again.",

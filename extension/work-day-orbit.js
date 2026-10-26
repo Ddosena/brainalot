@@ -47,30 +47,37 @@ export function mountOrbitCountdown(host,{getNow=()=>new Date()}={}){
  const ns='http://www.w3.org/2000/svg',make=(name,className)=>{
   const node=svg.ownerDocument.createElementNS(ns,name);node.setAttribute('class',className);return node;
  };
- const layer=make('g','cc-orbit-countdown');layer.setAttribute('hidden','');layer.setAttribute('aria-hidden','true');
- const line=make('line','cc-orbit-countdown-line'),dot=make('circle','cc-orbit-countdown-dot');dot.setAttribute('r','3');
+ const layer=make('g','cc-orbit-countdown');layer.setAttribute('aria-hidden','true');
+ const line=make('line','cc-orbit-countdown-line');line.setAttribute('hidden','');
  const label=make('text','cc-orbit-countdown-label');label.setAttribute('x',String(C));label.setAttribute('y','226');label.setAttribute('text-anchor','middle');
- layer.append(line,dot,label);svg.append(layer);
+ layer.append(line,label);svg.append(layer);
  let previousPointerMinute=null;
- const hide=()=>{previousPointerMinute=null;layer.setAttribute('hidden','');};
- const move=event=>{
-  if(event.pointerType!=='mouse'&&event.pointerType!=='pen'){hide();return;}
+ const reset=()=>{
+  previousPointerMinute=null;line.setAttribute('hidden','');
   const {today,nowMinutes}=currentDayPosition(section.dataset.orbitDate,getNow());
-  if(!today){hide();return;}
-  const matrix=svg.getScreenCTM?.();if(!matrix){hide();return;}
+  if(!today){layer.setAttribute('hidden','');return;}
+  label.textContent=t('До сна · {remaining}',{remaining:countdownText(orbitCountdownMinutes(nowMinutes,nowMinutes))});
+  layer.removeAttribute('hidden');
+ };
+ const move=event=>{
+  if(event.pointerType!=='mouse'&&event.pointerType!=='pen'){reset();return;}
+  const {today,nowMinutes}=currentDayPosition(section.dataset.orbitDate,getNow());
+  if(!today){reset();return;}
+  const matrix=svg.getScreenCTM?.();if(!matrix){reset();return;}
   const p=svg.createSVGPoint();p.x=event.clientX;p.y=event.clientY;
   const local=p.matrixTransform(matrix.inverse()),unwrapped=unwrapOrbitPointer(local.x,local.y,nowMinutes,previousPointerMinute);
   const target=clampOrbitMinute(unwrapped,nowMinutes);
-  if(target===null){hide();return;}
+  if(target===null){reset();return;}
   previousPointerMinute=unwrapped;
-  const display=HALF+target%HALF,inner=point(display,HALF,DAY,83),outer=point(display,HALF,DAY,141);
+  const display=HALF+target%HALF,inner=point(display,HALF,DAY,75),outer=point(display,HALF,DAY,83);
   line.setAttribute('x1',String(inner.x));line.setAttribute('y1',String(inner.y));line.setAttribute('x2',String(outer.x));line.setAttribute('y2',String(outer.y));
-  dot.setAttribute('cx',String(outer.x));dot.setAttribute('cy',String(outer.y));
-  label.textContent=t('До 01:00 · {remaining}',{remaining:countdownText(orbitCountdownMinutes(target,nowMinutes))});
+  line.removeAttribute('hidden');
+  label.textContent=t('До сна · {remaining}',{remaining:countdownText(orbitCountdownMinutes(target,nowMinutes))});
   layer.removeAttribute('hidden');
  };
- svg.addEventListener('pointermove',move);svg.addEventListener('pointerleave',hide);svg.addEventListener('pointercancel',hide);
- return ()=>{svg.removeEventListener('pointermove',move);svg.removeEventListener('pointerleave',hide);svg.removeEventListener('pointercancel',hide);layer.remove();};
+ reset();
+ svg.addEventListener('pointermove',move);svg.addEventListener('pointerleave',reset);svg.addEventListener('pointercancel',reset);
+ return ()=>{svg.removeEventListener('pointermove',move);svg.removeEventListener('pointerleave',reset);svg.removeEventListener('pointercancel',reset);layer.remove();};
 }
 function upright(n,start=HALF,end=DAY){let rotation=(n-start)/(end-start)*360;if(rotation>90&&rotation<270)rotation+=180;return (rotation+180)%360-180;}
 export function currentDayPosition(date,clockDate=new Date()){
@@ -107,11 +114,7 @@ export function orbitHalfCounts(events=[],cubes=[]){
  const rows=[...events.filter(e=>e.required),...cubes].filter(e=>Number.isFinite(e.start)&&Number.isFinite(e.minutes)&&e.minutes>0);
  return Object.fromEntries(['morning','afternoon'].map(half=>{const {start,end}=range(half);return [half,rows.filter(e=>e.start<end&&e.start+e.minutes>start).length];}));
 }
-function workLabel(title,span){
- const text=String(title||t('Работа')).replace(/^(?:уточнить|проверить|подготовить|собрать|сравнить|сделать)\s+/i,'').replace(/^практика\s*[·:—–-]\s*/i,'');
- const chars=Math.floor((span/HALF*2*Math.PI*R-8)/4.6);
- return chars<2?'':text.length>chars?text.slice(0,Math.max(1,chars-1))+'…':text;
-}
+function workLabel(title){return String(title||t('Работа')).trim();}
 export function lessonTitle(title){return String(title||t('Урок')).trim().replace(/^Урок\s*[·:—–-]\s*/i,'').trim()||t('Урок');}
 export function lessonTextPath(from,to,start,end,radius,reverse=false){
  const a=point(reverse?to:from,start,end,radius),b=point(reverse?from:to,start,end,radius),large=to-from>(end-start)/2?1:0;
@@ -125,6 +128,21 @@ function clippedText(value,maxWidth,measure,font){
   const incomplete=count<letters.length,text=letters.slice(0,count).join('').trimEnd()+(incomplete?'…':'');
   if(measure(text,font)<=maxWidth)best=text;else break;
  }return best;
+}
+function radialRotation(mid,start,end){
+ let degrees=(angle(mid,start,end)+Math.PI)*180/Math.PI;
+ degrees=(degrees+180)%360-180;
+ if(degrees>90)degrees-=180;
+ if(degrees<-90)degrees+=180;
+ return degrees;
+}
+function radialMarkup(title,mid,start,end,hidden=false){
+ const rotation=radialRotation(mid,start,end),a=angle(mid,start,end),tangent={x:-Math.sin(a),y:Math.cos(a)};
+ const layout=wrapLessonTitle(title,[72,72],(value,font)=>chars(value).length*font*.54,{minFont:9.5,maxFont:10.5});
+ return '<g class="cc-orbit-radial-label"'+(hidden?' hidden':'')+'>'+layout.lines.map((line,index)=>{
+  const offset=index===0?-6:6,p=point(mid,start,end,128);
+  return '<text class="cc-orbit-radial-title" data-line="'+index+'" transform="translate('+(p.x+tangent.x*offset).toFixed(2)+' '+(p.y+tangent.y*offset).toFixed(2)+') rotate('+rotation.toFixed(2)+')" text-anchor="middle" dominant-baseline="middle"'+(line?'':' hidden')+'>'+esc(line)+'</text>';
+ }).join('')+'</g>';
 }
 export function wrapLessonTitle(title,widths,measure,{minFont=13,maxFont=16}={}){
  const clean=lessonTitle(title),letters=chars(clean),limit=widths.map(width=>Math.max(8,width-5));
@@ -151,21 +169,33 @@ export function fitOrbitLabels(host){
  if(!host?.querySelectorAll)return [];
  const canvas=globalThis.document?.createElement?.('canvas'),ctx=canvas?.getContext?.('2d');if(!ctx)return [];
  const measure=(value,font)=>{ctx.font=`650 ${font}px "Segoe UI", Arial, sans-serif`;return ctx.measureText(value).width;},results=[];
- for(const group of host.querySelectorAll('[data-orbit-lesson-title]')){
-  const paths=[...group.querySelectorAll('defs path')],texts=[...group.querySelectorAll('.cc-orbit-fixed-title')];if(paths.length!==2||texts.length!==2)continue;
-  const widths=paths.map(path=>path.getTotalLength());let layout=wrapLessonTitle(group.dataset.orbitLessonTitle,widths,measure);
-  const apply=()=>texts.forEach((node,index)=>{node.style.fontSize=layout.font+'px';node.querySelector('textPath').textContent=layout.lines[index];node.toggleAttribute('hidden',!layout.lines[index]);});
-  apply();
-  while(layout.font>13&&texts.some((node,index)=>!node.hasAttribute('hidden')&&node.getComputedTextLength()>widths[index]-4)){
-   const font=Math.max(13,layout.font-.5);layout=wrapLessonTitle(group.dataset.orbitLessonTitle,widths,measure,{minFont:font,maxFont:font});apply();
+ for(const group of host.querySelectorAll('[data-orbit-label-full]')){
+  const title=group.dataset.orbitLabelFull,fixed=group.dataset.orbitLabelKind==='fixed';
+  const tangent=group.querySelector('.cc-orbit-tangent-label'),radial=group.querySelector('.cc-orbit-radial-label');
+  if(!tangent||!radial)continue;
+  const tangentTexts=[...tangent.querySelectorAll('text')],radialTexts=[...radial.querySelectorAll('text')];
+  const widths=fixed?[...tangent.querySelectorAll('defs path')].map(path=>path.getTotalLength()):[Number(group.dataset.orbitTangentWidth)];
+  if(!widths.length||!widths.every(Number.isFinite))continue;
+  const layout=fixed?wrapLessonTitle(title,widths,measure):{lines:[title],font:10,truncated:measure(title,10)>widths[0]-5};
+  tangentTexts.forEach((node,index)=>{
+   node.style.fontSize=layout.font+'px';
+   const content=node.querySelector('textPath')||node;content.textContent=layout.lines[index]||'';
+   node.toggleAttribute('hidden',!layout.lines[index]);
+  });
+  tangent.removeAttribute('hidden');radial.setAttribute('hidden','');
+  let useRadial=layout.truncated||tangentTexts.some((node,index)=>!node.hasAttribute('hidden')&&node.getComputedTextLength()>widths[index]-4);
+  let chosen=layout;
+  if(useRadial){
+   tangent.setAttribute('hidden','');radial.removeAttribute('hidden');
+   chosen=wrapLessonTitle(title,[72,72],measure,{minFont:9.5,maxFont:10.5});
+   radialTexts.forEach((node,index)=>{node.style.fontSize=chosen.font+'px';node.textContent=chosen.lines[index]||'';node.toggleAttribute('hidden',!chosen.lines[index]);});
+   radialTexts.forEach(node=>{
+    if(node.hasAttribute('hidden'))return;
+    while(chars(node.textContent).length>1&&node.getComputedTextLength()>70){node.textContent=chars(node.textContent).slice(0,-2).join('')+'…';chosen.truncated=true;}
+   });
   }
-  for(let index=0;index<2;index++){
-   const node=texts[index],path=node.querySelector('textPath');if(node.hasAttribute('hidden'))continue;
-   while(path.textContent.length>1&&node.getComputedTextLength()>widths[index]-4){path.textContent=chars(path.textContent).slice(0,-2).join('')+'…';layout.truncated=true;}
-   if(node.getComputedTextLength()>widths[index]-4){node.setAttribute('hidden','');path.textContent='';layout.truncated=true;}
-   layout.lines[index]=path.textContent;
-  }
-  results.push({title:group.dataset.orbitLessonTitle,lines:layout.lines,font:layout.font,truncated:layout.truncated,widths,actualWidths:texts.map(node=>node.hasAttribute('hidden')?0:node.getComputedTextLength())});
+  group.dataset.orbitLabelMode=useRadial?'radial':'tangent';
+  results.push({title,mode:group.dataset.orbitLabelMode,lines:chosen.lines,font:chosen.font,truncated:chosen.truncated,widths});
  }
  return results;
 }
@@ -180,14 +210,15 @@ export function renderDayOrbit({date,events=[],cubes=[],nowMinutes=null,today=fa
   if(step%3===0){const n=point(minute,start,end,168);ticks+='<text class="cc-day-orbit-hour" data-hour="'+minute/60+'" x="'+n.x+'" y="'+n.y+'" text-anchor="middle" dominant-baseline="middle">'+String(minute/60).padStart(2,'0')+'</text>';}
  }
  const arcs=paintRows.map(e=>{
-  const label=clock(e.start)+'–'+clock(e.start+e.minutes)+' · '+(e.title||t('Кубик')),mid=(e.from+e.to)/2,p=point(mid,start,end),text=e.fixed?'':workLabel(e.title,e.to-e.from);
-  return '<g class="cc-orbit-interval" data-orbit-id="'+esc(e.id)+'" data-start="'+e.start+'" data-minutes="'+e.minutes+'"><path class="cc-day-orbit-sector '+(e.fixed?'is-fixed':'is-work')+'" d="'+orbitArcPath(e.from,e.to,start,end)+'" stroke="'+e.color+'" data-ctooltip="'+esc(label)+'"'+(e.fixed?' aria-label="'+esc(label)+'"':' data-action="inspect" data-id="'+esc(e.id)+'" role="button" tabindex="0" aria-label="'+esc(t('Открыть: {label}',{label}))+'"')+'>'+(e.fixed?'<title>'+esc(label)+'</title>':'')+'</path>'+(text?'<text class="cc-orbit-work-label" transform="translate('+p.x+' '+p.y+') rotate('+upright(mid,start,end)+')" text-anchor="middle" dominant-baseline="middle">'+esc(text)+'</text>':'')+'</g>';
+  const label=clock(e.start)+'–'+clock(e.start+e.minutes)+' · '+(e.title||t('Кубик')),mid=(e.from+e.to)/2,p=point(mid,start,end),text=e.fixed?'':workLabel(e.title),width=(e.to-e.from)/(end-start)*Math.PI*2*R;
+  const tangentFits=text&&chars(text).length*10*.54<=width-5;
+  return '<g class="cc-orbit-interval" data-orbit-id="'+esc(e.id)+'" data-start="'+e.start+'" data-minutes="'+e.minutes+'"'+(text?' data-orbit-label-full="'+esc(text)+'" data-orbit-label-kind="work" data-orbit-tangent-width="'+width.toFixed(2)+'" data-orbit-label-mode="'+(tangentFits?'tangent':'radial')+'"':'')+'><path class="cc-day-orbit-sector '+(e.fixed?'is-fixed':'is-work')+'" d="'+orbitArcPath(e.from,e.to,start,end)+'" stroke="'+e.color+'" data-ctooltip="'+esc(label)+'"'+(e.fixed?' aria-label="'+esc(label)+'"':' data-action="inspect" data-id="'+esc(e.id)+'" role="button" tabindex="0" aria-label="'+esc(t('Открыть: {label}',{label}))+'"')+'>'+(e.fixed?'<title>'+esc(label)+'</title>':'')+'</path>'+(text?'<g class="cc-orbit-tangent-label"'+(tangentFits?'':' hidden')+'><text class="cc-orbit-work-label" transform="translate('+p.x+' '+p.y+') rotate('+upright(mid,start,end)+')" text-anchor="middle" dominant-baseline="middle">'+esc(text)+'</text></g>'+radialMarkup(text,mid,start,end,tangentFits):'')+'</g>';
  }).join('');
  const lessonHtml=fixed.map((e,index)=>{
   const raw=String(e.title||t('Урок')),title=lessonTitle(raw),mid=(e.from+e.to)/2,turn=(mid-start)/(end-start)*360,reverse=turn>90&&turn<270,radii=reverse?[110,132]:[132,110];
   const ids=radii.map((_,line)=>'cc-orbit-title-'+renderId+'-'+index+'-'+line),span=(e.to-e.from)/(end-start)*Math.PI*2;
-  const lines=wrapLessonTitle(title,radii.map(radius=>radius*span),(value,font)=>chars(value).length*font*.54).lines;
-  return '<g class="cc-orbit-fixed-label" data-orbit-lesson-title="'+esc(title)+'" data-lesson-id="'+esc(e.id)+'" data-start="'+e.start+'" data-minutes="'+e.minutes+'" aria-label="'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'" data-ctooltip="'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'"><title>'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'</title><defs>'+radii.map((radius,line)=>'<path id="'+ids[line]+'" d="'+lessonTextPath(e.from,e.to,start,end,radius,reverse)+'"/>').join('')+'</defs>'+ids.map((id,line)=>'<text class="cc-orbit-fixed-title" data-line="'+line+'"'+(lines[line]?'':' hidden')+'><textPath href="#'+id+'" startOffset="50%" text-anchor="middle">'+esc(lines[line])+'</textPath></text>').join('')+'</g>';
+  const widths=radii.map(radius=>radius*span),layout=wrapLessonTitle(title,widths,(value,font)=>chars(value).length*font*.54),tangentFits=!layout.truncated;
+  return '<g class="cc-orbit-fixed-label" data-orbit-lesson-title="'+esc(title)+'" data-orbit-label-full="'+esc(title)+'" data-orbit-label-kind="fixed" data-orbit-label-mode="'+(tangentFits?'tangent':'radial')+'" data-lesson-id="'+esc(e.id)+'" data-start="'+e.start+'" data-minutes="'+e.minutes+'" aria-label="'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'" data-ctooltip="'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'"><title>'+esc(raw+' · '+clock(e.start)+'–'+clock(e.start+e.minutes))+'</title><g class="cc-orbit-tangent-label"'+(tangentFits?'':' hidden')+'><defs>'+radii.map((radius,line)=>'<path id="'+ids[line]+'" d="'+lessonTextPath(e.from,e.to,start,end,radius,reverse)+'"/>').join('')+'</defs>'+ids.map((id,line)=>'<text class="cc-orbit-fixed-title" data-line="'+line+'"'+(layout.lines[line]?'':' hidden')+'><textPath href="#'+id+'" startOffset="50%" text-anchor="middle">'+esc(layout.lines[line])+'</textPath></text>').join('')+'</g>'+radialMarkup(title,mid,start,end,tangentFits)+'</g>';
  }).join('');
  const now=today&&Number.isFinite(nowMinutes)?((nowMinutes%DAY)+DAY)%DAY:null;
  let marker='';if(now!==null){
@@ -195,5 +226,5 @@ export function renderDayOrbit({date,events=[],cubes=[],nowMinutes=null,today=fa
   const actualHalf=now<HALF?'morning':'afternoon',displayMinute=start+now%HALF,p=point(displayMinute,start,end,145),other=actualHalf!==period,periodLabel=actualHalf==='morning'?'00–12':'12–24';
   marker='<path class="cc-day-orbit-hand-tip" data-now="'+now+'" data-now-half="'+actualHalf+'" data-other-half="'+other+'" aria-label="'+esc(t('Текущее время {time} · {period}',{time:clock(now),period:periodLabel}))+'" transform="translate('+p.x+' '+p.y+') rotate('+(angle(displayMinute,start,end)*180/Math.PI+90)+')" d="M 0 0 L -8 -15 L 8 -15 Z"/>';
  }
- return '<section class="cc-day-orbit" data-orbit-date="'+esc(date)+'" data-half="'+period+'" data-lesson-layout="curved" aria-label="'+esc(t('Часы {start}–{end}: уроки и работа',{start:clock(start),end:clock(end)}))+'"><div class="cc-day-orbit-face"><svg viewBox="0 0 360 360" aria-label="'+esc(t('Время и интервалы: {start}–{end}',{start:clock(start),end:clock(end)}))+'"><circle class="cc-day-orbit-base" cx="180" cy="180" r="112"/>'+arcs+lessonHtml+ticks+'<text class="cc-day-orbit-center-time" x="180" y="190" text-anchor="middle">'+esc(now===null?shortDate(date):clock(now))+'</text>'+marker+'</svg></div></section>';
+ return '<section class="cc-day-orbit" data-orbit-date="'+esc(date)+'" data-half="'+period+'" data-lesson-layout="adaptive" aria-label="'+esc(t('Часы {start}–{end}: уроки и работа',{start:clock(start),end:clock(end)}))+'"><div class="cc-day-orbit-face"><svg viewBox="0 0 360 360" aria-label="'+esc(t('Время и интервалы: {start}–{end}',{start:clock(start),end:clock(end)}))+'"><circle class="cc-day-orbit-base" cx="180" cy="180" r="112"/>'+arcs+lessonHtml+ticks+'<text class="cc-day-orbit-center-time" x="180" y="190" text-anchor="middle">'+esc(now===null?shortDate(date):clock(now))+'</text>'+marker+'</svg></div></section>';
 }

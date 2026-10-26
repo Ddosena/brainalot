@@ -8,7 +8,8 @@ import { historyCubes, pedestalShelf, awardsPanel,awardArt,SHELF_STYLES,monthHtm
 import {createKeyedSaveQueue,createCompletionClaims,transientOrbitModel,goalPreviewLabel} from "./work-constructor-motion.js";
 import { uniqueTaskCubes,taskPoolChange,readTaskChoice,saveTaskChoice } from "./work-constructor-selection.js";
 import { renderDayOrbit,currentDayPosition,fitOrbitLabels,mountOrbitCountdown } from "./work-day-orbit.js";
-import {validPlanMonth,approvedMonthlyPlan,prioritizeSourcePools,sourceImportanceControl,sourcePools,sourceCardContents,setReadableLayout,readableLayout,readableCardContents,compactCardMinutes,readableSource,hoverCubeContents,hoverCubePosition} from "./work-readable-cubes.js";
+import {validPlanMonth,approvedMonthlyPlan,prioritizeSourcePools,sourceImportanceControl,sourcePools,sourceCardContents,setReadableLayout,readableLayout,readableCardContents,compactCardMinutes,readableSource,hoverCubeContents,hoverCubePosition,timelineCubeInfo} from "./work-readable-cubes.js";
+import {orbitDropMinute} from './work-orbit-drop.js';
 
 
 import {sourceImportance as canonicalSourceImportance,sourceImportanceTarget,saveSourceImportance,sourceNote} from "./work-source-importance.js";
@@ -164,9 +165,9 @@ export function createWorkConstructor(root,ctx){
   }
   function timelineHtml(m){
     const entries=dayTimelineEntries(m),fixed=entries.events.map(e=>'<div class="cc-event" style="left:'+clamp((e.start-START)/(END-START)*100,0,100)+'%;width:'+Math.max(.5,e.minutes/(END-START)*100)+'%" data-ctooltip="'+safe(e.title+" · "+clock(e.start)+"–"+clock(e.start+e.minutes))+'"><b>'+safe(e.title)+'</b><small>'+safe(clock(e.start))+'</small></div>').join("");
-    const chosen=entries.cubes.map(c=>'<button class="cc-timeline-cube" data-ccube="'+safe(c.id)+'" data-tray="timeline" data-ctooltip="'+safe(c.title)+'" style="left:'+((c.start-START)/(END-START)*100)+'%;width:'+(c.minutes/(END-START)*100)+'%;background:'+(COLORS[c.type]||COLORS.task)+';'+(pendingBlocks.has(c.id)?"visibility:hidden":"")+'"><b>'+safe(c.title)+'</b><small>'+safe(clock(c.start))+" · "+safe(minutes(c.minutes))+'</small>'+(m.initialized&&writable()&&!['calendar','weekly_review'].includes(c.kind)&&!Number(c.progress_percent)&&!Number(c.actual_minutes)?'<span class="cc-time-resize" data-timeline-resize aria-hidden="true"></span>':'')+'</button>').join("");
+    const chosen=entries.cubes.map(c=>{const detail=timelineCubeInfo(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task,importance:sourceImportance(c)});return '<button class="cc-timeline-cube" data-ccube="'+safe(c.id)+'" data-tray="timeline" data-ctooltip="'+safe(c.title)+'" aria-label="'+safe(detail)+'" style="left:'+((c.start-START)/(END-START)*100)+'%;width:'+(c.minutes/(END-START)*100)+'%;background:'+(COLORS[c.type]||COLORS.task)+';'+(pendingBlocks.has(c.id)?"visibility:hidden":"")+'"><b>'+safe(c.title)+'</b><small>'+safe(clock(c.start))+" · "+safe(minutes(c.minutes))+'</small>'+(m.initialized&&writable()&&!['calendar','weekly_review'].includes(c.kind)&&!Number(c.progress_percent)&&!Number(c.actual_minutes)?'<span class="cc-time-resize" data-timeline-resize aria-hidden="true"></span>':'')+'</button>';}).join("");
     const fullDate=dateLabel(selectedDate,true);
-    return '<section class="cc-timeline-panel" data-testid="constructor-day"><nav class="cc-date" aria-label="'+safe(t('Выбранная дата')+' · '+fullDate)+'"><button data-action="previous" aria-label="'+safe(t('Предыдущий день'))+'" title="'+safe(t('Предыдущий день'))+'">'+ic('chevL')+'</button><time datetime="'+selectedDate+'" title="'+safe(fullDate)+'" aria-label="'+safe(fullDate)+'">'+safe(compactTimelineDate(selectedDate))+'</time><button data-action="next" aria-label="'+safe(t('Следующий день'))+'" title="'+safe(t('Следующий день'))+'">'+ic('chevR')+'</button></nav><div class="cc-time-scroll"><div class="cc-timeline" data-testid="constructor-timeline">'+Array.from({length:15},(_,i)=>'<span class="cc-hour" style="left:'+i/14*100+'%">'+clock(START+i*60)+'</span><i class="cc-tick" style="left:'+i/14*100+'%"></i>').join("")+fixed+chosen+timelineNowHtml()+'</div></div></section>';
+    return '<section class="cc-timeline-panel" data-testid="constructor-day"><nav class="cc-date" aria-label="'+safe(t('Выбранная дата')+' · '+fullDate)+'"><button data-action="previous" aria-label="'+safe(t('Предыдущий день'))+'" title="'+safe(t('Предыдущий день'))+'">'+ic('chevL')+'</button><time datetime="'+selectedDate+'" title="'+safe(fullDate)+'" aria-label="'+safe(fullDate)+'">'+safe(compactTimelineDate(selectedDate))+'</time><button data-action="next" aria-label="'+safe(t('Следующий день'))+'" title="'+safe(t('Следующий день'))+'">'+ic('chevR')+'</button></nav><div class="cc-time-scroll"><div class="cc-timeline-info" data-testid="timeline-cube-info" aria-live="off"></div><div class="cc-timeline" data-testid="constructor-timeline">'+Array.from({length:15},(_,i)=>'<span class="cc-hour" style="left:'+i/14*100+'%">'+clock(START+i*60)+'</span><i class="cc-tick" style="left:'+i/14*100+'%"></i>').join("")+fixed+chosen+timelineNowHtml()+'</div></div></section>';
   }
   function cubeHtml(cube,tray,variant="day"){
     const c={...cube,...drafts.get(cube.id)},size=cubeDimensions(c.minutes,variant),type=c.type||typeOf(c),color=COLORS[type]||COLORS.task,selected=isSelected(c.id),full=[c.title,c.taskTitle,c.segmentTitle,TYPES[type],minutes(c.minutes),c.comment].filter(Boolean).join(" · ");
@@ -565,6 +566,13 @@ export function createWorkConstructor(root,ctx){
     }
     drag={id:c.id,c,source:element,tray:element.dataset.tray,x:event.clientX,y:event.clientY,active:false,pointer:event.pointerId,snap:null};
   }
+  function orbitDropAt(x,y){
+    const svg=$('.cc-orbit-host svg');
+    return svg?orbitDropMinute(svg.getBoundingClientRect(),x,y):null;
+  }
+  function orbitDropHint(host,label,valid){
+    const hint=document.createElement('div');hint.className='cc-orbit-drop-hint'+(valid?'':' is-invalid');hint.textContent=label;host.append(hint);
+  }
   function pointerMove(event){
     lastHoverPoint={x:event.clientX,y:event.clientY};
     if(!drag||event.pointerId!==drag.pointer){hoverTooltip(event);return;}
@@ -575,13 +583,17 @@ export function createWorkConstructor(root,ctx){
     }
     if(!drag.active&&Math.hypot(event.clientX-drag.x,event.clientY-drag.y)<5)return;
     if(!drag.active){
-      drag.active=true;closePopup();hideTooltip();for(const item of physics.values())item.pause();const ghost=document.createElement("div"),size=cubeDimensions(drag.c.minutes);ghost.className="cc-drag-ghost rc-card";ghost.dataset.layout=readableLayout();ghost.style.width=size.width+"px";ghost.style.height=size.height+"px";ghost.innerHTML=readableCardContents(drag.c,{typeLabel:TYPES[drag.c.type]||TYPES.task,duration:minutes(compactCardMinutes(drag.c))});document.body.append(ghost);drag.ghost=ghost;drag.source.style.opacity=".2";
+      drag.active=true;closePopup();hideTooltip();clearTimelineInfo();for(const item of physics.values())item.pause();const ghost=document.createElement("div"),size=cubeDimensions(drag.c.minutes);ghost.className="cc-drag-ghost rc-card";ghost.dataset.layout=readableLayout();ghost.style.width=size.width+"px";ghost.style.height=size.height+"px";ghost.innerHTML=readableCardContents(drag.c,{typeLabel:TYPES[drag.c.type]||TYPES.task,duration:minutes(compactCardMinutes(drag.c))});document.body.append(ghost);drag.ghost=ghost;drag.source.style.opacity=".2";
     }
-    event.preventDefault();const size=cubeDimensions(drag.c.minutes),timeline=$(".cc-timeline"),near=boundsHit(timeline,event.clientX,event.clientY,45);drag.ghost.style.left=event.clientX-size.width/2+"px";drag.ghost.style.top=event.clientY-size.height/2+"px";drag.ghost.style.transform="";drag.snap=null;$(".cc-snap")?.remove();
+    event.preventDefault();const size=cubeDimensions(drag.c.minutes),timeline=$(".cc-timeline"),near=boundsHit(timeline,event.clientX,event.clientY,45),ringMinute=near?null:orbitDropAt(event.clientX,event.clientY);drag.ghost.style.left=event.clientX-size.width/2+"px";drag.ghost.style.top=event.clientY-size.height/2+"px";drag.ghost.style.transform="";drag.snap=null;$(".cc-snap")?.remove();
     if(near){const bounds=timeline.getBoundingClientRect(),desired=START+(event.clientX-bounds.left)/bounds.width*(END-START)-drag.c.minutes/2,start=snapSlot(drag.id,drag.c.minutes,desired),snap=document.createElement("div");snap.className="cc-snap";snap.textContent=start===null?t("Нет свободного места"):clock(start);snap.style.left=(start===null?40:(start-START)/(END-START)*100)+"%";snap.style.width=(start===null?20:drag.c.minutes/(END-START)*100)+"%";timeline.append(snap);drag.snap=start;
       if(start!==null){const orbit=$(".cc-orbit-host");if(orbit){orbit.innerHTML=orbitHtml(transientOrbitModel(model(),drag.c,start));mountOrbitFeatures(orbit);}const center=bounds.left+(start-START+drag.c.minutes/2)/(END-START)*bounds.width;drag.ghost.style.left=(event.clientX*.78+center*.22)-size.width/2+"px";drag.ghost.style.top=(event.clientY*.78+(bounds.top+46)*.22)-size.height/2+"px";drag.ghost.style.transform="scale(1.1,.78)";}
     }
-    if(!near||drag.snap===null){const orbit=$(".cc-orbit-host");if(orbit){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}}
+    if(ringMinute!==null){
+      const desired=ringMinute-drag.c.minutes/2,start=snapSlot(drag.id,drag.c.minutes,desired),orbit=$('.cc-orbit-host');drag.snap=start;
+      if(orbit){orbit.innerHTML=orbitHtml(start===null?model():transientOrbitModel(model(),drag.c,start));mountOrbitFeatures(orbit);orbitDropHint(orbit,start===null?t('Нет свободного места нужной длительности.'):clock(start),start!==null);}
+      if(start!==null)drag.ghost.style.transform='scale(1.1,.78)';
+    }else if(!near||drag.snap===null){const orbit=$(".cc-orbit-host");if(orbit){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}}
     for(const zone of root.querySelectorAll("[data-trash],[data-physical],[data-catalog-drop]"))zone.classList.toggle("is-drop",boundsHit(zone,event.clientX,event.clientY,10));
   }
   function pointerUp(event){
@@ -595,10 +607,11 @@ export function createWorkConstructor(root,ctx){
         return constructorPatch(previous.base,{...latest,minutes:previous.minutes},latest,new Set(["minutes"]));
       }).catch(reportError);return;
     }
-    if(!drag||event.pointerId!==drag.pointer)return;const previous=drag,origin=drag.ghost?.getBoundingClientRect();if(!previous.active){drag=null;return;}suppressClick=Date.now()+450;const bin=[...root.querySelectorAll("[data-trash]")].find(el=>boundsHit(el,event.clientX,event.clientY)),left=$('[data-physical="selected"]'),right=$('[data-catalog-drop]'),timeline=$(".cc-timeline"),overTimeline=boundsHit(timeline,event.clientX,event.clientY,45);cleanupDrag();
+    if(!drag||event.pointerId!==drag.pointer)return;const previous=drag,origin=drag.ghost?.getBoundingClientRect();if(!previous.active){drag=null;return;}suppressClick=Date.now()+450;const bin=[...root.querySelectorAll("[data-trash]")].find(el=>boundsHit(el,event.clientX,event.clientY)),left=$('[data-physical="selected"]'),right=$('[data-catalog-drop]'),timeline=$(".cc-timeline"),overTimeline=boundsHit(timeline,event.clientX,event.clientY,45),ringMinute=overTimeline?null:orbitDropAt(event.clientX,event.clientY);cleanupDrag();
     void (async()=>{
       if(bin){await ensureDay();await hideCube(previous.id,bin,origin);return;}
       if(overTimeline){if(previous.snap===null)throw new Error(t("Нет свободного места нужной длительности."));await placeOnTimeline(previous.id,previous.snap,origin);return;}
+      if(ringMinute!==null){const start=snapSlot(previous.id,previous.c.minutes,ringMinute-previous.c.minutes/2);if(start===null)throw new Error(t("Нет свободного места нужной длительности."));await placeOnTimeline(previous.id,start,origin);return;}
       const target=boundsHit(left,event.clientX,event.clientY)?"selected":boundsHit(right,event.clientX,event.clientY)?"possible":null;
       if(!target){render();return;}
       pendingBlocks.add(previous.id);
@@ -615,19 +628,23 @@ export function createWorkConstructor(root,ctx){
   }
   function pointerCancel(event){if(drag&&event.pointerId===drag.pointer){cleanupDrag();render();}}
   let tooltip=null,lastHoverPoint=null,hoverKey=null;
+  function clearTimelineInfo(){const strip=$('.cc-timeline-info');if(strip){strip.textContent='';strip.removeAttribute('title');strip.removeAttribute('aria-label');strip.classList.remove('has-cube');}}
+  function showTimelineInfo(c){const strip=$('.cc-timeline-info');if(!strip)return;const line=timelineCubeInfo(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task,importance:sourceImportance(c)});strip.textContent=line;strip.title=line;strip.setAttribute('aria-label',line);strip.classList.add('has-cube');}
   function hideTooltip(){tooltip?.remove();tooltip=null;hoverKey=null;}
-  function leaveHover(){lastHoverPoint=null;hideTooltip();}
+  function leaveHover(){lastHoverPoint=null;hideTooltip();clearTimelineInfo();}
   function updateHoverTarget(element){
-    if(disposed||drag?.active||popup||document.hidden||(globalThis.matchMedia?.('(hover: none)').matches&&element!==document.activeElement)){hideTooltip();return;}
-    const target=element?.closest?.('[data-ccube],.rc-source-card,.cc-trophy,.cc-history-member,[data-ctooltip]');if(!target||!root.contains(target)){hideTooltip();return;}
+    if(disposed||drag?.active||popup||document.hidden||(globalThis.matchMedia?.('(hover: none)').matches&&element!==document.activeElement)){hideTooltip();clearTimelineInfo();return;}
+    const target=element?.closest?.('[data-ccube],.rc-source-card,.cc-trophy,.cc-history-member,[data-ctooltip]');if(!target||!root.contains(target)){hideTooltip();clearTimelineInfo();return;}
     const carrier=target.closest('[data-ccube],[data-row-id],[data-id]'),id=target.dataset.ccube||target.dataset.rowId||target.dataset.id||carrier?.dataset.ccube||carrier?.dataset.rowId||carrier?.dataset.id;
     const c=id?(find(id)||historyCubes(planning(),{includeArchived:true}).find(cube=>cube.id===id)):null;
-    if(!c){hideTooltip();return;}
+    if(!c){hideTooltip();clearTimelineInfo();return;}
+    if(target.dataset.tray==='timeline'||carrier?.dataset.tray==='timeline'){hideTooltip();showTimelineInfo(c);return;}
+    clearTimelineInfo();
     const anchor=target.closest('.rc-source-card,.cc-cube,.cc-trophy,.cc-history-member')||target;
     const key=id+':'+(anchor.dataset.rowId?'source':anchor.className);
     if(hoverKey!==key)hideTooltip();
     if(!tooltip){tooltip=document.createElement('div');tooltip.className='cc-hover-tooltip is-positioning';tooltip.dataset.testid='cube-hover-info';tooltip.setAttribute('role','tooltip');tooltip.innerHTML=hoverCubeContents(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task});document.body.append(tooltip);hoverKey=key;}
-    const rect=anchor.getBoundingClientRect();tooltip.style.width=Math.min(236,window.innerWidth-16)+'px';
+    const rect=anchor.getBoundingClientRect();tooltip.style.width=Math.min(118,window.innerWidth-16)+'px';
     const position=hoverCubePosition(rect,{width:window.innerWidth,height:window.innerHeight},{height:tooltip.getBoundingClientRect().height});
     tooltip.style.left=position.left+'px';tooltip.style.top=position.top+'px';
     tooltip.style.setProperty('--rc-start-x',String(Math.max(.1,Math.min(1,rect.width/position.width))));
@@ -638,7 +655,7 @@ export function createWorkConstructor(root,ctx){
   function hoverTooltip(event){lastHoverPoint={x:event.clientX,y:event.clientY};updateHoverTarget(event.target);}
   function refreshHoverFromPoint(){if(lastHoverPoint)updateHoverTarget(document.elementFromPoint(lastHoverPoint.x,lastHoverPoint.y));}
   function focusHover(event){if(event.target.closest?.('[data-ccube],.cc-trophy,.cc-history-member'))updateHoverTarget(event.target);}
-  function blurHover(event){if(!event.relatedTarget?.closest?.('[data-ccube],.cc-trophy,.cc-history-member'))hideTooltip();}
+  function blurHover(event){if(!event.relatedTarget?.closest?.('[data-ccube],.cc-trophy,.cc-history-member')){hideTooltip();clearTimelineInfo();}}
   function keyDown(event){
     if(event.key==="Escape"){closePopup();cleanupDrag();leaveHover();render();return;}
     const task=event.target.closest?.(".cc-task");if(task&&["ArrowLeft","ArrowRight"].includes(event.key)){const tasks=[...root.querySelectorAll(".cc-task")],index=tasks.indexOf(task),next=tasks[clamp(index+(event.key==="ArrowLeft"?-1:1),0,tasks.length-1)];event.preventDefault();next?.focus();next?.scrollIntoView({block:"nearest",inline:"nearest"});}

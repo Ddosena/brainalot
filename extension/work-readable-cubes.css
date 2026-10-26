@@ -133,3 +133,18 @@ body:has(#planning-root:not([hidden]) .work-constructor[data-collecting="true"])
 .rc-card .token.small-award-token{padding:4px 4px}
 .rc-card .token.small-award-token .compact-award-top{gap:2px}
 .rc-card .token.small-award-token .wta-art--compact{width:17px;height:17px}
+
+/* Hover previews stay close to the physical tokens; the linear axis has its own quiet readout. */
+.cc-hover-tooltip{width:118px;min-height:min(74px,calc(100vh - 16px));max-height:min(110px,calc(100vh - 16px));gap:4px;padding:5px 6px;font-size:11px;line-height:1.15}
+.cc-hover-tooltip .rc-hover-art{flex-basis:16px}.cc-hover-tooltip .rc-hover-art .wta-art--compact{width:16px;height:16px}
+.cc-hover-tooltip .rc-hover-copy{gap:2px}
+.cc-hover-tooltip .rc-hover-copy>strong{font-size:11px;line-height:1.12;-webkit-line-clamp:2}
+.cc-hover-tooltip .rc-hover-copy>small{font-size:10px;-webkit-line-clamp:1}
+.cc-hover-tooltip .rc-hover-output{font-size:10px;-webkit-line-clamp:2}
+.cc-hover-tooltip .rc-hover-meta{font-size:10px;line-height:1.1}
+.cc-hover-tooltip .rc-done-check{width:12px;height:12px}
+.cc-time-scroll>.cc-timeline-info{position:sticky;left:0;z-index:2;display:block;box-sizing:border-box;width:100%;height:22px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;padding:3px 4px;border-bottom:1px solid #36566a;color:var(--cc-muted);font-size:11px;line-height:15px}
+.cc-time-scroll>.cc-timeline-info.has-cube{color:var(--cc-text)}
+.cc-orbit-host{position:relative}
+.cc-orbit-drop-hint{position:absolute;left:50%;bottom:2px;transform:translateX(-50%);max-width:90%;padding:3px 7px;border:1px solid #5daec0;border-radius:4px;background:#102d3be8;color:#def8ff;font-size:11px;line-height:1.2;text-align:center;pointer-events:none;white-space:nowrap}
+.cc-orbit-drop-hint.is-invalid{border-color:#c97975;color:#ffe3df}

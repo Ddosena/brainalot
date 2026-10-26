@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readableCardDimensions,sourceCardContents,readableCardContents,hoverCubeContents,hoverCubePosition} from '../work-readable-cubes.js';
+import {readableCardDimensions,sourceCardContents,readableCardContents,hoverCubeContents,hoverCubePosition,timelineCubeInfo} from '../work-readable-cubes.js';
 import {cubeDimensions,trayCapacity} from '../work-constructor-model.js';
 
 const cube={id:'sample',title:'Подготовить подробный план занятия',minutes:60,progress_percent:0,kind:'task',output:'Согласованный конспект'};
@@ -32,8 +32,15 @@ test('expanded cube shows title, context and short result inside viewport',()=>{
   assert.match(html,/Подготовить подробный план занятия/);
   assert.match(html,/Согласованный конспект/);
   assert.equal((hoverCubeContents({...cube,taskTitle:cube.title}).match(/Подготовить подробный план занятия/g)||[]).length,1);
-  const pos=hoverCubePosition({left:375,top:580,width:123,height:92},{width:390,height:640},{height:180});
-  assert.equal(pos.width,236);
+  const pos=hoverCubePosition({left:375,top:580,width:123,height:92},{width:390,height:640},{height:110});
+  assert.equal(pos.width,118);
   assert.ok(pos.left>=8&&pos.left+pos.width<=382);
-  assert.ok(pos.top>=8&&pos.top+180<=632);
+  assert.ok(pos.top>=8&&pos.top+110<=632);
+});
+
+test('timeline readout retains full facts on one line',()=>{
+  const item={...cube,taskTitle:'Курс',progress_percent:35,actual_minutes:17};
+  const line=timelineCubeInfo(item,{importance:4});
+  for(const part of [item.title,'Курс','План: 60 мин','Готовность: 35%','Факт: 17 мин','Важность: 4/5',item.output])assert.ok(line.includes(part));
+  assert.ok(!line.includes('\n'));
 });

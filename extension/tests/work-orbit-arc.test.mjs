@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {renderDayOrbit,orbitArcPath,lessonTextPath,lessonTitle,wrapLessonTitle} from '../work-day-orbit.js';
+import {renderDayOrbit,orbitArcPath,lessonTextPath,lessonTitle,wrapLessonTitle,fitOrbitLabels} from '../work-day-orbit.js';
 
 const event=(id,start,minutes,title)=>({id,start,minutes,title,required:true,color:'#e8b55b'});
 const measure=(value,font)=>Array.from(value).length*font*.54;
@@ -60,4 +60,47 @@ test('side arcs turn text upright at 16:00 and keep 22:00 clockwise',()=>{
   const second=html.match(/data-lesson-id="twentytwo"[\s\S]*?<defs><path id="[^"]+" d="([^"]+)"/)?.[1];
   assert.equal(first,lessonTextPath(960,1020,720,1440,110,true));
   assert.equal(second,lessonTextPath(1320,1380,720,1440,132,false));
+});
+
+test('adaptive labels keep roomy incumbent layout and rotate only tight work and lessons',()=>{
+ const html=renderDayOrbit({date:'2026-10-26',events:[
+  event('roomy-lesson',1080,90,'Урок: разбор работ'),
+  event('tight-lesson',1380,20,'Урок: подготовка к лепке')
+ ],cubes:[
+  {id:'roomy-work',start:900,minutes:90,title:'Печать'},
+  {id:'tight-work',start:1020,minutes:20,title:'Подготовить урок по Blender'}
+ ]});
+ assert.match(html,/data-lesson-layout="adaptive"/);
+ assert.match(html,/data-orbit-id="roomy-work"[^>]*data-orbit-label-mode="tangent"/);
+ assert.match(html,/data-orbit-id="tight-work"[^>]*data-orbit-label-mode="radial"/);
+ assert.match(html,/data-lesson-id="roomy-lesson"[^>]*data-orbit-label-mode="tangent"|data-orbit-label-mode="tangent"[^>]*data-lesson-id="roomy-lesson"/);
+ assert.match(html,/data-lesson-id="tight-lesson"[^>]*data-orbit-label-mode="radial"|data-orbit-label-mode="radial"[^>]*data-lesson-id="tight-lesson"/);
+ assert.match(html,/data-orbit-label-full="Подготовить урок по Blender"/);
+ assert.match(html,/Открыть: 17:00–17:20 · Подготовить урок по Blender/);
+ assert.match(html,/<title>Урок: подготовка к лепке · 23:00–23:20<\/title>/);
+ assert.match(html,/cc-orbit-radial-title[^>]*rotate\(/);
+ assert.doesNotMatch(html,/<text[^>]*>[^<]*<script>/);
+ const radial=html.match(/data-orbit-id="tight-work"[\s\S]*?cc-orbit-radial-title" data-line="0" transform="translate\(([-\d.]+) ([-\d.]+)\)/);
+ assert.ok(radial,'tight work has radial text');
+ assert.ok(Math.abs(Math.hypot(Number(radial[1])-180,Number(radial[2])-180)-128)<1,'radial label center is outside the center readout');
+});
+
+test('actual SVG text measurement can switch a predicted tangent label to radial',()=>{
+ const originalDocument=globalThis.document;
+ const node=()=>({style:{},attrs:new Set(),textContent:'',setAttribute(key){this.attrs.add(key);},removeAttribute(key){this.attrs.delete(key);},hasAttribute(key){return this.attrs.has(key);},toggleAttribute(key,value){value?this.attrs.add(key):this.attrs.delete(key);}});
+ const tangentText={...node(),getComputedTextLength(){return 120;},querySelector(){return null;}};
+ const radialTexts=[node(),node()].map(text=>({...text,getComputedTextLength(){return this.textContent.length*12;}}));
+ const tangent={...node(),querySelectorAll:()=>[tangentText]};
+ const radial={...node(),querySelectorAll:()=>radialTexts};
+ const group={dataset:{orbitLabelFull:'Печать',orbitLabelKind:'work',orbitTangentWidth:'100'},querySelector:selector=>selector.includes('tangent')?tangent:radial};
+ globalThis.document={createElement:()=>({getContext:()=>({font:'',measureText:value=>({width:value.length*5})})})};
+ try{
+  const result=fitOrbitLabels({querySelectorAll:()=>[group]});
+  assert.equal(result[0].mode,'radial');
+  assert.equal(group.dataset.orbitLabelMode,'radial');
+  assert.equal(tangent.hasAttribute('hidden'),true);
+  assert.equal(radial.hasAttribute('hidden'),false);
+  assert.ok(radialTexts[0].getComputedTextLength()<=70,'measured radial line stays inside the 70px allowance');
+  assert.match(radialTexts[0].textContent,/^Печ/);
+ }finally{globalThis.document=originalDocument;}
 });

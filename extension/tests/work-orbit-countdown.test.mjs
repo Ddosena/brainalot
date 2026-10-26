@@ -88,27 +88,40 @@ class FakeNode{
  dispatch(type,event={}){this.listeners.get(type)?.(event);}
 }
 
-test('mount adapts mouse pointer to passive SVG line, hides and cleans up',()=>{
+test('mount starts at now, changes one sleep countdown on hover, resets and cleans up',()=>{
  const svg=new FakeNode('svg');
  svg.getScreenCTM=()=>({inverse:()=>({})});
  svg.createSVGPoint=()=>({x:0,y:0,matrixTransform(){return this;}});
  const section={dataset:{orbitDate:'2026-10-26'},matches:()=>true,querySelector:selector=>selector==='svg'?svg:null};
- const cleanup=mountOrbitCountdown(section,{getNow:()=>new Date('2026-10-26T15:00:00Z')});
- const layer=svg.children[0],line=layer.children[0],label=layer.children[2];
- assert.equal(layer.getAttribute('hidden'),'');
+ let now='2026-10-26T15:00:00Z';
+ const cleanup=mountOrbitCountdown(section,{getNow:()=>new Date(now)});
+ const layer=svg.children[0],line=layer.children[0],label=layer.children[1];
+ assert.equal(layer.getAttribute('hidden'),null);
+ assert.equal(line.getAttribute('hidden'),'');
+ assert.match(label.textContent,/До сна · 7 ч 00 мин/);
+ assert.equal(layer.children.length,2,'one readout and no outer dot');
  const [clientX,clientY]=polar(1140);
  svg.dispatch('pointermove',{pointerType:'mouse',clientX,clientY});
  assert.equal(layer.getAttribute('hidden'),null);
- assert.ok(Number.isFinite(Number(line.getAttribute('x1'))));
- assert.ok(Number.isFinite(Number(line.getAttribute('y2'))));
- assert.match(label.textContent,/До 01:00 · 6 ч 00 мин/);
- svg.dispatch('pointerleave');assert.equal(layer.getAttribute('hidden'),'');
+ assert.equal(line.getAttribute('hidden'),null);
+ for(const [x,y] of [[line.getAttribute('x1'),line.getAttribute('y1')],[line.getAttribute('x2'),line.getAttribute('y2')]]){
+  const radius=Math.hypot(Number(x)-180,Number(y)-180);
+  assert.ok(radius>=74.9&&radius<=83.1,`inner tick radius ${radius}`);
+ }
+ assert.match(label.textContent,/До сна · 6 ч 00 мин/);
+ now='2026-10-26T15:05:00Z';
+ svg.dispatch('pointerleave');
+ assert.equal(layer.getAttribute('hidden'),null);
+ assert.equal(line.getAttribute('hidden'),'');
+ assert.match(label.textContent,/До сна · 6 ч 55 мин/);
  section.dataset.orbitDate='2026-10-25';
  svg.dispatch('pointermove',{pointerType:'mouse',clientX,clientY});
  assert.equal(layer.getAttribute('hidden'),'');
  section.dataset.orbitDate='2026-10-26';
  svg.dispatch('pointermove',{pointerType:'touch',clientX,clientY});
- assert.equal(layer.getAttribute('hidden'),'');
+ assert.equal(layer.getAttribute('hidden'),null);
+ assert.equal(line.getAttribute('hidden'),'');
+ assert.match(label.textContent,/До сна · 6 ч 55 мин/);
  cleanup();
  assert.equal(svg.children.length,0);
  assert.equal(svg.listeners.size,0);
@@ -120,15 +133,16 @@ test('mount keeps backward drag at now and resets unwrapped anchor on leave',()=
  svg.createSVGPoint=()=>({x:0,y:0,matrixTransform(){return this;}});
  const section={dataset:{orbitDate:'2026-10-26'},matches:()=>true,querySelector:()=>svg};
  const cleanup=mountOrbitCountdown(section,{getNow:()=>new Date('2026-10-26T13:20:00Z')});
- const layer=svg.children[0],label=layer.children[2];
+ const layer=svg.children[0],label=layer.children[1];
  for(const minute of [960,900,780,750]){
   const [clientX,clientY]=polar(minute);
   svg.dispatch('pointermove',{pointerType:'mouse',clientX,clientY});
-  assert.match(label.textContent,/8 ч 40 мин/);
+  assert.match(label.textContent,/До сна · 8 ч 40 мин/);
  }
  svg.dispatch('pointerleave');
+ assert.match(label.textContent,/До сна · 8 ч 40 мин/);
  const [clientX,clientY]=polar(750);
  svg.dispatch('pointermove',{pointerType:'mouse',clientX,clientY});
- assert.match(label.textContent,/30 мин/);
+ assert.match(label.textContent,/До сна · 30 мин/);
  cleanup();
 });
