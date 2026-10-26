@@ -1,15 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import vm from "node:vm";
 import { cubeDimensions,trayCapacity,nearestSlot,nearestPlanningSlot,constructorModel,resourcesForSave,resourcesForEdit,launchGroups,validUrl,todayIn,monday,formatReadiness } from "../work-constructor-model.js";
-import { physicsWorld,stepPhysics,physicsPositions,createTrayPhysics } from "../work-constructor-physics.js";
-import { cubeCommand,constructorPatch,weekProposals,groupWeekCubes,releaseTrayDrop,createWorkConstructor } from "../work-constructor.js";
+import { slotLayout,createTraySlots,shouldUnstickPanel } from "../work-constructor-slots.js";
+import { cubeCommand,constructorPatch,weekProposals,groupWeekCubes,createWorkConstructor } from "../work-constructor.js";
 import { historyCubes,goalMembers,monthGoals,weightedReadiness,pedestalShelf,awardsPanel,monthHtml,dayAwards } from "../work-constructor-history.js";
 import { AWARD_VARIANTS } from "../work-trophy-art.js";
 
-test("approved fixed compact tokens fit the tray regardless of their planned minutes",()=>{
-  for(const variant of ["day","week"])for(let m=0;m<=240;m+=5)assert.deepEqual(cubeDimensions(m,variant),{width:84,height:59});
+test("approved compact tokens fit ordered slots regardless of their planned minutes",()=>{
+  for(const variant of ["day","week"])for(let m=0;m<=240;m+=5)assert.deepEqual(cubeDimensions(m,variant),{width:89,height:62});
   for(const width of [290,345,410,540,800])for(let count=1;count<=25;count++){
     const sizes=Array.from({length:count},(_,i)=>cubeDimensions([15,30,60,120,240][i%5])),capacity=trayCapacity(width,sizes),boxes=sizes.map((s,i)=>({...s,x:8+i%capacity.columns*capacity.cellWidth,y:capacity.height-s.height-10-Math.floor(i/capacity.columns)*capacity.rowHeight}));
     for(const b of boxes){assert.ok(b.x>=0&&b.x+b.width<=width);assert.ok(b.y>=0&&b.y+b.height<=capacity.height);}
@@ -74,37 +72,19 @@ test("resource drafts persist safely, opening uses only canonical HTTP(S) withou
   for(const bad of ["javascript:alert(1)","data:text/html,x","file:///c:/secret","https://a:b@example.test/x","http://",""])assert.equal(validUrl(bad),null);
   const command=cubeCommand({...payload,id:"cube",kind:"task",task_id:"task",minutes:60,title:"A",selected_date:"2030-03-04",token:"never",candidate:true});assert.ok(!Object.hasOwn(command,"selected_date"));assert.ok(!Object.hasOwn(command,"token"));assert.ok(command.resource_drafts);
 });
-function loadMatter(){const context=vm.createContext({console,setTimeout,clearTimeout,Date,Math});vm.runInContext(readFileSync(new URL("../vendor/matter-0.20.0.min.js",import.meta.url),"utf8"),context);return context.Matter;}
-test("real vendored rigid bodies collide and sleep while keeping compact titles upright",()=>{
-  const Matter=loadMatter();assert.equal(Matter.version,"0.20.0");
-  const world=physicsWorld([{id:"base",width:118,height:52,position:{x:100,y:346,angle:0}},{id:"fall",width:118,height:52,position:{x:190,y:40,angle:2},awake:true}],420,400,Matter);
-  let maxAngle=0;for(let i=0;i<600;i++){stepPhysics(world);maxAngle=Math.max(maxAngle,Math.abs(world.bodies.get("fall").angle));}
-  assert.equal(maxAngle,0,"compact readable tokens stay upright while Matter handles gravity and collisions");assert.ok([...world.bodies.values()].every(b=>b.isSleeping));
-  for(const body of world.bodies.values()){assert.ok(body.bounds.min.x>=1.9&&body.bounds.max.x<=418.1);assert.ok(body.bounds.min.y>=.9&&body.bounds.max.y<=398.1);}
-  const restored=physicsWorld([{id:"rotated",width:118,height:52,position:{x:5,y:340,angle:90}}],300,400,Matter),body=restored.bodies.get("rotated");assert.ok(body.bounds.max.y<=398.1);assert.equal(physicsPositions(restored).rotated.angle,0);
-  const saved=physicsPositions(restored),again=physicsWorld([{id:"rotated",width:118,height:52,position:saved.rotated}],300,400,Matter);assert.ok(Math.abs(again.bodies.get("rotated").position.x-body.position.x)<.02);
-});
-test("tray drop bridge wakes a saved inside body and settles its upright RAF loop",()=>{
-  const globals={document:globalThis.document,matchMedia:globalThis.matchMedia,requestAnimationFrame:globalThis.requestAnimationFrame,cancelAnimationFrame:globalThis.cancelAnimationFrame},queue=[],els=["base","fall"].map(id=>({dataset:{ccube:id,minutes:"60"},style:{}})),positions={base:{x:100,y:346,angle:0},fall:{x:190,y:40,angle:2}};let settled=0,iterations=0,maxAngle=0;
-  Object.assign(globalThis,{document:{hidden:false,addEventListener(){},removeEventListener(){}},matchMedia:()=>({matches:false}),requestAnimationFrame:fn=>{queue.push(fn);return queue.length;},cancelAnimationFrame(){}});
-  const instance=createTrayPhysics({clientWidth:420,clientHeight:400,querySelectorAll:()=>els},{Matter:loadMatter(),positions,awakeIds:["fall"],onSettled(){settled++;}});
-  try{while(queue.length&&iterations<600){queue.shift()(++iterations*1000/60);const angle=Number(els[1].style.transform?.match(/rotate\(([-.\d]+)/)?.[1]||0);maxAngle=Math.max(maxAngle,Math.abs(angle));}assert.equal(maxAngle,0);assert.ok(iterations<=480);assert.equal(queue.length,0);assert.equal(settled,1);assert.ok(instance.snapshot().fall.y>positions.fall.y);}finally{instance.destroy();Object.assign(globalThis,globals);}
-});
-test("same-tray release coordinates survive the outgoing physics snapshot",async()=>{
-  const key="2030-03-04:selected",cache=new Map([[key,{cube:{x:10,y:8.83,angle:0}}]]),awake=new Set(),release={x:161,y:110,angle:0};let world=true;
-  const snapshot=()=>{if(world){cache.set(key,{cube:{x:10,y:8.83,angle:0}});world=false;}};
-  await releaseTrayDrop({cache,key,id:"cube",position:release,awake,snapshot,render(){snapshot();}});
-  assert.deepEqual(cache.get(key).cube,release);assert.ok(awake.has("cube"));
-});
-test("cross-tray release waits for async CAS/intermediate render before overriding world coordinates",async()=>{
-  for(const target of ["selected","possible"]){
-    const key="2030-03-04:"+target,cache=new Map(),awake=new Set(),release={x:161,y:110,angle:0},calls=[];let resume,world=false;
-    const confirmed=new Promise(resolve=>{resume=resolve;});
-    const snapshot=()=>{calls.push("snapshot");if(world){cache.set(key,{cube:{x:10,y:8.83,angle:0}});world=false;}};
-    const operation=releaseTrayDrop({cache,key,id:"cube",position:release,awake,snapshot,async applySelection(){calls.push("CAS");await confirmed;world=true;calls.push("intermediate-world");},render(){calls.push("render");snapshot();}});
-    assert.ok(!cache.has(key));resume();await operation;
-    assert.deepEqual(calls,["CAS","intermediate-world","snapshot","render","snapshot"]);assert.deepEqual(cache.get(key).cube,release);assert.ok(awake.has("cube"));
+test("ordered slots expand in rows, ignore legacy coordinates and do not persist layout",()=>{
+  const size=cubeDimensions(60),items=Array.from({length:40},(_,i)=>({dataset:{ccube:`cube-${i}`,minutes:'60'}}));
+  for(const width of [260,390,820])for(const count of [0,1,8,10,24,40]){
+    const layout=slotLayout(width,count,size);
+    assert.equal(layout.positions.length,count);assert.equal(layout.rows,Math.max(1,Math.ceil(count/layout.columns)));
+    for(const p of layout.positions){assert.equal(p.angle,0);assert.ok(p.x>=9&&p.x+size.width<=width-7);assert.ok(p.y>=9&&p.y+size.height<=layout.height-8);}
+    assert.deepEqual(layout.positions,slotLayout(width,count,size).positions);
   }
+  const classes=new Set(),container={clientWidth:390,querySelectorAll:()=>items,classList:{add:name=>classes.add(name)},style:{},dataset:{}};
+  let writes=0;const slots=createTraySlots(container,{positions:{'cube-0':{x:999,y:999,angle:42}},onSettled(){writes++;}});
+  assert.ok(classes.has('cc-slot-tray'));assert.deepEqual(slots.snapshot()['cube-0'],{x:9,y:9,angle:0});
+  slots.pause();slots.wake();slots.resize('cube-0',size);slots.destroy();assert.equal(writes,0);
+  assert.equal(shouldUnstickPanel(520,900,160),false);assert.equal(shouldUnstickPanel(740,900,160),true);
 });
 test("pedestals/month resolve aliased history once and show unfinished goal members without fake completion",()=>{
   const p=fixture("2030-03-04");p.completed_cubes={};
@@ -151,7 +131,7 @@ test("near-complete goal and weighted history labels never claim 100 while a pos
   for(const html of [week,day]){const heading=html.match(/<header class="cc-history-heading">[\s\S]*?<\/header>/)[0];assert.ok(heading.includes(expected));assert.ok(!heading.includes("100%"));}
   assert.ok(day.includes("99%"));assert.ok(day.includes("is-unfinished"));assert.equal(cubes[1].progress_percent,99);assert.equal(JSON.stringify(p),before);
 });
-test("mount only reads Work/dashboard; goal closure is separate from derived readiness; tooltip is immediate",async()=>{
+test("mount only reads Work/dashboard; goal closure is separate from derived readiness",async()=>{
   const globals={document:globalThis.document,window:globalThis.window,innerWidth:globalThis.innerWidth,innerHeight:globalThis.innerHeight,matchMedia:globalThis.matchMedia,requestAnimationFrame:globalThis.requestAnimationFrame,cancelAnimationFrame:globalThis.cancelAnimationFrame};
   const handlers=new Map(),elements=[],calls=[],date=todayIn(),p=fixture(date),root={innerHTML:"",querySelector(){return null;},querySelectorAll(){return [];},contains(){return true;},addEventListener(){},removeEventListener(){}};
   const document={activeElement:null,hidden:false,querySelector(){return null;},querySelectorAll(){return [];},addEventListener(name,fn){const entries=handlers.get(name)||[];entries.push(fn);handlers.set(name,entries);},removeEventListener(){},body:{append(el){elements.push(el);}},createElement(){return {className:"",dataset:{},style:{},textContent:"",offsetWidth:180,offsetHeight:30,querySelectorAll(){return [];},querySelector(){return null;},setAttribute(){},remove(){this.removed=true;}};}};
@@ -167,8 +147,8 @@ test("mount only reads Work/dashboard; goal closure is separate from derived rea
     assert.deepEqual(calls,[{action:"constructor_goal",data:{scope:"week",date:monday(date),title:"QA goal only"}}]);assert.equal(p.completed_cubes.cube.percent,25);assert.ok(!root.innerHTML.includes("data-goal-percent"));
     const button={dataset:{action:"goal-close",scope:"week",goalDate:monday(date),status:"completed"},closest(selector){return selector==="[data-action]"?this:null;}};
     handlers.get("click")[0]({target:button,preventDefault(){}});await new Promise(resolve=>setTimeout(resolve,0));assert.deepEqual(calls.at(-1),{action:"constructor_goal_status",data:{scope:"week",date:monday(date),status:"completed"}});assert.equal(p.completed_cubes.cube.percent,25);assert.equal(p.constructor.weeks[monday(date)].status,"completed");
-    const hover={dataset:{ctooltip:"Complete untruncated title"},closest(selector){return selector.includes("[data-ctooltip]")?this:null;}};
-    handlers.get("pointermove")[0]({target:hover,clientX:300,clientY:240});const tip=elements.at(-1);assert.equal(tip.textContent,"Complete untruncated title");assert.equal(tip.className,"cc-hover-tooltip");assert.equal(calls.length,2);
+    const hover={dataset:{ctooltip:"Old generic tooltip"},closest(selector){return selector.includes("[data-ctooltip]")?this:null;}};
+    handlers.get("pointermove")[0]({target:hover,clientX:300,clientY:240});assert.ok(!elements.some(el=>el.className?.includes('cc-hover-tooltip')));assert.equal(calls.length,2);
     p.result.constructor.goals=[{id:"day:"+date,scope:"day",date,title:"Closed day",status:"completed",percent:99.9,cube_ids:["cube"],award_variant:"orbit"}];app.render();assert.ok(root.innerHTML.includes('data-action="month-goal"'));assert.ok(root.innerHTML.includes('width:99.9%'));assert.ok(root.innerHTML.includes(formatReadiness(99.9)+'%'));assert.equal(p.completed_cubes.cube.percent,25);
     const earned={dataset:{action:"month-goal",id:"day:"+date},closest(selector){return selector==="[data-action]"?this:null;}};
     handlers.get("click")[0]({target:earned,preventDefault(){}});await new Promise(resolve=>setTimeout(resolve,0));assert.ok(root.innerHTML.includes('data-testid="month-history"'));assert.ok(root.innerHTML.includes("Saved"));assert.ok(root.innerHTML.includes("is-unfinished"));assert.equal(calls.length,2,"award drilldown is read-only");

@@ -50,10 +50,10 @@ test('responsive tray grows for rows and gives every card a distinct in-bounds s
   assert.ok(trayCapacity(350,Array.from({length:8},()=>({minutes:45})),170).height>170);setReadableLayout('compact');
 });
 
-test('approved compact84x59 replaces the three rejected wide variants everywhere',()=>{
-  assert.deepEqual(READABLE_LAYOUTS,[{id:'compact',label:'Компактные блоки',width:84,height:59}]);
-  for(const obsolete of ['cards','wide','rows',null]){assert.equal(setReadableLayout(obsolete),'compact');assert.deepEqual(cubeDimensions(45),{width:84,height:59});}
-  assert.deepEqual(readableCardDimensions('compact','day',390),{width:82,height:58});assert.deepEqual(readableCardDimensions('compact','day',1260),{width:84,height:59});
+test('approved compact footprint is shared by the model and responsive cards',()=>{
+  assert.deepEqual(READABLE_LAYOUTS,[{id:'compact',label:'Компактные блоки',width:89,height:62}]);
+  for(const obsolete of ['cards','wide','rows',null]){assert.equal(setReadableLayout(obsolete),'compact');assert.deepEqual(cubeDimensions(45),{width:89,height:62});}
+  assert.deepEqual(readableCardDimensions('compact','day',390),{width:86,height:61});assert.deepEqual(readableCardDimensions('compact','day',1260),{width:89,height:62});
 });
 test('three source pools coexist, retain selected chain places and move explicitly chosen future tasks without duplicates',()=>{
   const date='2026-10-24',planning={tasks:[{id:'a',title:'Скульптура'},{id:'b',title:'Печать'},{id:'future',title:'Будущий проект'}],task_segments:[{id:'a1',task_id:'a'},{id:'a2',task_id:'a'},{id:'b1',task_id:'b'}],monthly_plan:{id:'0b2bf8c5-26ab-4b22-a844-a45a619e6079',month:'2026-10',status:'approved',approved_at:'2026-10-24T07:00:00Z',task_ids:['future']}},cubes=[{id:'a2',kind:'task',task_id:'a',segment_id:'a2',progress_percent:0},{id:'note',kind:'brainalot',sourceLabel:'На неделе',progress_percent:0},{id:'future-cube',kind:'task',task_id:'future',planned_date:'2026-10-27',progress_percent:0},{id:'b1',kind:'task',task_id:'b',segment_id:'b1',progress_percent:0},{id:'a1',kind:'task',task_id:'a',segment_id:'a1',progress_percent:35,actual_minutes:15},{id:'alias',canonical_id:'a1',kind:'task',task_id:'a',segment_id:'a1',progress_percent:0},{id:'prep',kind:'prep',task_id:'a',planned_date:date},{id:'ordinary',kind:'task',task_id:'not-approved',planned_date:'2026-10-28',progress_percent:0}];
@@ -83,9 +83,9 @@ test('excluded protected/returned task cubes remain discoverable and explicitly 
   const cubes=[{id:'started',kind:'task',task_id:'removed',progress_percent:35,actual_minutes:15},{id:'returned',kind:'task',task_id:'removed',progress_percent:0},{id:'untouched',kind:'task',task_id:'removed',progress_percent:0},{id:'hidden',kind:'task',task_id:'removed',progress_percent:100}];
   const pools=sourcePools({date:'2026-10-24',taskIds:[],cubes,restoredIds:['returned'],hiddenIds:['hidden']});assert.equal(pools.chains[0].retained,true);assert.deepEqual(pools.chains[0].cubes.map(c=>c.id),['started','returned']);
 });
-test('source cards keep full meaning/source but no visible planned minutes or percentage labels',()=>{
+test('source cards keep action and duration without duplicate source or percentage labels',()=>{
   const cube={title:'Собрать референсы персонажа в трёх ракурсах',taskTitle:'Первая скульптура',minutes:60,progress_percent:35,type:'research'},html=sourceCardContents(cube,{selected:true});
-  assert.ok(html.includes(cube.title));assert.ok(html.includes(cube.taskTitle));assert.ok(html.includes('В дне'));assert.ok(html.includes('width:35%'));assert.ok(!html.includes('60 мин'));assert.ok(!html.includes('token-meta'));assert.ok(!html.includes('35%</'));assert.ok(!html.includes('<time'));
+  assert.ok(html.includes(cube.title));assert.ok(!html.includes(cube.taskTitle));assert.ok(html.includes('В дне'));assert.ok(html.includes('width:35%'));assert.ok(html.includes('60 мин'));assert.ok(!html.includes('token-meta'));assert.ok(!html.includes('35%</'));assert.ok(!html.includes('<time'));
 });
 test('compact card reuses exact existing award SVG and source structure, with fill instead of percent text',()=>{
   const cube={id:'opaque-id',title:'Уточнить силуэт персонажа',taskTitle:'Первая скульптура',type:'practice',minutes:45,actual_minutes:15,progress_percent:35,award_variant:'order'};

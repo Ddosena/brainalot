@@ -63,3 +63,11 @@
 
 .cc-completion-transform{position:fixed;z-index:5300;pointer-events:none;isolation:isolate;transform-origin:center}.cc-material-before,.cc-material-after{position:absolute;inset:0;display:block}.cc-material-before>.cc-flat-cube-art,.cc-material-after>.cc-flat-cube-art{display:block;width:100%;height:100%}.cc-material-after{opacity:0}.cc-completion-spark{position:absolute;left:50%;top:50%;width:5px;height:5px;background:#f3d995;clip-path:polygon(50% 0,68% 32%,100% 50%,68% 68%,50% 100%,32% 68%,0 50%,32% 32%);transform-origin:center;opacity:0}.cc-completion-spark:nth-of-type(2n){background:#b6e9d9;width:4px;height:4px}
 @media(prefers-reduced-motion:reduce){.cc-completion-transform,.cc-completion-spark{display:none}}
+
+/* Compact date navigation keeps the timeline as the main control surface. */
+.work-constructor .cc-timeline-panel .cc-date{display:flex;align-items:center;align-self:center;justify-content:flex-start;flex-wrap:nowrap;gap:3px;width:max-content;min-width:0;flex:0 0 auto;margin:0;white-space:nowrap}
+.work-constructor .cc-date time{font-size:11px;font-weight:650;line-height:1;letter-spacing:.01em;color:var(--cc-text);font-variant-numeric:tabular-nums;padding:0 3px}
+.work-constructor .cc-date>button{display:grid;place-items:center;width:22px;height:22px;min-width:22px;min-height:22px;padding:0;border-color:transparent;background:transparent;color:var(--cc-muted)}
+.work-constructor .cc-date>button:hover{color:var(--cc-cyan);background:#173c4e;border-color:#36566a}
+.work-constructor .cc-date>button svg{width:12px;height:12px}
+@media(max-width:720px){.work-constructor .cc-timeline-panel .cc-date{margin-bottom:7px}}

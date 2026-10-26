@@ -2,19 +2,25 @@ import { esc, ic } from "./work-icons.js";
 import { t, localeTag } from "./i18n.js";
 import { timeClient, sharedApi,formatTime } from "./time-client.js";
 import { startCubeTimer, pauseCubeTimer, stopCubeTimer, cubeTimerState, recordedCubeMinutes } from "./work-cube-timer.js";
-import { START,END,clamp,formatReadiness,cubeDimensions,trayCapacity,dayLoadReference,dayLoadBreakdown,dayTimelineEntries,nearestPlanningSlot,timelineResizeMinutes,clock,minutes,shiftDate,monday,nextMonday,dateLabel,todayIn,validUrl,resourcesForSave,resourcesForEdit,launchGroups,typeOf,TYPES,COLORS,constructorModel } from "./work-constructor-model.js?v=constructor-20261023-a";
-import { createTrayPhysics } from "./work-constructor-physics.js?v=constructor-20261023-a";
+import { START,END,clamp,formatReadiness,cubeDimensions,dayLoadReference,dayLoadBreakdown,dayTimelineEntries,nearestPlanningSlot,timelineResizeMinutes,clock,minutes,shiftDate,monday,nextMonday,dateLabel,todayIn,validUrl,resourcesForSave,resourcesForEdit,launchGroups,typeOf,TYPES,COLORS,constructorModel } from "./work-constructor-model.js?v=constructor-20261023-a";
+import { createTraySlots,shouldUnstickPanel } from "./work-constructor-slots.js";
 import { historyCubes, pedestalShelf, awardsPanel,awardArt,SHELF_STYLES,monthHtml,statusLabel,goalEarned } from "./work-constructor-history.js?v=constructor-20261023-a";
 import {createKeyedSaveQueue,createCompletionClaims,transientOrbitModel,goalPreviewLabel} from "./work-constructor-motion.js";
 import { uniqueTaskCubes,taskPoolChange,readTaskChoice,saveTaskChoice } from "./work-constructor-selection.js";
-import { renderDayOrbit,currentDayPosition } from "./work-day-orbit.js";
-import {normalizeOrbitHalf,orbitHalfAt,validPlanMonth,approvedMonthlyPlan,prioritizeSourcePools,sourceImportanceControl,fullCubeInfo,sourcePools,sourceCardContents,setReadableLayout,readableLayout,readableCardContents,compactCardMinutes,readableSource} from "./work-readable-cubes.js";
+import { renderDayOrbit,currentDayPosition,fitOrbitLabels,mountOrbitCountdown } from "./work-day-orbit.js";
+import {validPlanMonth,approvedMonthlyPlan,prioritizeSourcePools,sourceImportanceControl,sourcePools,sourceCardContents,setReadableLayout,readableLayout,readableCardContents,compactCardMinutes,readableSource,hoverCubeContents,hoverCubePosition} from "./work-readable-cubes.js";
 
 
 import {sourceImportance as canonicalSourceImportance,sourceImportanceTarget,saveSourceImportance,sourceNote} from "./work-source-importance.js";
 import {isDeletedCube,normalizeDeletionState,confirmedCubeDelete} from './work-deletions.js';
 
 const safe=value=>esc(String(value??"")),copy=value=>structuredClone(value);
+export function compactTimelineDate(value){
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(String(value)))return '';
+  const date=new Date(value+'T12:00:00Z');if(Number.isNaN(date.getTime())||date.toISOString().slice(0,10)!==value)return '';
+  const parts=new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',weekday:'short',day:'2-digit',month:'2-digit'}).formatToParts(date),part=name=>parts.find(row=>row.type===name)?.value||'';
+  return part('weekday').replace(/\.$/,'').toLocaleUpperCase('ru-RU')+' · '+part('day')+'.'+part('month');
+}
 const uid=()=>("cube-"+(crypto.randomUUID?.()||Date.now()+"-"+Math.random())).replace(/[^a-zA-Z0-9:-]/g,"");
 const fields=["kind","task_id","segment_id","source_ref","minutes","title","output","steps","comment","planned_date","links","groups","resource_drafts","week_position","blueprint_ref"];
 export function cubeCommand(cube){return Object.fromEntries(fields.filter(key=>cube[key]!==undefined).map(key=>[key,copy(cube[key])]));}
@@ -31,20 +37,9 @@ export function weekProposals(planning,start){
   return [...saved.filter(c=>c.planned_date>=start&&c.planned_date<=end&&(!exempt.has(c.task_id)||c.selected_date||c.progress_percent>0||c.actual_minutes>0)),...(planning.result?.cubes||[]).filter(c=>!exempt.has(c.task_id)&&!c.manual&&!c.locked&&c.date>=start&&c.date<=end&&!blueprints.has(c.id)).map(c=>({...c,id:"planned-"+c.id,blueprint_ref:c.id,kind:"task",planned_date:c.date,candidate:true,progress_percent:0,actual_minutes:0}))].filter(cube=>!isDeletedCube(planning,cube));
 }
 export function groupWeekCubes(cubes){const groups=new Map();for(const cube of cubes){const key=JSON.stringify([cube.planned_date,cube.task_id||cube.kind+":"+cube.source_ref]);if(!groups.has(key))groups.set(key,{key,date:cube.planned_date,task_id:cube.task_id,cubes:[]});groups.get(key).cubes.push(cube);}return [...groups.values()];}
-export async function releaseTrayDrop({applySelection,snapshot,cache,key,id,position,awake,render}){
-  if(applySelection)await applySelection();
-  // A render snapshots the outgoing world. Capture it before merging the release,
-  // including when a CAS response has already rendered a new intermediate world.
-  snapshot();
-  cache.set(key,{...(cache.get(key)||{}),[id]:position});
-  awake.add(id);
-  render();
-}
-
 export function createWorkConstructor(root,ctx){
-  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,orbitHalf='afternoon',monthlyDraft=null,monthlyEditorOpen=false,monthlySaving=false;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
-  try{const options=JSON.parse(preferences.getItem('brainalot.work.readable.v1')||'{}');setReadableLayout(options.layout);orbitHalf=normalizeOrbitHalf(options.orbitHalf);}catch{}
-  function saveReadableOptions(){try{preferences.setItem('brainalot.work.readable.v1',JSON.stringify({layout:readableLayout(),orbitHalf}));}catch{}}
+  let workStyle='navy',orbitTimer=null,taskPanelOpen=false,monthlyDraft=null,monthlyEditorOpen=false,monthlySaving=false;const poolPins=new Map(),importanceSaving=new Set(),importanceWrites=createKeyedSaveQueue(),preferences=globalThis.localStorage;
+  try{const options=JSON.parse(preferences.getItem('brainalot.work.readable.v1')||'{}');setReadableLayout(options.layout);}catch{}
   function sourceImportance(c){return canonicalSourceImportance(c,planning()||{},dashboard);}
   const importanceKey=target=>target.kind+':'+target.id;
   function importanceControl(c){const target=sourceImportanceTarget(c,planning()||{},dashboard);return sourceImportanceControl(c,target.score,{editable:target.editable&&(target.kind!=='note'||!dashboardError),saving:importanceSaving.has(importanceKey(target))});}
@@ -66,9 +61,9 @@ export function createWorkConstructor(root,ctx){
   function poolPinned(){if(!poolPins.has(selectedDate)){let value=false;try{value=JSON.parse(preferences.getItem('brainalot.work.pool.v1:'+selectedDate)||'{}').pinned===true;}catch{}poolPins.set(selectedDate,value);}return poolPins.get(selectedDate);}
   function setPoolPinned(value){const previousTop=$('#cc-selected')?.getBoundingClientRect?.().top;poolPins.set(selectedDate,value);try{preferences.setItem('brainalot.work.pool.v1:'+selectedDate,JSON.stringify({pinned:value}));}catch{}render();const tray=$('#cc-selected'),bounds=tray?.getBoundingClientRect?.(),scroller=value?root:document.scrollingElement||document.documentElement;if(bounds&&scroller&&Number.isFinite(previousTop)){const safeTop=value?(root.getBoundingClientRect?.().top||0)+($('.cc-goal-strip')?.getBoundingClientRect?.().height||0)+($('.cc-timeline-panel')?.getBoundingClientRect?.().height||0)+16:0;scroller.scrollTop+=bounds.top-Math.max(previousTop,safeTop);}}
   function requirePoolEditing(){if(poolPinned())throw new Error(t('Пул закреплён. Нажмите «Изменить пул», чтобы изменить состав.'));}
-  let selectedDate=null,mode="day",historyMonth=null,historyPath=[],weekStart=null,weekKey=null,stage=null,hours=2,search="",busy=0,error="",notice="",pending=null,dashboard={},dashboardError="",serial=Promise.resolve(),popup=null,popupObserver=null,popupFrame=0,saveTimer=null,drag=null,suppressClick=0,disposed=false,resizeTimer=null,positionTimer=null,lastUndo=null;
+  let selectedDate=null,mode="day",historyMonth=null,historyPath=[],weekStart=null,weekKey=null,stage=null,hours=2,search="",busy=0,error="",notice="",pending=null,dashboard={},dashboardError="",serial=Promise.resolve(),popup=null,popupObserver=null,popupFrame=0,saveTimer=null,drag=null,suppressClick=0,disposed=false,resizeTimer=null,lastUndo=null;
   let deleteIntent=null,deleteBusy=false;
-  const popupBases=new Map(),popupConflicts=new Map(),dirtyFields=new Map(),drafts=new Map(),geometries=new Map(),localPositions=new Map(),localPositionWidths=new Map(),physics=new Map(),pendingBlocks=new Set(),returned=new Map(),scrolls={tasks:0,week:0,catalog:0},positionChanges=new Map(),sourceScrolls=new Map();
+  const popupBases=new Map(),popupConflicts=new Map(),dirtyFields=new Map(),drafts=new Map(),geometries=new Map(),physics=new Map(),pendingBlocks=new Set(),returned=new Map(),scrolls={tasks:0,week:0,catalog:0},sourceScrolls=new Map();
   const planning=()=>ctx.state?.planning;
   const deletionState=()=>normalizeDeletionState(ctx.deletionState?.());
   const deletionFrozen=()=>deletionState().pending.length>0;
@@ -128,11 +123,11 @@ export function createWorkConstructor(root,ctx){
     const m=model(),priority=returned.get(selectedDate)||[],raw=[...m.possible,...virtualTasks()],overrides=new Set(taskChoice().restoredCubeIds||[]),list=uniqueTaskCubes([...taskPoolChange(raw,taskChoice().taskIds,taskProtection()).included,...raw.filter(c=>overrides.has(c.id))]),ids=new Set();
     return list.filter(c=>{if(Number(c.progress_percent)>=100||ids.has(c.id)||m.hidden.some(h=>h.id===c.id))return false;ids.add(c.id);return true;}).sort((a,b)=>priority.indexOf(a.id)>=0?-1:priority.indexOf(b.id)>=0?1:0);
   }
-  const positionStorageKey=(key,width)=>'brainalot.work.positions.compact.v1:'+readableLayout()+':'+Math.round(width)+':'+key;
-  function saveLocalPositions(key,value,width){try{preferences.setItem(positionStorageKey(key,width),JSON.stringify(value));}catch{}}
-  function readLocalPositions(key,width){try{const value=JSON.parse(preferences.getItem(positionStorageKey(key,width))||'{}');return value&&typeof value==='object'&&!Array.isArray(value)?value:{};}catch{return {};}}
-  function snapshotPhysics(){for(const [key,instance] of physics){const value=instance.snapshot();localPositions.set(key,value);localPositionWidths.set(key,instance.width);saveLocalPositions(key,value,instance.width);instance.destroy();}physics.clear();}
+  function snapshotPhysics(){for(const instance of physics.values())instance.destroy();physics.clear();}
+  let disposeOrbitCountdown=()=>{};
+  function mountOrbitFeatures(host){disposeOrbitCountdown();fitOrbitLabels(host);disposeOrbitCountdown=mountOrbitCountdown(host);}
   function render(){
+    disposeOrbitCountdown();
     if(disposed)return;const p=planning(),focused=document.activeElement,focusKey=root.contains(focused)?focused?.dataset?.focusKey:null,selection=focusKey&&focused.matches?.("input,textarea")?[focused.selectionStart,focused.selectionEnd]:null;
     for(const el of root.querySelectorAll('[data-source-scroll]'))sourceScrolls.set(el.dataset.sourceScroll,{x:el.scrollLeft,y:el.scrollTop});if($(".rc-catalog-list"))scrolls.catalog=$(".rc-catalog-list").scrollTop;if($(".cc-task-strip"))scrolls.tasks=$(".cc-task-strip").scrollLeft;if($(".cc-week-scroll"))scrolls.week=$(".cc-week-scroll").scrollLeft;snapshotPhysics();
     if(!p){root.innerHTML='<div class="work-constructor cc-empty"><h2>'+safe(t("План пока не загружен"))+'</h2><p>'+safe(t("Проекты, доска, заметки и изображения сохраняются."))+'</p></div>';return;}
@@ -144,7 +139,7 @@ export function createWorkConstructor(root,ctx){
     for(const [selector,key] of [[".cc-task-strip","tasks"],[".cc-week-scroll","week"]])if($(selector)){const el=$(selector);el.style.scrollBehavior="auto";el.scrollLeft=scrolls[key];el.style.scrollBehavior="";}
     for(const el of root.querySelectorAll('[data-source-scroll]')){const saved=sourceScrolls.get(el.dataset.sourceScroll);if(saved){el.scrollLeft=saved.x;el.scrollTop=saved.y;}}
     if(focusKey){const target=[...root.querySelectorAll("[data-focus-key]")].find(el=>el.dataset.focusKey===focusKey);target?.focus({preventScroll:true});try{if(selection&&target?.matches?.("input,textarea")&&target?.setSelectionRange)target.setSelectionRange(...selection);}catch{}}
-    mountPhysics();bindWheel();if(popup)renderPopup();updateTimers();scheduleOrbitClock();
+    mountPhysics();mountOrbitFeatures($('.cc-orbit-host'));bindWheel();if(popup)renderPopup();updateTimers();scheduleOrbitClock();
     if(deletionFrozen()||deleteBusy)for(const element of root.querySelectorAll('button,input,textarea,select'))if(!readAction(element.dataset?.action)&&!['date','history-month','search'].includes(element.dataset?.field))element.disabled=true;
   }
   function deletionBanner(){
@@ -154,7 +149,7 @@ export function createWorkConstructor(root,ctx){
     if(state.conflicts.length)return '<section class="cc-warning" role="alert">'+safe(t('Удаление не выполнено. Обновите данные перед новой попыткой.'))+detail(state.conflicts)+' <button data-action="deletion-check">'+safe(t('Обновить данные'))+'</button></section>';
     return '';
   }
-  function readAction(name){return ['mode-day','mode-week','mode-month','previous','next','today','preview-date','week-prev','week-next','week-task','month-goal','month-day','month-root','month-path','inspect','history-inspect','trophy-inspect','orbit-half','orbit-now','popup-close','delete-cancel','deletion-check','retry','discard','refresh-dashboard','resources-open'].includes(name);}
+  function readAction(name){return ['mode-day','mode-week','mode-month','previous','next','today','preview-date','week-prev','week-next','week-task','month-goal','month-day','month-root','month-path','inspect','history-inspect','trophy-inspect','popup-close','delete-cancel','deletion-check','retry','discard','refresh-dashboard','resources-open'].includes(name);}
   function goalsHtml(){
     const p=planning()||{},week=mode==='week'?weekStart:monday(selectedDate),goals=p.result?.constructor?.goals||[];
     return '<section class="cc-goal-strip cc-goals-readable" aria-label="'+safe(t('Цели дня и недели'))+'">'+[['day',selectedDate,t('Цель дня')],['week',week,t('Цель недели')]].map(([scope,date,label])=>{
@@ -170,7 +165,8 @@ export function createWorkConstructor(root,ctx){
   function timelineHtml(m){
     const entries=dayTimelineEntries(m),fixed=entries.events.map(e=>'<div class="cc-event" style="left:'+clamp((e.start-START)/(END-START)*100,0,100)+'%;width:'+Math.max(.5,e.minutes/(END-START)*100)+'%" data-ctooltip="'+safe(e.title+" · "+clock(e.start)+"–"+clock(e.start+e.minutes))+'"><b>'+safe(e.title)+'</b><small>'+safe(clock(e.start))+'</small></div>').join("");
     const chosen=entries.cubes.map(c=>'<button class="cc-timeline-cube" data-ccube="'+safe(c.id)+'" data-tray="timeline" data-ctooltip="'+safe(c.title)+'" style="left:'+((c.start-START)/(END-START)*100)+'%;width:'+(c.minutes/(END-START)*100)+'%;background:'+(COLORS[c.type]||COLORS.task)+';'+(pendingBlocks.has(c.id)?"visibility:hidden":"")+'"><b>'+safe(c.title)+'</b><small>'+safe(clock(c.start))+" · "+safe(minutes(c.minutes))+'</small>'+(m.initialized&&writable()&&!['calendar','weekly_review'].includes(c.kind)&&!Number(c.progress_percent)&&!Number(c.actual_minutes)?'<span class="cc-time-resize" data-timeline-resize aria-hidden="true"></span>':'')+'</button>').join("");
-    return '<section class="cc-timeline-panel" data-testid="constructor-day"><div class="cc-date"><strong>'+safe(dateLabel(selectedDate,true))+'</strong><div><button data-action="previous" aria-label="'+safe(t("Предыдущий день"))+'">'+ic("chevL")+'</button><input type="date" data-focus-key="date" data-field="date" value="'+selectedDate+'" aria-label="'+safe(t("Выбранная дата"))+'"><button data-action="next" aria-label="'+safe(t("Следующий день"))+'">'+ic("chevR")+'</button><button data-action="today">'+safe(t("Сегодня"))+'</button></div></div><div class="cc-time-scroll"><div class="cc-timeline" data-testid="constructor-timeline">'+Array.from({length:15},(_,i)=>'<span class="cc-hour" style="left:'+i/14*100+'%">'+clock(START+i*60)+'</span><i class="cc-tick" style="left:'+i/14*100+'%"></i>').join("")+fixed+chosen+timelineNowHtml()+'</div></div></section>';
+    const fullDate=dateLabel(selectedDate,true);
+    return '<section class="cc-timeline-panel" data-testid="constructor-day"><nav class="cc-date" aria-label="'+safe(t('Выбранная дата')+' · '+fullDate)+'"><button data-action="previous" aria-label="'+safe(t('Предыдущий день'))+'" title="'+safe(t('Предыдущий день'))+'">'+ic('chevL')+'</button><time datetime="'+selectedDate+'" title="'+safe(fullDate)+'" aria-label="'+safe(fullDate)+'">'+safe(compactTimelineDate(selectedDate))+'</time><button data-action="next" aria-label="'+safe(t('Следующий день'))+'" title="'+safe(t('Следующий день'))+'">'+ic('chevR')+'</button></nav><div class="cc-time-scroll"><div class="cc-timeline" data-testid="constructor-timeline">'+Array.from({length:15},(_,i)=>'<span class="cc-hour" style="left:'+i/14*100+'%">'+clock(START+i*60)+'</span><i class="cc-tick" style="left:'+i/14*100+'%"></i>').join("")+fixed+chosen+timelineNowHtml()+'</div></div></section>';
   }
   function cubeHtml(cube,tray,variant="day"){
     const c={...cube,...drafts.get(cube.id)},size=cubeDimensions(c.minutes,variant),type=c.type||typeOf(c),color=COLORS[type]||COLORS.task,selected=isSelected(c.id),full=[c.title,c.taskTitle,c.segmentTitle,TYPES[type],minutes(c.minutes),c.comment].filter(Boolean).join(" · ");
@@ -179,7 +175,7 @@ export function createWorkConstructor(root,ctx){
   function completedForDay(){return historyCubes(planning()).filter(c=>Number(c.progress_percent)>=100&&(c.report_date||c.selected_date||c.planned_date)===selectedDate).map(decorated);}
   function sourceCardHtml(c,selectedIds){
     const done=Number(c.progress_percent)>=100,on=selectedIds.has(c.id),type=c.type||typeOf(c),source=readableSource(c,TYPES[type]||TYPES.task),tooltip=[c.title,source,t('План')+' '+minutes(c.minutes),c.planned_date?dateLabel(c.planned_date):''].filter(Boolean).join(' · ');
-    return '<article class="rc-source-card '+(on?'is-taken ':'')+(done?'is-done':'')+'" data-row-id="'+safe(c.id)+'" '+(pendingBlocks.has(c.id)?'style="visibility:hidden"':'')+'><button class="rc-source-open" data-action="'+(done?'history-inspect':'inspect')+'" data-id="'+safe(c.id)+'" data-ccube="'+safe(c.id)+'" data-tray="'+(done?'history':on?'selected':'possible')+'" data-focus-key="source-'+safe(c.id)+'" data-ctooltip="'+safe(tooltip)+'">'+sourceCardContents(c,{typeLabel:TYPES[type]||TYPES.task,selected:on,done,source})+'</button><div class="rc-source-footer">'+importanceControl(c)+(done?'':'<button class="rc-source-take" data-action="'+(on?'return':'select')+'" data-id="'+safe(c.id)+'" data-focus-key="take-'+safe(c.id)+'" '+(poolPinned()||c.allocation_stale?'disabled':'')+' aria-label="'+safe((on?t('Вернуть'):t('Взять в день'))+' · '+c.title)+'">'+ic(on?'check':'plus')+'<span>'+safe(on?t('Вернуть'):t('Взять'))+'</span></button>')+'</div></article>';
+    return '<article class="rc-source-card '+(on?'is-taken ':'')+(done?'is-done':'')+'" data-row-id="'+safe(c.id)+'" '+(pendingBlocks.has(c.id)?'style="visibility:hidden"':'')+'><button class="rc-source-open" data-action="'+(done?'history-inspect':'inspect')+'" data-id="'+safe(c.id)+'" data-ccube="'+safe(c.id)+'" data-tray="'+(done?'history':on?'selected':'possible')+'" data-focus-key="source-'+safe(c.id)+'" data-ctooltip="'+safe(tooltip)+'" aria-label="'+safe(c.title+' · '+source+' · '+minutes(compactCardMinutes(c,done)))+'">'+sourceCardContents(c,{typeLabel:TYPES[type]||TYPES.task,selected:on,done,source})+'</button></article>';
   }
   function monthPlanDraft(){
     if(!monthlyDraft){const plan=approvedMonthlyPlan(planning());monthlyDraft={month:plan?.month||selectedDate.slice(0,7),taskIds:[...(plan?.task_ids||[])]};}
@@ -212,14 +208,14 @@ export function createWorkConstructor(root,ctx){
     const selected=m.selected.filter(c=>c.start==null&&Number(c.progress_percent)<100),active=m.selected.filter(c=>Number(c.progress_percent)<100),pinned=poolPinned();
     return '<main class="cc-day-grid">'+dayResourceHtml(m)+'<div class="cc-work-area"><section class="cc-tray-panel rc-selected '+(pinned?'is-pinned':'is-following')+'" id="cc-selected" data-pool-pinned="'+pinned+'"><header><h2>'+safe(t('В дне'))+'</h2><span>'+active.length+' · '+safe(minutes(active.reduce((sum,c)=>sum+c.minutes,0)))+'</span><button data-action="pool-pin" data-focus-key="pool-pin" aria-label="'+safe(pinned?t('Изменить пул в этом окне'):t('Закрепить пул в этом окне'))+'" aria-pressed="'+pinned+'">'+safe(pinned?t('Изменить пул'):t('Закрепить пул'))+'</button></header><div class="cc-tray" data-physical="selected" data-testid="selected-tray">'+selected.map(c=>cubeHtml(c,'selected')).join('')+(selected.length?'':'<p class="cc-tray-empty">'+safe(t('Добавьте кубик из источников'))+'</p>')+'</div><div class="rc-tray-footer"><div class="cc-trash" data-trash="selected">'+ic('trash')+'<span>'+safe(t('Не сегодня'))+'</span></div><details class="rc-execution-returns"><summary>'+safe(t('Вернуть кубик'))+'</summary><div>'+active.map(c=>'<button data-action="return" data-id="'+safe(c.id)+'" '+(pinned?'disabled':'')+'>'+safe(c.title)+'</button>').join('')+'</div></details><button data-action="clear" '+(!m.initialized||!active.length||pinned?'disabled':'')+'>'+safe(t('Вернуть все'))+'</button></div></section>'+catalogHtml(m)+'</div></main>';
   }
-  function orbitHtml(m,position=currentDayPosition(selectedDate)){const entries=dayTimelineEntries(m);return renderDayOrbit({date:selectedDate,start:START,end:END,events:entries.events.map(event=>({...event,color:"#e8b55b"})),cubes:entries.cubes.map(cube=>({...cube,color:COLORS[cube.type]||COLORS.task})),...position,labels:'tangent',half:orbitHalf,showDate:orbitShowDate});}
-  function refreshClocks(){const position=currentDayPosition(selectedDate),host=$(".cc-orbit-host"),timeline=$('[data-testid="constructor-timeline"]');if(host)host.innerHTML=orbitHtml(model(),position);if(timeline){timeline.querySelector('.cc-timeline-now')?.remove();timeline.insertAdjacentHTML('beforeend',timelineNowHtml(position));}}
+  function orbitHtml(m,position=currentDayPosition(selectedDate)){const entries=dayTimelineEntries(m);return renderDayOrbit({date:selectedDate,start:START,end:END,events:entries.events.map(event=>({...event,color:"#e8b55b"})),cubes:entries.cubes.map(cube=>({...cube,color:COLORS[cube.type]||COLORS.task})),...position,labels:'curved',half:'afternoon',showDate:orbitShowDate});}
+  function refreshClocks(){const position=currentDayPosition(selectedDate),host=$(".cc-orbit-host"),timeline=$('[data-testid="constructor-timeline"]');if(host){host.innerHTML=orbitHtml(model(),position);mountOrbitFeatures(host);}if(timeline){timeline.querySelector('.cc-timeline-now')?.remove();timeline.insertAdjacentHTML('beforeend',timelineNowHtml(position));}}
   function scheduleOrbitClock(){clearTimeout(orbitTimer);if(!disposed&&!document.hidden&&mode==="day")orbitTimer=setTimeout(()=>{refreshClocks();scheduleOrbitClock();},60000-Date.now()%60000);}
   function orbitVisibility(){clearTimeout(orbitTimer);if(document.hidden){leaveHover();return;}if(!document.hidden){void refreshDashboard();refreshClocks();scheduleOrbitClock();}}
   function dayResourceHtml(m){
     const s=m.summary,load=dayLoadReference(planning(),selectedDate,s),parts=dayLoadBreakdown(m);
     const rows=[[t("Календарь"),parts.calendar],[t("Незавершённые — резерв"),parts.unfinished],[t("Завершённые — факт"),parts.completedActual],...(parts.completedEstimate?[[t("Завершённые без факта — план"),parts.completedEstimate]]:[]),...(parts.returnedActual?[[t("Факт возвращённых кубиков"),parts.returnedActual]]:[]),...(parts.returnedEstimate?[[t("Прогресс без факта"),parts.returnedEstimate]]:[]),...(parts.other?[[t("Другие учтённые нагрузки"),parts.other]]:[])];
-    return '<aside class="cc-resource"><div class="rc-orbit-halves" aria-label="'+safe(t('Половина суток на круге'))+'">'+[['morning','00–12'],['afternoon','12–24']].map(([half,label])=>'<button data-action="orbit-half" data-half="'+half+'" data-focus-key="half-'+half+'" aria-pressed="'+(orbitHalf===half)+'">'+label+'</button>').join('')+(currentDayPosition(selectedDate).today?'<button data-action="orbit-now" data-focus-key="orbit-now">'+safe(t('Сейчас'))+'</button>':'')+'</div><div class="cc-orbit-host" data-testid="day-orbit-host">'+orbitHtml(m)+'</div><section class="cc-load-summary"><div class="cc-load-heading"><strong class="cc-load" data-load>'+safe(minutes(load.total))+'</strong><span>'+safe(t('из'))+' '+safe(minutes(load.budget))+'</span></div><div class="cc-energy-bar" role="meter" aria-label="'+safe(t('Нагрузка дня'))+'" aria-valuemin="0" aria-valuemax="'+load.budget+'" aria-valuenow="'+load.total+'"><span style="width:'+load.fill+'%"></span></div><details><summary>'+safe(t('Нагрузка и настройки'))+'</summary><dl>'+rows.map(([label,value])=>'<div><dt>'+safe(t(label))+'</dt><dd data-load-component="'+value+'">'+(value<0?'−':'')+safe(minutes(Math.abs(value)))+'</dd></div>').join('')+'</dl><p>'+safe(t('Первоначальный план'))+': '+safe(minutes(parts.plannedSelected))+'</p><p>'+safe(t('Факт'))+': <span data-day-actual>'+safe(minutes(parts.actual))+'</span></p><label>'+safe(t('Энергия дня'))+'<input type="number" min="0" max="24" step="0.5" data-field="energy" value="'+s.budget/60+'"></label>'+calendarHtml(m)+'<button data-action="recalculate">'+safe(t('Пересчитать будущие дни'))+'</button><button data-action="refresh-dashboard">'+safe(t('Обновить предложения'))+'</button></details></section></aside>';
+    return '<aside class="cc-resource"><div class="cc-orbit-host" data-testid="day-orbit-host">'+orbitHtml(m)+'</div><section class="cc-load-summary"><div class="cc-load-heading"><strong class="cc-load" data-load>'+safe(minutes(load.total))+'</strong><span>'+safe(t('из'))+' '+safe(minutes(load.budget))+'</span></div><div class="cc-energy-bar" role="meter" aria-label="'+safe(t('Нагрузка дня'))+'" aria-valuemin="0" aria-valuemax="'+load.budget+'" aria-valuenow="'+load.total+'"><span style="width:'+load.fill+'%"></span></div><details><summary>'+safe(t('Нагрузка и настройки'))+'</summary><dl>'+rows.map(([label,value])=>'<div><dt>'+safe(t(label))+'</dt><dd data-load-component="'+value+'">'+(value<0?'−':'')+safe(minutes(Math.abs(value)))+'</dd></div>').join('')+'</dl><p>'+safe(t('Первоначальный план'))+': '+safe(minutes(parts.plannedSelected))+'</p><p>'+safe(t('Факт'))+': <span data-day-actual>'+safe(minutes(parts.actual))+'</span></p><label>'+safe(t('Энергия дня'))+'<input type="number" min="0" max="24" step="0.5" data-field="energy" value="'+s.budget/60+'"></label>'+calendarHtml(m)+'<button data-action="recalculate">'+safe(t('Пересчитать будущие дни'))+'</button><button data-action="refresh-dashboard">'+safe(t('Обновить предложения'))+'</button></details></section></aside>';
   }
   function calendarHtml(m){return '<details class="cc-list"><summary>'+safe(t("Календарь · обязательность в Work"))+'</summary><p>'+safe(t("Локальный флаг. Google Calendar не изменяется."))+'</p>'+m.events.map(e=>'<label class="cc-event-option"><input type="checkbox" data-field="event-required" data-event="'+safe(e.stable_id||e.occurrence_id||e.id)+'" '+(e.required?"checked":"")+' '+(!m.initialized?"disabled":"")+'><span>'+safe(e.title||e.summary)+'<small>'+safe(String(e.start||"").slice(11,16))+'</small></span></label>').join("")+'</details>';}
   function weekGroups(){return groupWeekCubes(weekProposals(planning()||{},weekStart)).map(g=>({...g,title:planning()?.tasks?.find(task=>task.id===g.task_id)?.title||g.cubes[0]?.title||""}));}
@@ -357,7 +353,7 @@ export function createWorkConstructor(root,ctx){
       const size=cubeDimensions(c.minutes,el.dataset.tray==="week"?"week":"day");el.style.width=size.width+"px";el.style.height=size.height+"px";el.dataset.minutes=c.minutes;const art=el.matches(".cc-cube");if(art)el.innerHTML=readableCardContents(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task,duration:minutes(compactCardMinutes(c))});const badge=el.querySelector("[data-duration]");if(badge)badge.textContent=c.minutes;physics.get(selectedDate+":"+el.dataset.tray)?.resize(c.id,size);physics.get("week:"+weekKey)?.resize(c.id,size);
     }
     const readout=document.querySelector("[data-popup-duration]");if(readout)readout.textContent=minutes(c.minutes);
-    const orbit=$(".cc-orbit-host");if(orbit){const m=model();orbit.innerHTML=orbitHtml({...m,selected:m.selected.map(item=>item.id===c.id?{...item,...c}:item)});}
+    const orbit=$(".cc-orbit-host");if(orbit){const m=model();orbit.innerHTML=orbitHtml({...m,selected:m.selected.map(item=>item.id===c.id?{...item,...c}:item)});mountOrbitFeatures(orbit);}
   }
   async function measureStoppedCube(c){
     await stopCubeTimer(c);const saved=Number(canonical(c.id)?.actual_minutes)||0,measured=await recordedCubeMinutes(c),actual=Math.max(saved,measured,Number(drafts.get(c.id)?.actual_minutes)||0);
@@ -393,27 +389,16 @@ export function createWorkConstructor(root,ctx){
   }
   async function ensureDay(){if(!model().initialized)await commit("constructor_day",{date:selectedDate});}
   function mountPhysics(){
-    const entries=[...root.querySelectorAll("[data-physical]")].filter(el=>el.clientWidth>0),m=model();if(!entries.length)return;
-    const widths=entries.map(el=>({el,tray:el.dataset.physical,items:[...el.querySelectorAll("[data-ccube]")].map(node=>find(node.dataset.ccube)).filter(Boolean)})),height=Math.max(...widths.map(e=>trayCapacity(e.el.clientWidth,e.items,mode==='day'&&!poolPinned()&&e.tray==='selected'?88:170,e.tray==="week"?"week":"day").height));
-    for(const entry of widths){
-      entry.el.style.height=height+"px";const key=entry.tray==="week"?"week:"+weekKey:selectedDate+":"+entry.tray,width=entry.el.clientWidth,stored=readLocalPositions(key,width),positions={...stored,...(localPositionWidths.get(key)===width?localPositions.get(key)||{}:{})};
-      const instance=createTrayPhysics(entry.el,{variant:entry.tray==="week"?"week":"day",positions,awakeIds:[...awakeIds],onSettled:value=>{localPositions.set(key,value);localPositionWidths.set(key,width);saveLocalPositions(key,value,width);queuePositions(entry.tray,key,value);}});
-      localPositionWidths.set(key,width);physics.set(key,instance);
-    }awakeIds.clear();
-  }
-  const awakeIds=new Set();
-  function queuePositions(tray,key,positions){
-    if(deletionFrozen()||deleteBusy)return;
-    const known=Object.fromEntries(Object.entries(positions).filter(([id])=>planning()?.constructor?.cubes?.[id]&&!isDeletedCube(planning(),{id})));if(!Object.keys(known).length)return;
-    const canonicalPositions=tray==="week"?Object.fromEntries(Object.keys(known).map(id=>[id,planning()?.constructor?.cubes?.[id]?.week_position])):planning()?.constructor?.days?.[selectedDate]?.positions?.[tray]||{};
-    const changed=Object.entries(known).some(([id,p])=>{const old=canonicalPositions[id];return !old||Math.abs(old.x-p.x)>.75||Math.abs(old.y-p.y)>.75||Math.abs(old.angle-p.angle)>.75;});
-    if(!changed||tray!=="week"&&!model().initialized)return;
-    positionChanges.set(key,{tray,date:selectedDate,positions:known});clearTimeout(positionTimer);positionTimer=setTimeout(()=>void flushPositions(),900);
-  }
-  async function flushPositions(){
-    const changes=[...positionChanges.values()];positionChanges.clear();
-    if(deletionFrozen()||deleteBusy)return;
-    try{for(const change of changes){const positions=Object.fromEntries(Object.entries(change.positions).filter(([id])=>!isDeletedCube(planning(),{id})));if(!Object.keys(positions).length)continue;if(change.tray==="week"){for(const [id,position] of Object.entries(positions))await commit("constructor_cube",{cube_id:id,week_position:position},{quiet:true});}else await commit("constructor_day",{date:change.date,positions:{[change.tray]:positions}},{quiet:true});}}catch{positionChanges.clear();}
+    for(const el of root.querySelectorAll('[data-physical]')){
+      if(el.clientWidth<=0)continue;
+      const variant=el.dataset.physical==='week'?'week':'day',key=variant==='week'?'week:'+weekKey:selectedDate+':'+el.dataset.physical;
+      const instance=createTraySlots(el,{variant});physics.set(key,instance);
+      const panel=el.closest('.rc-selected');
+      if(panel?.classList.contains('is-following')){
+        const stickyTop=Number.parseFloat(getComputedStyle(panel).top);
+        panel.classList.toggle('is-tall',shouldUnstickPanel(panel.getBoundingClientRect().height,window.innerHeight,stickyTop));
+      }
+    }
   }
   function bindWheel(){const strip=$(".cc-task-strip");strip?.addEventListener("wheel",event=>{if(Math.abs(event.deltaX)>Math.abs(event.deltaY)||strip.scrollWidth<=strip.clientWidth)return;const next=clamp(strip.scrollLeft+event.deltaY,0,strip.scrollWidth-strip.clientWidth);if(next!==strip.scrollLeft){event.preventDefault();strip.scrollLeft=next;}},{passive:false});}
   const snapSlot=(id,duration,desired)=>nearestPlanningSlot(planning(),occupied(id),duration,desired);
@@ -427,6 +412,7 @@ export function createWorkConstructor(root,ctx){
   function fly(c,origin,destination,{bin=false,suction=false,effect='flight',onFinish=()=>{}}={}){
     if(disposed||matchMedia('(prefers-reduced-motion: reduce)').matches||!destination){onFinish();return Promise.resolve();}
     const size=cubeDimensions(c.minutes),from=origin||cubeElement(c.id)?.getBoundingClientRect()||{left:destination.left,top:destination.top,width:size.width,height:size.height},node=document.createElement('div');node.className='cc-flight rc-card';node.dataset.layout=readableLayout();node.dataset.effect=effect;node.dataset.cubeId=c.id;node.innerHTML=readableCardContents(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task,duration:minutes(compactCardMinutes(c))});document.body.append(node);
+    if(effect==='tray-slot')return playEffect(node,[{transform:'translate('+from.left+'px,'+from.top+'px)',width:from.width+'px',height:from.height+'px',opacity:1},{transform:'translate('+destination.left+'px,'+destination.top+'px)',width:destination.width+'px',height:destination.height+'px',opacity:1}],{duration:320,easing:'cubic-bezier(.2,.75,.3,1)',fill:'forwards'}).finally(()=>{node.remove();onFinish();});
     const end=bin?{left:destination.left+destination.width/2,top:destination.top+destination.height/2,width:2,height:2}:suction?{left:destination.left+destination.width*.16,top:destination.top+destination.height*.16,width:destination.width*.68,height:destination.height*.68}:destination,dx=end.left-from.left,dy=end.top-from.top;
     return playEffect(node,[{transform:'translate('+from.left+'px,'+from.top+'px) rotate(0deg)',width:(from.width||size.width)+'px',height:(from.height||size.height)+'px',opacity:1},{transform:'translate('+(from.left+dx*.38-dy*.08)+'px,'+(from.top+dy*.38+dx*.08)+'px) rotate(-10deg)',width:(bin?size.width*.6:Math.max(90,from.width*.82))+'px',height:(bin?size.height*.6:Math.max(50,from.height*.82))+'px',offset:.55,opacity:1},{transform:'translate('+end.left+'px,'+end.top+'px) rotate('+(bin?23:0)+'deg)',width:end.width+'px',height:end.height+'px',opacity:bin?0:1}],{duration:suction?320:bin?440:540,easing:'cubic-bezier(.48,.03,.8,.68)',fill:'forwards'}).finally(()=>{node.remove();onFinish();});
   }
@@ -485,8 +471,6 @@ export function createWorkConstructor(root,ctx){
 
     if(name==='month-plan-save')return saveMonthPlan();
     if(name==='pool-pin'){await taskChangeSerial;await serial;setPoolPinned(!poolPinned());return;}
-    if(name==='orbit-now'){const position=currentDayPosition(selectedDate),half=orbitHalfAt(position.nowMinutes);if(position.today&&half){orbitHalf=half;saveReadableOptions();render();}return;}
-    if(name==='orbit-half'){orbitHalf=normalizeOrbitHalf(button.dataset.half);saveReadableOptions();render();return;}
     if(name==="main"){const operation=taskChangeSerial.catch(()=>{}).then(()=>toggleTask(button.dataset.task));taskChangeSerial=operation;return operation;}
     if(name==="stage"){stage=button.dataset.segment;render();return;}
     if(name==="hours"){hours=Number(button.dataset.hours);render();return;}
@@ -569,7 +553,7 @@ export function createWorkConstructor(root,ctx){
     if(el.dataset.field==="event-required"){void commit("calendar_required",{event_id:el.dataset.event,required:el.checked}).catch(reportError);return;}
     if(el.dataset.popupField){void savePopup().then(()=>render()).catch(()=>{});}
   }
-  function cleanupDrag(){const orbit=$(".cc-orbit-host");if(orbit&&!disposed)orbit.innerHTML=orbitHtml(model());if(drag?.source){drag.source.style.opacity="";drag.source.classList.remove("is-resizing");}drag?.ghost?.remove();drag=null;$(".cc-snap")?.remove();for(const el of root.querySelectorAll(".is-drop"))el.classList.remove("is-drop");}
+  function cleanupDrag(){const orbit=$(".cc-orbit-host");if(orbit&&!disposed){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}if(drag?.source){drag.source.style.opacity="";drag.source.classList.remove("is-resizing");}drag?.ghost?.remove();drag=null;$(".cc-snap")?.remove();for(const el of root.querySelectorAll(".is-drop"))el.classList.remove("is-drop");}
   function pointerDown(event){
     if(deletionFrozen()||deleteBusy)return;
     if(event.button!==0||!root.contains(event.target))return;const element=event.target.closest("[data-ccube]");if(!element||element.dataset.tray==="week"||!writable())return;
@@ -595,9 +579,9 @@ export function createWorkConstructor(root,ctx){
     }
     event.preventDefault();const size=cubeDimensions(drag.c.minutes),timeline=$(".cc-timeline"),near=boundsHit(timeline,event.clientX,event.clientY,45);drag.ghost.style.left=event.clientX-size.width/2+"px";drag.ghost.style.top=event.clientY-size.height/2+"px";drag.ghost.style.transform="";drag.snap=null;$(".cc-snap")?.remove();
     if(near){const bounds=timeline.getBoundingClientRect(),desired=START+(event.clientX-bounds.left)/bounds.width*(END-START)-drag.c.minutes/2,start=snapSlot(drag.id,drag.c.minutes,desired),snap=document.createElement("div");snap.className="cc-snap";snap.textContent=start===null?t("Нет свободного места"):clock(start);snap.style.left=(start===null?40:(start-START)/(END-START)*100)+"%";snap.style.width=(start===null?20:drag.c.minutes/(END-START)*100)+"%";timeline.append(snap);drag.snap=start;
-      if(start!==null){const orbit=$(".cc-orbit-host");if(orbit)orbit.innerHTML=orbitHtml(transientOrbitModel(model(),drag.c,start));const center=bounds.left+(start-START+drag.c.minutes/2)/(END-START)*bounds.width;drag.ghost.style.left=(event.clientX*.78+center*.22)-size.width/2+"px";drag.ghost.style.top=(event.clientY*.78+(bounds.top+46)*.22)-size.height/2+"px";drag.ghost.style.transform="scale(1.1,.78)";}
+      if(start!==null){const orbit=$(".cc-orbit-host");if(orbit){orbit.innerHTML=orbitHtml(transientOrbitModel(model(),drag.c,start));mountOrbitFeatures(orbit);}const center=bounds.left+(start-START+drag.c.minutes/2)/(END-START)*bounds.width;drag.ghost.style.left=(event.clientX*.78+center*.22)-size.width/2+"px";drag.ghost.style.top=(event.clientY*.78+(bounds.top+46)*.22)-size.height/2+"px";drag.ghost.style.transform="scale(1.1,.78)";}
     }
-    if(!near||drag.snap===null){const orbit=$(".cc-orbit-host");if(orbit)orbit.innerHTML=orbitHtml(model());}
+    if(!near||drag.snap===null){const orbit=$(".cc-orbit-host");if(orbit){orbit.innerHTML=orbitHtml(model());mountOrbitFeatures(orbit);}}
     for(const zone of root.querySelectorAll("[data-trash],[data-physical],[data-catalog-drop]"))zone.classList.toggle("is-drop",boundsHit(zone,event.clientX,event.clientY,10));
   }
   function pointerUp(event){
@@ -617,34 +601,44 @@ export function createWorkConstructor(root,ctx){
       if(overTimeline){if(previous.snap===null)throw new Error(t("Нет свободного места нужной длительности."));await placeOnTimeline(previous.id,previous.snap,origin);return;}
       const target=boundsHit(left,event.clientX,event.clientY)?"selected":boundsHit(right,event.clientX,event.clientY)?"possible":null;
       if(!target){render();return;}
-      const position=(target==="selected"?left:right).getBoundingClientRect(),size=cubeDimensions(previous.c.minutes),key=selectedDate+":"+target,release={x:event.clientX-position.left-size.width/2,y:event.clientY-position.top-size.height/2,angle:0};
       pendingBlocks.add(previous.id);
       if(target==='possible'){
         try{if(isSelected(previous.id)){await ensureDay();await returnCube(previous.id);}render();snapshotPhysics();const row=[...root.querySelectorAll('.rc-source-card')].find(node=>node.dataset.rowId===previous.id),bounds=(row||$('[data-catalog-drop]'))?.getBoundingClientRect();await fly(find(previous.id)||previous.c,origin,bounds,{suction:true,effect:'catalog-return',onFinish:()=>{pendingBlocks.delete(previous.id);render();}});}catch(cause){pendingBlocks.delete(previous.id);render();throw cause;}return;
       }
-      try{await releaseTrayDrop({key,id:previous.id,position:release,cache:localPositions,awake:awakeIds,snapshot:snapshotPhysics,render,applySelection:async()=>{
-        if(target==="selected"){if(!isSelected(previous.id))await selectCube(previous.id);else if(find(previous.id)?.start!=null)await commit("constructor_timeline",{cube_id:previous.id,date:selectedDate,start:null});}
-        else if(previous.tray!=="possible"&&isSelected(previous.id)){await ensureDay();await returnCube(previous.id);}
-      }});
-        snapshotPhysics();
-        const zone=$('[data-physical="'+target+'"]'),bounds=zone?.getBoundingClientRect(),destination=bounds?{left:bounds.left+release.x,top:bounds.top+release.y,width:size.width,height:size.height}:null;
-        await fly(find(previous.id)||previous.c,origin,destination,{suction:true,effect:'tray-suction',onFinish:()=>{pendingBlocks.delete(previous.id);awakeIds.add(previous.id);render();}});
+      try{
+        if(target==='selected'){if(!isSelected(previous.id))await selectCube(previous.id);else if(find(previous.id)?.start!=null)await commit('constructor_timeline',{cube_id:previous.id,date:selectedDate,start:null});}
+        render();
+        const node=[...root.querySelectorAll('[data-physical="selected"] [data-ccube]')].find(el=>el.dataset.ccube===previous.id),destination=node?.getBoundingClientRect();
+        await fly(find(previous.id)||previous.c,origin,destination||null,{effect:'tray-slot',onFinish:()=>{pendingBlocks.delete(previous.id);render();}});
       }catch(cause){pendingBlocks.delete(previous.id);render();throw cause;}
     })().catch(reportError);
   }
   function pointerCancel(event){if(drag&&event.pointerId===drag.pointer){cleanupDrag();render();}}
-  let tooltip=null,lastHoverPoint=null;
-  function hideTooltip(){tooltip?.remove();tooltip=null;}
+  let tooltip=null,lastHoverPoint=null,hoverKey=null;
+  function hideTooltip(){tooltip?.remove();tooltip=null;hoverKey=null;}
   function leaveHover(){lastHoverPoint=null;hideTooltip();}
   function updateHoverTarget(element){
-    if(disposed||drag?.active||popup||document.hidden){hideTooltip();return;}
+    if(disposed||drag?.active||popup||document.hidden||(globalThis.matchMedia?.('(hover: none)').matches&&element!==document.activeElement)){hideTooltip();return;}
     const target=element?.closest?.('[data-ccube],.rc-source-card,.cc-trophy,.cc-history-member,[data-ctooltip]');if(!target||!root.contains(target)){hideTooltip();return;}
     const carrier=target.closest('[data-ccube],[data-row-id],[data-id]'),id=target.dataset.ccube||target.dataset.rowId||target.dataset.id||carrier?.dataset.ccube||carrier?.dataset.rowId||carrier?.dataset.id;
-    const c=id?(find(id)||historyCubes(planning(),{includeArchived:true}).find(cube=>cube.id===id)):null,text=c?fullCubeInfo(c,{importance:sourceImportance(c),typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task}):target.dataset.ctooltip;
-    if(!text){hideTooltip();return;}if(!tooltip){tooltip=document.createElement('div');tooltip.className='cc-hover-tooltip';tooltip.dataset.testid='cube-hover-info';tooltip.setAttribute('role','tooltip');document.body.append(tooltip);}if(tooltip.textContent!==text)tooltip.textContent=text;
+    const c=id?(find(id)||historyCubes(planning(),{includeArchived:true}).find(cube=>cube.id===id)):null;
+    if(!c){hideTooltip();return;}
+    const anchor=target.closest('.rc-source-card,.cc-cube,.cc-trophy,.cc-history-member')||target;
+    const key=id+':'+(anchor.dataset.rowId?'source':anchor.className);
+    if(hoverKey!==key)hideTooltip();
+    if(!tooltip){tooltip=document.createElement('div');tooltip.className='cc-hover-tooltip is-positioning';tooltip.dataset.testid='cube-hover-info';tooltip.setAttribute('role','tooltip');tooltip.innerHTML=hoverCubeContents(c,{typeLabel:TYPES[c.type||typeOf(c)]||TYPES.task});document.body.append(tooltip);hoverKey=key;}
+    const rect=anchor.getBoundingClientRect();tooltip.style.width=Math.min(236,window.innerWidth-16)+'px';
+    const position=hoverCubePosition(rect,{width:window.innerWidth,height:window.innerHeight},{height:tooltip.getBoundingClientRect().height});
+    tooltip.style.left=position.left+'px';tooltip.style.top=position.top+'px';
+    tooltip.style.setProperty('--rc-start-x',String(Math.max(.1,Math.min(1,rect.width/position.width))));
+    tooltip.style.setProperty('--rc-start-y',String(Math.max(.1,Math.min(1,rect.height/tooltip.getBoundingClientRect().height))));
+    tooltip.style.transformOrigin=Math.max(0,Math.min(position.width,rect.left+rect.width/2-position.left))+'px '+Math.max(0,Math.min(tooltip.getBoundingClientRect().height,rect.top+rect.height/2-position.top))+'px';
+    tooltip.classList.remove('is-positioning');
   }
   function hoverTooltip(event){lastHoverPoint={x:event.clientX,y:event.clientY};updateHoverTarget(event.target);}
   function refreshHoverFromPoint(){if(lastHoverPoint)updateHoverTarget(document.elementFromPoint(lastHoverPoint.x,lastHoverPoint.y));}
+  function focusHover(event){if(event.target.closest?.('[data-ccube],.cc-trophy,.cc-history-member'))updateHoverTarget(event.target);}
+  function blurHover(event){if(!event.relatedTarget?.closest?.('[data-ccube],.cc-trophy,.cc-history-member'))hideTooltip();}
   function keyDown(event){
     if(event.key==="Escape"){closePopup();cleanupDrag();leaveHover();render();return;}
     const task=event.target.closest?.(".cc-task");if(task&&["ArrowLeft","ArrowRight"].includes(event.key)){const tasks=[...root.querySelectorAll(".cc-task")],index=tasks.indexOf(task),next=tasks[clamp(index+(event.key==="ArrowLeft"?-1:1),0,tasks.length-1)];event.preventDefault();next?.focus();next?.scrollIntoView({block:"nearest",inline:"nearest"});}
@@ -661,9 +655,9 @@ export function createWorkConstructor(root,ctx){
   }
   function outerDown(event){if(popup&&!event.target.closest("[data-constructor-popup]")&&!event.target.closest("[data-ccube]"))closePopup();}
   function toggle(event){if(event.target.matches?.("[data-month-plan-editor]"))monthlyEditorOpen=event.target.open;if(event.target.matches?.(".rc-task-choice"))taskPanelOpen=event.target.open;if(event.target.closest?.("[data-constructor-popup]"))schedulePopupPosition();}
-  function resize(){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{snapshotPhysics();localPositions.clear();localPositionWidths.clear();render();positionPopup();},140);}
-  document.addEventListener("visibilitychange",orbitVisibility);document.addEventListener("click",handleClick);document.addEventListener("input",handleInput);document.addEventListener("change",handleChange);document.addEventListener("pointermove",pointerMove,{passive:false});document.addEventListener("pointerup",pointerUp);document.addEventListener("pointercancel",pointerCancel);document.addEventListener("pointerdown",outerDown);document.addEventListener("keydown",keyDown);document.addEventListener("toggle",toggle,true);document.addEventListener("scroll",refreshHoverFromPoint,true);document.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerdown",pointerDown);window.addEventListener("resize",resize);
+  function resize(){clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{snapshotPhysics();render();positionPopup();},140);}
+  document.addEventListener("visibilitychange",orbitVisibility);document.addEventListener("click",handleClick);document.addEventListener("input",handleInput);document.addEventListener("change",handleChange);document.addEventListener("pointermove",pointerMove,{passive:false});document.addEventListener("pointerup",pointerUp);document.addEventListener("pointercancel",pointerCancel);document.addEventListener("pointerdown",outerDown);document.addEventListener("keydown",keyDown);document.addEventListener("toggle",toggle,true);document.addEventListener("scroll",refreshHoverFromPoint,true);document.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerleave",leaveHover);root.addEventListener("pointerdown",pointerDown);root.addEventListener("focusin",focusHover);root.addEventListener("focusout",blurHover);window.addEventListener("resize",resize);
   const unsubscribe=timeClient.subscribe(updateTimers);
   render();void refreshPending().catch(reportError);void refreshDashboard();
-  return {render,remoteChanged,destroy(){disposed=true;for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(positionTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);window.removeEventListener("resize",resize);}};
+  return {render,remoteChanged,destroy(){disposed=true;disposeOrbitCountdown();for(const cancel of [...activeEffects])cancel();clearTimeout(orbitTimer);document.removeEventListener("visibilitychange",orbitVisibility);clearTimeout(saveTimer);clearTimeout(resizeTimer);snapshotPhysics();cleanupDrag();hideTooltip();closePopup(false);if(typeof unsubscribe==="function")unsubscribe();document.removeEventListener("click",handleClick);document.removeEventListener("input",handleInput);document.removeEventListener("change",handleChange);document.removeEventListener("pointermove",pointerMove);document.removeEventListener("pointerup",pointerUp);document.removeEventListener("pointercancel",pointerCancel);document.removeEventListener("pointerdown",outerDown);document.removeEventListener("keydown",keyDown);document.removeEventListener("toggle",toggle,true);document.removeEventListener("scroll",refreshHoverFromPoint,true);document.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerleave",leaveHover);root.removeEventListener("pointerdown",pointerDown);root.removeEventListener("focusin",focusHover);root.removeEventListener("focusout",blurHover);window.removeEventListener("resize",resize);}};
 }

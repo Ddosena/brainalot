@@ -58,3 +58,78 @@ body:has(#planning-root:not([hidden]) .work-constructor[data-collecting="true"])
 .work-constructor[data-collecting="true"] .cc-timeline-panel{top:0}
 .work-constructor[data-collecting="true"] .rc-selected.is-following{top:calc(var(--cc-timeline-height,88px) + 8px)}
 .work-constructor[data-collecting="true"] .rc-selected .cc-tray{min-height:88px}
+
+/* Cube readability prototype: visual and Matter footprints share readableCardDimensions(). */
+.work-constructor button.rc-card,.rc-card,.rc-card .token.small-award-token{width:118px;height:83px}
+.rc-card .token.small-award-token{padding:7px 8px;gap:6px}
+.cc-flight.rc-card .small-award-token,.cc-drag-ghost.rc-card .small-award-token{width:100%;height:100%}
+.small-award-token .tiny-title{font-size:12.5px;line-height:1.16;-webkit-line-clamp:3;overflow-wrap:break-word;word-break:normal}
+.small-award-token .wta-art--compact{width:24px;height:24px}
+.small-award-token .token-meta{font-size:11px;justify-content:space-between}
+.rc-done-check{width:17px;height:17px;flex:none;fill:none;stroke:#c5f3d5;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.work-constructor button.cc-trophy.rc-card,.work-constructor button.cc-history-member.rc-card{width:128px;height:90px;min-height:90px;max-width:128px;flex-basis:128px}
+.cc-trophy.rc-card .token.small-award-token,.cc-history-member.rc-card .token.small-award-token{width:128px;height:90px}
+.cc-shelf-objects{min-height:104px;gap:14px}
+.cc-history-members{gap:14px}
+.rc-chain-scroll{gap:8px;min-height:92px}
+.rc-chain-scroll>.rc-source-card{flex-basis:123px}
+.rc-source-scroll{grid-template-columns:repeat(auto-fill,123px);grid-auto-rows:92px;gap:8px}
+.rc-source-card,.rc-source-column .rc-source-card,.rc-chain-scroll>.rc-source-card,.rc-source-scroll>.rc-source-card{flex:0 0 123px;width:123px;min-width:123px;max-width:123px;height:92px;min-height:92px;max-height:92px}
+.work-constructor button.rc-source-open{display:flex;flex-direction:column;justify-content:space-between;flex:1 1 auto;height:100%;min-height:0;max-height:none;padding:7px 8px}
+.rc-source-top{gap:5px}
+.rc-source-top>.wta-art--compact{flex-basis:23px;width:23px;height:23px}
+.rc-source-top>strong{font-size:12px;line-height:1.16;-webkit-line-clamp:4}
+.rc-source-duration{display:flex;align-items:center;justify-content:space-between;gap:5px;position:relative;color:#d7e9ed;font-size:11px;font-weight:600}
+.rc-source-state{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.rc-source-card.is-taken .rc-source-open,.rc-source-card.is-done .rc-source-open{opacity:1}
+.rc-source-card.is-taken{border-color:#5daec0}
+.rc-source-card.is-done{border-color:#6c9b80}
+.cc-hover-tooltip{position:fixed;left:0;top:0;bottom:auto;right:auto;transform:none;box-sizing:border-box;display:flex;gap:9px;width:236px;min-height:min(148px,calc(100vh - 16px));max-height:min(220px,calc(100vh - 16px));padding:10px 11px;overflow:hidden;z-index:6500;pointer-events:none;background:#193846;color:#e8f3f5;border:1px solid #8fb0aa;border-radius:6px;box-shadow:0 12px 24px #0008;font:11px/1.3 'Segoe UI',Arial,sans-serif;white-space:normal;overflow-wrap:anywhere;animation:rc-hover-grow .13s ease-out both}
+.cc-hover-tooltip.is-positioning{animation:none;visibility:hidden}
+.rc-hover-art{flex:0 0 28px}.rc-hover-art .wta-art--compact{display:block;width:28px;height:28px}
+.rc-hover-copy{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1}
+.rc-hover-copy>strong{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:5;overflow:hidden;font-size:14px;line-height:1.25;font-weight:650}
+.rc-hover-copy>small{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;color:#c2d8dc;font-size:11px}
+.rc-hover-output{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;color:#d6e9e6;font-size:12px}
+.rc-hover-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;color:#d7e9ed;font-size:11px;font-weight:650}
+@keyframes rc-hover-grow{from{opacity:.92;transform:scale(var(--rc-start-x,.5),var(--rc-start-y,.5))}to{opacity:1;transform:scale(1)}}
+@media(prefers-reduced-motion:reduce){.cc-hover-tooltip{animation:none}}
+@media(max-width:600px){.work-constructor button.rc-card,.rc-card,.rc-card .token.small-award-token{width:115px;height:81px}.work-constructor button.cc-trophy.rc-card,.work-constructor button.cc-history-member.rc-card{width:128px;height:90px;min-height:90px;max-width:128px;flex-basis:128px}.cc-trophy.rc-card .token.small-award-token,.cc-history-member.rc-card .token.small-award-token{width:128px;height:90px}}
+
+/* Stable brick slots replace free Matter positions in this isolated prototype. */
+.work-constructor .cc-slot-tray{display:grid;grid-auto-rows:max-content;justify-content:start;align-content:start;align-items:start;gap:8px;padding:8px;overflow:visible;min-height:0}
+.work-constructor[data-collecting="true"] .rc-selected .cc-slot-tray,.work-constructor .rc-selected .cc-slot-tray{min-height:0}
+.work-constructor .cc-slot-tray button.cc-cube.rc-card{position:relative;left:auto;top:auto;transform:none;rotate:0deg;will-change:auto;grid-column:auto;grid-row:auto}
+.work-constructor .cc-slot-tray .cc-tray-empty{position:relative;left:auto;right:auto;top:auto;grid-column:1/-1;align-self:center;padding:4px 0;text-align:left}
+.rc-selected.is-following.is-tall{position:relative;top:auto;z-index:1;box-shadow:none}
+.work-constructor[data-collecting="true"] .rc-selected.is-following.is-tall{position:relative;top:auto;z-index:1;box-shadow:none}
+
+/* 25% footprint reduction from the preceding approved-size prototype. */
+.work-constructor button.rc-card,.rc-card,.rc-card .token.small-award-token{width:89px;height:62px}
+.work-constructor button.cc-cube.rc-card{width:89px;height:62px}
+.rc-card .token.small-award-token{box-sizing:border-box;padding:4px 5px;gap:3px}
+.small-award-token .tiny-title{font-size:11px;line-height:1.12;-webkit-line-clamp:2;overflow-wrap:break-word;word-break:normal}
+.small-award-token .wta-art--compact{width:18px;height:18px;flex:none}
+.small-award-token .token-meta{font-size:11px;line-height:1.1;gap:3px;justify-content:space-between}
+.rc-done-check{width:14px;height:14px;flex:none}
+.work-constructor button.cc-trophy.rc-card,.work-constructor button.cc-history-member.rc-card{width:96px;height:68px;min-height:68px;max-width:96px;flex-basis:96px}
+.cc-trophy.rc-card .token.small-award-token,.cc-history-member.rc-card .token.small-award-token{width:96px;height:68px}
+.cc-shelf-objects{min-height:82px;gap:10px}
+.cc-history-members{gap:10px}
+.rc-chain-scroll{gap:6px;min-height:69px}
+.rc-chain-scroll>.rc-source-card{flex-basis:92px}
+.rc-source-scroll{grid-template-columns:repeat(auto-fill,92px);grid-auto-rows:69px;gap:6px}
+.rc-source-card,.rc-source-column .rc-source-card,.rc-chain-scroll>.rc-source-card,.rc-source-scroll>.rc-source-card{box-sizing:border-box;flex:0 0 92px;width:92px;min-width:92px;max-width:92px;height:69px;min-height:69px;max-height:69px;overflow:hidden}
+.work-constructor button.rc-source-open{box-sizing:border-box;display:flex;flex-direction:column;justify-content:space-between;flex:1 1 auto;width:100%;height:100%;min-height:0;max-height:none;padding:4px 5px;overflow:hidden}
+.rc-source-top{gap:3px;align-items:start}
+.rc-source-top>.wta-art--compact{flex:0 0 18px;width:18px;height:18px}
+.rc-source-top>strong{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;font-size:11px;line-height:1.12;overflow-wrap:break-word;word-break:normal}
+.rc-source-duration{font-size:11px;line-height:1.1;gap:3px}
+@media(max-width:600px){.work-constructor button.rc-card,.rc-card,.rc-card .token.small-award-token,.work-constructor button.cc-cube.rc-card{width:86px;height:61px}.work-constructor button.cc-trophy.rc-card,.work-constructor button.cc-history-member.rc-card{width:96px;height:68px;min-height:68px;max-width:96px;flex-basis:96px}.cc-trophy.rc-card .token.small-award-token,.cc-history-member.rc-card .token.small-award-token{width:96px;height:68px}}
+/* Completion and enlarged preview retain their own readable face sizing. */
+.cc-trophy.rc-card .tiny-title,.cc-history-member.rc-card .tiny-title{-webkit-line-clamp:3}
+.cc-hover-tooltip .rc-done-check{width:17px;height:17px}
+/* Preserve whole-word title wrapping at the narrow physical-token width. */
+.rc-card .token.small-award-token{padding:4px 4px}
+.rc-card .token.small-award-token .compact-award-top{gap:2px}
+.rc-card .token.small-award-token .wta-art--compact{width:17px;height:17px}

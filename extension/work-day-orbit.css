@@ -4,3 +4,13 @@
 .cc-orbit-lesson-leader{stroke:#e2b778;stroke-width:1;opacity:.75;pointer-events:none}.cc-orbit-work-label{fill:#112b37;font-size:10px;font-weight:600;pointer-events:none}.cc-orbit-lesson{position:absolute;z-index:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:2px;background:var(--lesson,#e2b778);color:#18303d;border-radius:4px;line-height:1;box-sizing:border-box;transform:translate(-50%,-50%) rotate(var(--lesson-angle));transform-origin:center;overflow:hidden;cursor:help}.cc-orbit-lesson time{font-variant-numeric:tabular-nums;font-weight:500;font-size:8px;line-height:1.05}.cc-orbit-lesson b{font-weight:600;font-size:9px;line-height:1.05;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 
 .cc-day-orbit-clock-period{fill:var(--cc-muted,#acc4ce);font-size:11px;font-weight:500;font-variant-numeric:tabular-nums}.cc-day-orbit-hand-tip{pointer-events:none}
+.cc-day-orbit-sector.is-fixed{stroke-width:76}
+.cc-orbit-fixed-label{pointer-events:none}
+.cc-orbit-fixed-title{fill:#17313e;font-size:13px;font-weight:650;letter-spacing:0;dominant-baseline:middle;stroke:none}
+.cc-orbit-fixed-title[hidden]{display:none}
+.cc-day-orbit-hand-tip{fill:#8fd9a7}
+.cc-orbit-countdown{pointer-events:none}
+.cc-orbit-countdown[hidden]{display:none}
+.cc-orbit-countdown-line{stroke:#a7e5bb;stroke-width:2.5;stroke-linecap:round;filter:drop-shadow(0 1px 2px #07131c)}
+.cc-orbit-countdown-dot{fill:#a7e5bb;stroke:#102932;stroke-width:1.5}
+.cc-orbit-countdown-label{fill:#d9f2e0;font-size:12px;font-weight:650;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:#10232d;stroke-width:3px;stroke-linejoin:round}

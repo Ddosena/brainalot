@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {currentDayPosition,orbitArcPath,renderDayOrbit,layoutLessonLabels,orbitHalfCounts} from '../work-day-orbit.js';
+import {currentDayPosition,orbitArcPath,renderDayOrbit,lessonTextPath,lessonTitle,wrapLessonTitle,orbitHalfCounts} from '../work-day-orbit.js';
 test('Moscow midnight belongs to the new day',()=>{
  assert.deepEqual(currentDayPosition('2026-10-24',new Date('2026-10-23T21:30:00Z')),{today:true,nowMinutes:30,label:'00:30'});
  assert.equal(currentDayPosition('2026-10-23',new Date('2026-10-23T21:30:00Z')).today,false);
@@ -20,7 +20,7 @@ test('half-day projection never overlays morning and evening data',()=>{
  assert.match(am,/data-orbit-id="noon"/);assert.match(pm,/data-orbit-id="noon"/);
 });
 test('external clock marker remains visible in both halves on the actual day',()=>{
- for(const nowMinutes of [0,30,420,1380]){const half=nowMinutes<720?'morning':'afternoon',other=half==='morning'?'afternoon':'morning',same=renderDayOrbit({today:true,nowMinutes,half}),opposite=renderDayOrbit({today:true,nowMinutes,half:other});assert.match(same,new RegExp('data-now="'+nowMinutes+'"'));assert.match(opposite,new RegExp('data-now="'+nowMinutes+'" data-now-half="'+half+'" data-other-half="true"'));assert.match(opposite,/cc-day-orbit-clock-period/);assert.equal(same.match(/data-other-half="false"[^>]*transform="([^"]+)"/)[1],opposite.match(/data-other-half="true"[^>]*transform="([^"]+)"/)[1]);}
+ for(const nowMinutes of [0,30,420,1380]){const half=nowMinutes<720?'morning':'afternoon',other=half==='morning'?'afternoon':'morning',same=renderDayOrbit({today:true,nowMinutes,half}),opposite=renderDayOrbit({today:true,nowMinutes,half:other});assert.match(same,new RegExp('data-now="'+nowMinutes+'"'));assert.match(opposite,new RegExp('data-now="'+nowMinutes+'" data-now-half="'+half+'" data-other-half="true"'));assert.doesNotMatch(opposite,/cc-day-orbit-clock-period/);assert.equal(same.match(/data-other-half="false"[^>]*transform="([^"]+)"/)[1],opposite.match(/data-other-half="true"[^>]*transform="([^"]+)"/)[1]);}
  assert.doesNotMatch(renderDayOrbit({today:false,nowMinutes:900}),/cc-day-orbit-hand-tip/);
 });
 test('visible current marker has a readable label and moves with clock minutes',()=>{
@@ -28,16 +28,18 @@ test('visible current marker has a readable label and moves with clock minutes',
  assert.match(first,/aria-label="Текущее время 01:30 · 00–12"/);assert.match(first,/L -8 -15 L 8 -15/);
  assert.notEqual(first.match(/data-now="90"[^>]*transform="([^"]+)"/)[1],next.match(/data-now="91"[^>]*transform="([^"]+)"/)[1]);
 });
-test('lessons are miniature near-squares tangent to the correct time; work has letters',()=>{
+test('fixed lessons use curved subjects on the correct time sectors; work has letters',()=>{
  const html=renderDayOrbit({events:[{id:'lesson',title:'Урок · Моделирование',required:true,start:720,minutes:60},{id:'optional',title:'Встреча',required:false,start:840,minutes:30}],cubes:[{id:'placed',title:'Уточнить силуэт и пропорции',start:900,minutes:45}]});
- assert.match(html,/<b>Модел\.<\/b>/);assert.match(html,/data-ctooltip="12:00–13:00 · Моделирование"/);assert.doesNotMatch(html,/<title>| title="/);assert.match(html,/cc-orbit-work-label/);assert.match(html,/силуэт/);assert.doesNotMatch(html,/data-orbit-id="optional"|cc-orbit-key|Сегодня|Сейчас/);
- const box=layoutLessonLabels([{from:1080,to:1140}])[0];assert.equal(box.boxWidth,40);assert.equal(box.boxHeight,36);assert.equal(box.rotation,15);assert(Math.hypot(box.center.x-180,box.center.y-180)<=112.001);
+ assert.match(html,/data-orbit-lesson-title="Моделирование"/);assert.match(html,/<textPath /);assert.match(html,/<title>Урок · Моделирование · 12:00–13:00<\/title>/);assert.match(html,/cc-orbit-work-label/);assert.match(html,/силуэт/);assert.doesNotMatch(html,/data-orbit-id="optional"|cc-orbit-key|Сегодня|Сейчас/);
+ assert.equal(lessonTitle('Урок: разбор работ'),'разбор работ');
+ const widths=[132,110].map(r=>r*60/720*Math.PI*2),measure=(value,font)=>Array.from(value).length*font*.54;
+ assert.deepEqual(wrapLessonTitle('разбор работ',widths,measure).lines,['разбор','работ']);
+ assert.match(lessonTextPath(1080,1140,720,1440,100,true),/ 0 0 /);
 });
 test('arc geometry reacts to real movement, clipping and resizing',()=>{
  assert.notEqual(orbitArcPath(900,945),orbitArcPath(900,990));assert.notEqual(orbitArcPath(900,990),orbitArcPath(1080,1170));assert.equal(orbitArcPath(600,600),'');assert.equal((orbitArcPath(720,1440).match(/ A /g)||[]).length,2);
 });
-test('lesson content is escaped and adjacent miniatures do not overlap',()=>{
+test('lesson content is escaped and fixed sector retains exact bounds',()=>{
  const html=renderDayOrbit({events:[{id:'x',title:'<script>',required:true,start:720,minutes:30,color:'url(evil)'}]});assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/url\(evil\)/);
- const boxes=layoutLessonLabels([{from:720,to:735},{from:735,to:750},{from:750,to:765}]);
- for(let i=0;i<boxes.length;i++)for(let j=i+1;j<boxes.length;j++){const a=boxes[i],b=boxes[j];assert(a.left+a.width<=b.left||b.left+b.width<=a.left||a.top+a.height<=b.top||b.top+b.height<=a.top);}
+ assert.match(html,/data-start="720" data-minutes="30"/);assert.ok(html.includes(`d="${orbitArcPath(720,750)}"`));
 });

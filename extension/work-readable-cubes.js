@@ -3,12 +3,12 @@ import {renderAwardArt} from './work-trophy-art.js';
 import {validImportanceScore} from './importance-score.js';
 import {t} from './i18n.js';
 import {isDeletedCube} from './work-deletions.js';
-export const READABLE_LAYOUTS=[{id:'compact',label:t("Компактные блоки"),width:84,height:59}];
+export const READABLE_LAYOUTS=[{id:'compact',label:t("Компактные блоки"),width:89,height:62}];
 export const normalizeOrbitHalf=value=>value==='morning'?'morning':'afternoon';
 export const orbitHalfAt=minutes=>typeof minutes==='number'&&Number.isFinite(minutes)&&minutes>=0&&minutes<1440?(minutes<720?'morning':'afternoon'):null;
 export function setReadableLayout(){return 'compact';}
 export function readableLayout(){return 'compact';}
-export function readableCardDimensions(_value='compact',_variant='day',viewportWidth=globalThis.innerWidth??Infinity){return viewportWidth<=600?{width:82,height:58}:{width:84,height:59};}
+export function readableCardDimensions(_value='compact',_variant='day',viewportWidth=globalThis.innerWidth??Infinity){return viewportWidth<=600?{width:86,height:61}:{width:89,height:62};}
 export function readableSource(c,typeLabel=t("Задача")){
   if(c.kind==='brainalot')return ['Brainalot',c.sourceLabel].filter(Boolean).join(' · ');
   if(c.kind==='calendar')return t("Календарь");if(c.kind==='weekly_review')return t("Недельный разбор");
@@ -20,8 +20,8 @@ const CATEGORY_COLORS={research:'#76accf',practice:'#70bdb4',slides:'#ad9cd6',sc
 export const compactCardVariant=c=>c.award_variant||TYPE_ART[c.type||c.color||c.kind]||'enamel';
 export const compactCardMinutes=(c,finished=Number(c.progress_percent??c.progress)>=100)=>finished?(c.actual_minutes??c.actual??c.minutes??c.planned??0):(c.minutes??c.planned??0);
 export function readableCardContents(c,{typeLabel=t("Задача"),duration=null,finished=Number(c.progress_percent??c.progress)>=100}={}){
-  const percent=finished?100:Math.max(0,Math.min(100,Number(c.progress_percent??c.progress)||0)),type=c.type||c.color||c.kind||'task',variant=compactCardVariant(c),color=CATEGORY_COLORS[type]||CATEGORY_COLORS.task;
-  return '<span class="token small-award-token" data-color="'+esc(type)+'" data-award-variant="'+esc(variant)+'"'+(!c.award_variant?' data-art-preview="true"':'')+'><span class="rc-progress" style="width:'+percent+'%" aria-hidden="true"></span><span class="compact-award-top">'+renderAwardArt(variant,{compact:true,categoryColor:color})+'<span class="tiny-title">'+esc(c.title||typeLabel)+'</span></span><span class="token-meta"><span>'+esc(duration??t("{String} мин", {String: String(compactCardMinutes(c,finished))}))+'</span></span></span>';
+  const percent=finished?100:Math.max(0,Math.min(100,Number(c.progress_percent??c.progress)||0)),type=c.type||c.color||c.kind||'task',variant=compactCardVariant(c),color=CATEGORY_COLORS[type]||CATEGORY_COLORS.task,showCheck=finished&&c.status!=='cancelled'&&!c.cancelled;
+  return '<span class="token small-award-token" data-color="'+esc(type)+'" data-award-variant="'+esc(variant)+'"'+(!c.award_variant?' data-art-preview="true"':'')+'><span class="rc-progress" style="width:'+percent+'%" aria-hidden="true"></span><span class="compact-award-top">'+renderAwardArt(variant,{compact:true,categoryColor:color})+'<span class="tiny-title">'+esc(c.title||typeLabel)+'</span></span><span class="token-meta"><span>'+esc(duration??t("{String} мин", {String: String(compactCardMinutes(c,finished))}))+'</span>'+(showCheck?'<svg class="rc-done-check" viewBox="0 0 16 16" aria-hidden="true"><path d="m2.5 8 3.5 3.5 7.5-8"/></svg>':'')+'</span></span>';
 }
 const cubeKey=c=>c.canonical_id||c.blueprint_ref||c.id;
 export const sourceImportanceKey=c=>String(cubeKey(c)||'');
@@ -72,5 +72,14 @@ export function sourcePools({planning={},date,taskIds=[],cubes=[],selectedIds=[]
 }
 export function sourceCardContents(c,{typeLabel=t("Задача"),selected=false,done=Number(c.progress_percent)>=100,source=readableSource(c,typeLabel)}={}){
   const type=c.type||c.color||c.kind||'task',color=CATEGORY_COLORS[type]||CATEGORY_COLORS.task,percent=Math.max(0,Math.min(100,Number(c.progress_percent)||0));
-  return '<span class="rc-source-progress" style="width:'+percent+'%" aria-hidden="true"></span><span class="rc-source-top">'+renderAwardArt(compactCardVariant(c),{compact:true,categoryColor:color})+'<strong>'+esc(c.title||typeLabel)+'</strong></span><small>'+esc(source)+'</small>'+(selected||done?'<span class="rc-source-state">'+(done?t("Завершён"): t("В дне"))+'</span>':'');
+  return '<span class="rc-source-progress" style="width:'+percent+'%" aria-hidden="true"></span><span class="rc-source-top">'+renderAwardArt(compactCardVariant(c),{compact:true,categoryColor:color})+'<strong>'+esc(c.title||typeLabel)+'</strong></span><span class="rc-source-duration">'+esc(t("{String} мин",{String:String(compactCardMinutes(c,done))}))+(done&&c.status!=='cancelled'&&!c.cancelled?'<svg class="rc-done-check" viewBox="0 0 16 16" aria-hidden="true"><path d="m2.5 8 3.5 3.5 7.5-8"/></svg>':'')+'</span>'+(selected||done?'<span class="rc-source-state">'+(done?t("Завершён"): t("В дне"))+'</span>':'');
+}
+export function hoverCubeContents(c,{typeLabel=t("Задача"),done=Number(c.progress_percent??c.progress)>=100}={}){
+  const type=c.type||c.color||c.kind||'task',variant=compactCardVariant(c),color=CATEGORY_COLORS[type]||CATEGORY_COLORS.task;
+  const source=readableSource(c,typeLabel),output=String(c.output||'').trim(),normalize=value=>String(value||'').trim().replace(/\s+/g,' ').toLocaleLowerCase(),showSource=source&&normalize(source)!==normalize(c.title||typeLabel);
+  return '<span class="rc-hover-art">'+renderAwardArt(variant,{compact:true,categoryColor:color})+'</span><span class="rc-hover-copy"><strong>'+esc(c.title||typeLabel)+'</strong>'+(showSource?'<small>'+esc(source)+'</small>':'')+(output?'<span class="rc-hover-output">'+esc(output)+'</span>':'')+'<span class="rc-hover-meta">'+esc(t("{String} мин",{String:String(compactCardMinutes(c,done))}))+(done&&c.status!=='cancelled'&&!c.cancelled?'<svg class="rc-done-check" viewBox="0 0 16 16" aria-hidden="true"><path d="m2.5 8 3.5 3.5 7.5-8"/></svg>':'')+'</span></span>';
+}
+export function hoverCubePosition(rect,viewport,preview){
+  const width=Math.min(236,Math.max(0,viewport.width-16)),height=preview.height;
+  return {width,left:Math.max(8,Math.min(rect.left-(width-rect.width)/2,viewport.width-width-8)),top:Math.max(8,Math.min(rect.top-(height-rect.height)/2,viewport.height-height-8))};
 }
