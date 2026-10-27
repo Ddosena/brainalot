@@ -474,6 +474,9 @@ def day_command(planner, command):
         snapshot = store._read(db, current)
         snapshot['library_notes'] = library_notes
     eligible_library = any(note.get('kind') == 'task' and note.get('status') == 'active' for note in library_notes)
+    # Until a plan exists (its first import) there is nothing to coordinate.
+    if not isinstance((snapshot.get('state') or {}).get('planning'), dict):
+        return store.planning_operation(command)
     if not (snapshot.get('state') or {}).get('period_planner') and command['action'] != 'period_context' and not eligible_library:
         return store.planning_operation(command)
     action, data = command['action'], command['data']

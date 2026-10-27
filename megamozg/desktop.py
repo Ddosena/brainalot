@@ -176,7 +176,7 @@ class DesktopBridge:
         area = select_area(native_rect(window), self._host._areas()) if window else WorkArea(0, 0, 1920, 1080)
         return {"port": self._host.port, "token": self._host.token, "desktop": True,
                 "mode": self._host.mode, "widget_mode": self._host.widget_mode,
-                "topmost": self._host.topmost, "side": self._host.side,
+                "topmost": self._host.topmost, "full_on_top": self._host.full_on_top, "side": self._host.side,
                 "media_visible": self._host.media_visible,
                 "work_expanded": self._host._expanded_full_geometry is not None,
                 "double_click": double_click_settings(area.dpi)}
@@ -243,8 +243,16 @@ class CompactSurface:
         self.frames = 0
         self.skipped_frames = 0
         self.capture_seconds = 0.0
+        self._warned = {}
         self._worker = threading.Thread(target=self._inputs, name="brainalot-compact-input", daemon=True)
         self._worker.start()
+
+    def _warn(self, message):
+        """Visible but throttled: a silent failure here once hid a dead widget for hours."""
+        now = time.monotonic()
+        if now-self._warned.get(message, -60.0) >= 60:
+            self._warned[message] = now
+            _log.warning(message, exc_info=True)
 
     def _invoke(self, callback):
         from System import Action
@@ -355,6 +363,10 @@ class CompactSurface:
             if button == 0 and not item["id"]: self._input.put(("begin", item))
         def move(_sender, event):
             self._pointer_feedback(event.X,event.Y)
+            # WebView2's offscreen child shares this input queue and may set its
+            # own (even empty) cursor; WM_SETCURSOR also skips a capturing control.
+            from System.Windows.Forms import Cursor
+            Cursor.Current = canvas.Cursor
             item = self.press
             if not item: return
             point = cursor_position()
@@ -524,7 +536,7 @@ class CompactSurface:
                 if first_frame: self.window.native.Opacity = 1
             self._invoke(present)
         except Exception:
-            if not self.closed: _log.debug("Compact bitmap refresh failed", exc_info=True)
+            if not self.closed: self._warn("Compact bitmap refresh failed")
         finally:
             self.capture_seconds += time.monotonic()-started
             self._capture_lock.release(); self._schedule()
@@ -585,7 +597,7 @@ class CompactSurface:
                     elif item["key"] in {"Return", "Enter", "Space"}: self._activate_control(self.focus_id)
                 self._schedule(0)
             except Exception:
-                if not self.closed: _log.warning("Compact input failed",exc_info=True)
+                if not self.closed: self._warn("Compact input failed")
 
     def close(self):
         self.closed = True; self.active = False; self.generation += 1
@@ -613,6 +625,9 @@ class DesktopHost:
         if self.widget_mode not in WIDGET_SIZES:
             self.widget_mode = "bar"
         self.topmost = True  # old saved false/hide states cannot disable visibility
+        # Compact views always stay above other windows; the full window follows
+        # the person's pin (Ctrl+Shift+A or the pin button), remembered between runs.
+        self.full_on_top = self.state.data.get("full_on_top", True) is not False
         self.side = self.state.data.get("side", "right")
         if self.side not in {"left", "right", "top", "bottom"}:
             self.side = "right"
@@ -631,6 +646,9 @@ class DesktopHost:
         self._popup_above = False
         self._compact_surface = None
         self._expanded_full_geometry = None
+
+    def _set_rect(self, window, rect, minimum=None):
+        set_native_rect(window, rect, minimum, on_top=window is not self.full or self.full_on_top)
 
     def _widget_size(self, mode):
         width, height = WIDGET_SIZES[mode]
@@ -698,7 +716,7 @@ class DesktopHost:
         bridge = DesktopBridge(self)
         self.full = webview.create_window("Brainalot", self._url("desktop.html"), js_api=bridge,
                                          hidden=True, frameless=True, easy_drag=False,
-                                         on_top=True, shadow=False, min_size=MINIMUM_SIZES["full"],
+                                         on_top=self.full_on_top, shadow=False, min_size=MINIMUM_SIZES["full"],
                                          x=80, y=80,
                                          width=FULL_SIZE[0], height=FULL_SIZE[1])
         self.widget = webview.create_window("Brainalot", self._url(f"widget.html?mode={self.widget_mode}"),
@@ -808,7 +826,7 @@ class DesktopHost:
         try:
             for mode, window in (("full", self.full), (self.widget_mode, self.widget)):
                 rect, minimum = self._rect(mode)
-                set_native_rect(window, rect, minimum)
+                self._set_rect(window, rect, minimum)
         finally:
             self._switching = False
 
@@ -822,7 +840,7 @@ class DesktopHost:
                 self._widget_popup({"open": False})
                 window = self.full if self.mode == "full" else self.widget
                 rect, minimum = self._rect(self.mode)
-                set_native_rect(window, rect, minimum)
+                self._set_rect(window, rect, minimum)
                 self._sync_compact_surface()
                 self._remember_geometry(window, "full" if self.mode == "full" else "widget")
             self._topology = topology
@@ -874,7 +892,7 @@ class DesktopHost:
                         self.state.data["side"] = self.side
                     rect = fit_geometry(rect, self._areas(), self._widget_size(self.mode) if self.mode in WIDGET_SIZES else FULL_SIZE,
                                         side=self.side if self.mode == "bar" else None)
-                set_native_rect(window, rect)
+                self._set_rect(window, rect)
             if action == "gesture_end":
                 self._drag = None
                 self._sync_compact_surface()
@@ -975,19 +993,29 @@ class DesktopHost:
                         rect = fit_geometry(self._expanded_full_geometry, self._areas(), FULL_SIZE, MINIMUM_SIZES["full"])
                     self._switching = True
                     try:
-                        set_native_rect(self.full, rect)
+                        self._set_rect(self.full, rect)
                     finally:
                         self._switching = False
                     if not value:
                         self._expanded_full_geometry = None
                         self._remember_geometry(self.full, "full")
                 return {"ok": True, "expanded": value}
+            if action == "pin":
+                if value is not None and type(value) is not bool:
+                    raise ValueError("pin requires a boolean or null to toggle")
+                self.full_on_top = (not self.full_on_top) if value is None else value
+                with self.state.lock:
+                    self.state.data["full_on_top"] = self.full_on_top
+                    self.state.save()
+                if self.full:
+                    self._set_rect(self.full, native_rect(self.full))
+                return {"ok": True, "pinned": self.full_on_top, "mode": self.mode}
             if action == "topmost":
                 self.topmost = True
                 # pywebview's on_top setter writes WinForms.TopMost off the UI
                 # thread; native property events can deadlock with Python's GIL.
                 for window in (self.full, self.widget):
-                    set_native_rect(window, native_rect(window))
+                    self._set_rect(window, native_rect(window))
             elif action in {"full", "card", "bar", "hide"}:
                 # Compatibility for old callers: hide is now a visible tab.
                 if action == "hide": action = "bar"
@@ -1018,7 +1046,7 @@ class DesktopHost:
                     if action == "full" and self._expanded_full_geometry is not None:
                         area = select_area(self._expanded_full_geometry, self._areas())
                         rect = {"x": area.x, "y": area.y, "width": area.width, "height": area.height}
-                    set_native_rect(target, rect, minimum)
+                    self._set_rect(target, rect, minimum)
                     self._sync_compact_surface()
                     self._show(target)  # show before hiding the old surface
                     if action == "full":

@@ -21,11 +21,12 @@ from . import course_rules
 from . import cube_ops
 from . import ruler_rules
 from . import library_rules
+from . import color_rules
 
 NAMESPACE = "period_planner"
 ACTIONS = frozenset({"period_set", "period_clear", "project_visibility", "cube_select", "cube_return",
     "cube_move", "cube_time", "cube_merge", "cube_rename", "cube_cancel", "task_rename",
-    "calendar_source_import", "calendar_event_move", "calendar_offer_estimate", "cube_resize", "cube_drop", "course_source_import", "calendar_event_rename", "assignment_rename", "cube_delete"}) | ruler_rules.ACTIONS
+    "calendar_source_import", "calendar_event_move", "calendar_offer_estimate", "cube_resize", "cube_drop", "course_source_import", "calendar_event_rename", "assignment_rename", "cube_delete"}) | ruler_rules.ACTIONS | color_rules.ACTIONS
 CONTEXT_FIELDS = frozenset({"mode", "date", "week_start", "cube_id", "task_id", "project_id", "window_start", "expanded_week", "calendar_event_id"})
 
 
@@ -226,6 +227,7 @@ def _event_rows(planning, calendar_metadata=None):
             "all_day": bool(event.get("all_day")), "kind": "calendar", "conflict": conflict,
             "alternatives": alternatives if conflict else [],
             "project_id": native_tasks.get(matches[0].get("task_id"), {}).get("project_id") if matches else None,
+            "color": event.get("color"), "color_name": event.get("color_name"),
             "source_ids": list(dict.fromkeys([event_id, event["id"], *[row["id"] for row in matches]]))})
     for live in live_rows:
         if live["id"] in linked_live or not live.get("date") or not live.get("start"):
@@ -303,6 +305,7 @@ def read_model(snapshot):
         left = remaining.get(tid, result_tasks.get(tid, {}).get("remaining_minutes", total))
         # Completion derives exclusively from Work facts, never from a course table's status.
         percent = max(0, min(100, round(100 * (total-left) / total, 1))) if total else 0
+        baseline = wp.latest_remaining_baseline(planning, tid)
         tasks.append({"id": tid, "project_id": native["project_id"],
             "title": ext.get("task_titles", {}).get(tid, native["title"]),
             "start": explicit["start"] if explicit else min(dates) if dates else native.get("methodist_start"),
@@ -313,6 +316,8 @@ def read_model(snapshot):
             "effective_remaining_minutes": max(0, left-native_cancelled.get(tid, 0)-overlay_cancelled.get(tid, 0)),
             "progress_percent": percent,
             "status": "completed" if percent >= 100 else "started" if percent > 0 else "available",
+            # The day of an explicit "done" outcome; reopening replaces exactly that fact.
+            "completed_on": baseline[0] if baseline and baseline[2] else None,
             "period_explicit": bool(explicit), "source_status": source.get("status"),
             "owned": bool(source.get("owned_by_user", True) and not wp._scope_exempt(planning, tid))})
     task_map = {row["id"]: row for row in tasks}
@@ -347,7 +352,8 @@ def read_model(snapshot):
             "start": min(span) if span else settings["start"], "end": max(span) if span else settings["end"], "tasks": project_tasks})
     projects = course_rules.enrich(state, projects)
     projects = ruler_rules.enrich(state, projects)
-    date_overrides = {task.get("source_work_task_id"): task for project in projects for task in project.get("tasks", [])
+    projects = color_rules.enrich(state, projects, native_events, events)
+    date_overrides ={task.get("source_work_task_id"): task for project in projects for task in project.get("tasks", [])
         if task.get("owner_date_override") and task.get("source_work_task_id") and not task.get("package_id")}
     for task in tasks:
         if task["id"] in date_overrides:
@@ -367,6 +373,7 @@ def read_model(snapshot):
     return {"revision": snapshot["revision"], "today": datetime.now(ZoneInfo(settings["timezone"])).date().isoformat(),
         "context": context(state), "projects": projects, "tasks": tasks, "cubes": cubes, "events": events, "warnings": warnings,
         "calendar_coverage": calendar_rules.coverage(state),
+        "calendar_palette": color_rules.palette(state, native_events, projects),
         "totals": {"source_minutes": sum(t["minutes"] for t in personal_tasks),
             "source_all_minutes": sum(t["minutes"] for t in tasks),
             "reference_minutes": sum(t["minutes"] for t in tasks if not t["owned"]),
@@ -500,6 +507,8 @@ def apply_command(state, action, data, library_notes=None):
         return state
     if action in ruler_rules.ACTIONS:
         return ruler_rules.apply(state, action, data, model)
+    if action in color_rules.ACTIONS:
+        return color_rules.apply(state, action, data, model)
     if action == "cube_delete":
         return cube_ops.delete(state, data, model)
     if action == "cube_merge":

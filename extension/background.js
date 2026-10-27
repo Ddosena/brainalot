@@ -293,6 +293,9 @@ async function handle(message, sender) {
       return {opened:true};
     }
     case "calendar-oauth-disconnect": return api("/api/calendar/oauth", "DELETE");
+    case "calendar-bridge-prepare": return api("/api/calendar/bridge/prepare", "POST");
+    case "calendar-bridge-connect": return api("/api/calendar/bridge", "POST", { url: message.url });
+    case "calendar-bridge-disconnect": return api("/api/calendar/bridge", "DELETE");
     case "calendar-event-move":
       return api(`/api/calendar/events/${encodeURIComponent(message.eventId)}`, "PATCH", {
         calendar_id: message.calendarId, start: message.start, new_date: message.newDate,

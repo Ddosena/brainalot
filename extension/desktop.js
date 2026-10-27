@@ -39,6 +39,11 @@ document.querySelectorAll("[data-view]").forEach(button => button.onclick = () =
 window.addEventListener("brainalot-view", event => show(event.detail));
 const bootstrap = await native.bootstrap();
 document.body.classList.toggle("work-expanded", !!bootstrap.work_expanded);
+const pinButton = document.getElementById("desktop-pin");
+const showPin = pinned => pinButton.setAttribute("aria-pressed", String(pinned));
+showPin(bootstrap.full_on_top !== false);
+pinButton.onclick = () => void native.window_action("pin", null).then(result => showPin(result.pinned)).catch(showError);
+window.addEventListener("brainalot-pin", event => showPin(event.detail));
 window.addEventListener("message", async event => {
   const frame = document.getElementById("desktop-content"), request = event.data;
   if (event.origin !== location.origin || event.source !== frame.contentWindow) return;

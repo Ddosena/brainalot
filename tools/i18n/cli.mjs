@@ -23,7 +23,7 @@ export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const EXTENSION = join(ROOT, "extension");
 const CATALOG = join(EXTENSION, "locales", "en.js");
 const RUNTIME_FILES = new Set(["i18n.js"]);
-const SERVER_FILES = ["api.py", "core.py", "calendar.py", "google_calendar_api.py", "attachments.py",
+const SERVER_FILES = ["api.py", "core.py", "calendar.py", "calendar_bridge.py", "google_calendar_api.py", "attachments.py",
   "focus_overlay.py", "dictation.py", "dictation_service.py", "voice.py", "chats.py", "work_inbox.py", "telegram_chats.py", "work_delete.py"];
 export const MANIFEST_MESSAGES = {
   extName: { field: ["name"], en: "Brainalot" },

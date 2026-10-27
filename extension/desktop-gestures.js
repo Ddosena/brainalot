@@ -21,6 +21,10 @@ export function installWindowGestures(native, {
   surface.addEventListener("pointerdown", event => {
     pointerEpoch++;
     suppressClick = false;
+    // A new press of the same pointer means its previous release never reached
+    // the page (the compact widget hid the WebView mid-drag). Drop that gesture
+    // instead of letting the new release finish it as a stale drag.
+    if (gesture?.id === event.pointerId) gesture = null;
     if (gesture || ![0, 2].includes(event.button) || !eligible(event)) { last = null; interruption++; return; }
     gesture = {id: event.pointerId, button:event.button, x:event.clientX, y:event.clientY,
       moved:false, resize:!!event.target.closest("[data-resize]"), nativeGesture:tab || !!event.target.closest("[data-window-drag], [data-resize]"), epoch:pointerEpoch, interruption};
@@ -44,26 +48,30 @@ export function installWindowGestures(native, {
     if (!gesture || gesture.id !== event.pointerId) return;
     const finished = gesture; gesture = null;
     const click = {button:finished.button, x:event.clientX, y:event.clientY, time:stamp(event)};
-    // Set this synchronously: the compatibility click arrives before the native reply.
+    // The browser's compatibility click follows pointerup in this same task,
+    // before any native reply. The flag must not outlive that task: a compact
+    // widget gets no further pointerdown, so a leaked flag swallowed every
+    // native button click until the next real press reached the page.
     suppressClick = finished.moved || cancelled;
+    if (suppressClick) setTimeout(() => { if (pointerEpoch === finished.epoch) suppressClick = false; });
     if (surface.hasPointerCapture(event.pointerId)) surface.releasePointerCapture(event.pointerId);
     const result = finished.nativeGesture && finished.button === 0 ? await send("gesture_end") : {};
     if (result.side && typeof document !== "undefined") document.body.dataset.side = result.side;
     const discarded = finished.moved || result.dragged || cancelled || freeDoubleClick && selectedText();
-    if (pointerEpoch === finished.epoch) suppressClick = discarded;
     if (discarded || finished.resize || finished.interruption !== interruption) { last = null; return; }
     const paired = last && last.button === click.button && click.time-last.time >= 0 &&
       click.time-last.time <= interval && Math.abs(click.x-last.x) <= distanceX && Math.abs(click.y-last.y) <= distanceY;
     last = paired ? null : click;
-    if (paired) {
-      if (pointerEpoch === finished.epoch) suppressClick = true;
-      await (click.button === 2 ? onRightDoubleClick() : onDoubleClick());
-    }
+    if (paired) await (click.button === 2 ? onRightDoubleClick() : onDoubleClick());
   };
   surface.addEventListener("pointerup", event => { void finish(event); });
   surface.addEventListener("pointercancel", event => { void finish(event, true); });
   surface.addEventListener("click", event => {
-    if (suppressClick) {event.preventDefault(); event.stopImmediatePropagation();}
+    // Only the browser's own click after a drag is discarded, once. Native
+    // compact controls call element.click() (untrusted); those always run.
+    if (!suppressClick || !event.isTrusted) return;
+    suppressClick = false;
+    event.preventDefault(); event.stopImmediatePropagation();
   }, true);
   // Implement both buttons with Windows preferences; browser dblclick has its own timing.
   surface.addEventListener("dblclick", event => { if (eligible(event)) event.preventDefault(); });

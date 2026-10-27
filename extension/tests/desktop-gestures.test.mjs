@@ -16,7 +16,7 @@ function fixture(options={}) {
   const native = {async window_action(action,value) { calls.push([action,value]); return {ok:true}; }};
   installWindowGestures(native, {surface,...options});
   const emit = (name,extra={}) => {
-    const event = {button:0,pointerId:1,clientX:20,clientY:20,timeStamp:100,target,
+    const event = {button:0,pointerId:1,clientX:20,clientY:20,timeStamp:100,target,isTrusted:true,
       prevented:false,stopped:false,preventDefault(){this.prevented=true;},stopImmediatePropagation(){this.stopped=true;},...extra};
     handlers.get(name)?.(event); return event;
   };
@@ -61,6 +61,27 @@ test('drag and cancelled pointer suppress clicks synchronously and reset double 
   await flush();
   f.emit('pointerdown',{timeStamp:400,target:{closest(){return {};}}});
   assert.equal(f.emit('click').prevented,false, 'next control click must remain usable after drag/cancel');
+});
+
+test('a drag never disables later native element.click() activation (compact widget)',async()=>{
+  // Bug report 0.2.10: dragging the card while a menu was open closed the menu,
+  // the page then rendered through the native canvas and received no further
+  // pointerdown, and every native button click was swallowed for hours.
+  const f=fixture({tab:true});
+  f.emit('pointerdown',{timeStamp:100});
+  f.emit('pointermove',{clientX:40,timeStamp:110});
+  f.emit('pointerup',{clientX:40,timeStamp:120});
+  assert.equal(f.emit('click').stopped,true,'the browser click that ends the drag is discarded');
+  await flush(); await new Promise(resolve=>setTimeout(resolve));
+  assert.equal(f.emit('click',{isTrusted:false}).stopped,false,'native element.click() runs');
+  assert.equal(f.emit('click').stopped,false,'the drag flag expires with its own task');
+  const unreleased=fixture({tab:true});
+  unreleased.emit('pointerdown',{timeStamp:100});
+  unreleased.emit('pointermove',{clientX:40,timeStamp:110});
+  assert.equal(unreleased.emit('click',{isTrusted:false}).stopped,false,'release lost offscreen still keeps native clicks');
+  unreleased.emit('pointerdown',{timeStamp:5000,target:{closest(){return {};}}});
+  unreleased.emit('pointerup',{timeStamp:5010,target:{closest(){return {};}}});
+  assert.equal(unreleased.emit('click').stopped,false,'the next real press in a reopened menu is not a stale drag');
 });
 
 test('full header callback and compact card default, ordinary body ignored',async()=>{

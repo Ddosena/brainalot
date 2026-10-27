@@ -44,7 +44,8 @@ export async function requestApi(path, { token, port, method = "GET", body, fetc
   const base = validPort(port) ? `http://127.0.0.1:${port}` : apiBase();
   const scope = `${base}|${token}|`;
   const cacheKey = scope + path;
-  const conditional = method === "GET" && (path === "/api/dashboard" || path === "/api/notes");
+  const conditional = method === "GET" && (path === "/api/dashboard" || path === "/api/notes" ||
+    path === "/api/work/state" || path === "/api/work/period/model" || path === "/api/work/period/day");
   const cached = conditional ? readCache.get(cacheKey) : null;
   try {
     const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };

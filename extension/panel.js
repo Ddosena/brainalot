@@ -2,6 +2,7 @@ import "./desktop-platform.js";
 import { mountTimeUI, taskTimeButton } from "./time-ui.js";
 import { getTimePreset, saveTimePreset, subscribeTimePreset, normalizeTimePreset } from "./time-client.js";
 import { mountRecallControls } from "./recall-controls.js";
+import { BRIDGE_MANIFEST, bridgeScript } from "./calendar-bridge/script.js";
 import {addDays, assignmentPatch, calendarEventPhase, calendarEventTime, calendarEventsForDate, chooseResurface, compareCalendarEvents, createRefreshGate, currentWeekDueOptions, dayTasks, editableNoteText, editNotePatch, imageFit, isVisibleTask, mixPose, normalizeTheme, overdueTasks, posterHue, reorderedIds, RESURFACE_HOLD_MS, resurfaceCandidates, stackDragCommits, stackEase, stackPose, stepResurface, thoughtRecords, visibleWeekTasks, weekDates, weekStart} from "./panel-state.js";
 import { isOutdatedWorker, normalizeDesign } from "./capture-window.js";
 import { FOCUS_KEY, FOCUS_OVERLAY_COLOR_KEY, FOCUS_OVERLAY_KEY, NEON_COLORS, normalizeNeonColor, normalizeTimer, timerView } from "./focus-timer.js";
@@ -14,7 +15,7 @@ import { importanceScore, legacyForScore } from "./importance-score.js";
 import { bindTaskRename } from "./task-rename.js";
 import { createFireLayer, IGNITION_MS } from "./fire-layer.js";
 import { CALENDAR_CHANGED_KEY } from "./dictation.js";
-import { applyDocument, LOCALE_KEY, locale, localeChange, localeTag, saveLocale, setLocale, syncLocale, t } from "./i18n.js";
+import { applyDocument, LOCALE_KEY, locale, localeChange, localeTag, saveLocale, setLocale, syncLocale, t, translateServerMessage } from "./i18n.js";
 import { TIMER_CHIME_KEY, normalizeTimerChime, playTimerChime } from "./timer-chime.js";
 import { DEFAULT_IGNITION_SOUND, IGNITION_SOUNDS, normalizeIgnitionSound, playIgnitionSound } from "./comic-fire-sound.js";
 import { openWorkPage } from "./work-tabs.js";
@@ -78,7 +79,7 @@ let editImports = Promise.resolve();
 let editImportFailure = null;
 let editSaving = false;
 let editClosing = false;
-let calendar = {configured:false, calendar_count:0, calendars:[], events:[], last_updated:null, stale:false, error:null, write_access:{client_configured:false,authorized:false}};
+let calendar = {configured:false, calendar_count:0, calendars:[], events:[], last_updated:null, stale:false, error:null, write_access:{client_configured:false,authorized:false}, bridge:{configured:false}};
 let calendarRequest = 0;
 let rawCalendarEvents = [];
 const calendarOverlay = createCalendarOverlay();
@@ -838,6 +839,14 @@ function renderCalendarWriteStatus() {
       : t("Управление событиями не подключено.");
   $("calendar-oauth-disconnect").hidden = !access.authorized;
 }
+function renderCalendarBridgeStatus() {
+  const bridge = calendar.bridge || {};
+  $("calendar-bridge-status").textContent = !bridge.configured ? t("Мост не подключён.")
+    : bridge.last_error ? t("Мост подключён, но последнее чтение не удалось: {error}", {error: translateServerMessage(bridge.last_error)})
+    : bridge.last_success ? t("Мост подключён: события и цвета обновляются раз в минуту. Последнее чтение: {time}", {time: new Date(bridge.last_success).toLocaleString(localeTag())})
+    : t("Мост подключён.");
+  $("calendar-bridge-disconnect").hidden = !bridge.configured;
+}
 function mutateCalendarOccurrence(event, kind, newDate = null) {
   const token = kind === "move" ? calendarOverlay.beginMove(event,newDate) : calendarOverlay.beginDelete(event);
   if (!token) return;
@@ -896,6 +905,7 @@ function renderCalendarRows() {
     : t("Подключено календарей: {count}. Ещё не загружены из Google.", {count});
   renderCalendarConnections();
   renderCalendarWriteStatus();
+  renderCalendarBridgeStatus();
   if (!calendar.configured && !calendar.error) { $("calendar-section").hidden = true; return; }
   const cachedWarning = Boolean(calendar.stale && calendar.events.length);
   const warningMessage = calendar.error || t("Расписание временно показывается из сохранённой копии.");
@@ -1013,6 +1023,7 @@ async function loadCalendarWeek(force = false) {
       calendar_count:Number.isInteger(config.calendar_count) ? config.calendar_count : (Array.isArray(config.calendars) ? config.calendars.length : 0),
       calendars:Array.isArray(config.calendars) ? config.calendars : [],
       write_access:config.write_access || {client_configured:false,authorized:false},
+      bridge:config.bridge || {configured:false},
       events:calendarOverlay.project(rawCalendarEvents),
       last_updated:config.last_updated || response.last_updated || null,
       stale:Boolean(response.stale),
@@ -1645,7 +1656,7 @@ async function refreshOnce() {
     $("library-breadcrumb").hidden = true;
     $("completed-list").replaceChildren();
     $("completed-section").hidden = true;
-    calendar = {configured:false, calendar_count:0, calendars:[], events:[], last_updated:null, stale:false, error:null, write_access:{client_configured:false,authorized:false}}; renderCalendar();
+    calendar = {configured:false, calendar_count:0, calendars:[], events:[], last_updated:null, stale:false, error:null, write_access:{client_configured:false,authorized:false}, bridge:{configured:false}}; renderCalendar();
     for (const id of ["unscheduled-count","backlog-week-count","backlog-month-count","thought-count","inbox-count","library-count"]) $(id).textContent = "—";
     notice(error.message || t("Не удалось обновить панель"),true,"connection");
   }
@@ -2134,6 +2145,48 @@ $("calendar-oauth-connect").addEventListener("click", async () => {
     await send("calendar-oauth-start");
     notice(t("В новой вкладке подтвердите доступ Google. Панель подключится автоматически."));
     renderCalendarWriteStatus();
+  } catch (error) { notice(error.message, true); }
+  finally { button.disabled = false; }
+});
+for (const [id, kind] of [["calendar-bridge-copy-script", "script"], ["calendar-bridge-copy-manifest", "manifest"]]) {
+  $(id).addEventListener("click", async () => {
+    const button = $(id);
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      // The script carries the local key; the service creates it on first setup.
+      const text = kind === "script" ? bridgeScript((await send("calendar-bridge-prepare")).key) : BRIDGE_MANIFEST;
+      await navigator.clipboard.writeText(text);
+      notice(kind === "script" ? t("Скрипт моста скопирован. Вставьте его вместо всего текста в Code.gs.")
+        : t("Манифест скопирован. Вставьте его вместо всего текста в appsscript.json."));
+    } catch (error) { notice(error.message || t("Не удалось скопировать текст."), true); }
+    finally { button.disabled = false; }
+  });
+}
+$("calendar-bridge-connect").addEventListener("click", async () => {
+  const button = $("calendar-bridge-connect"), input = $("calendar-bridge-url");
+  const url = input.value.trim();
+  if (button.disabled) return;
+  if (!url) { notice(t("Вставьте URL веб-приложения из Apps Script."), true); return; }
+  button.disabled = true;
+  try {
+    calendar.bridge = await send("calendar-bridge-connect", {url});
+    input.value = "";
+    renderCalendarBridgeStatus();
+    notice(t("Мост подключён. Цвета появятся в Work после следующего обновления календаря."));
+    await loadCalendarWeek(true);
+  } catch (error) { notice(error.message, true); }
+  finally { button.disabled = false; }
+});
+$("calendar-bridge-disconnect").addEventListener("click", async () => {
+  const button = $("calendar-bridge-disconnect");
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    calendar.bridge = await send("calendar-bridge-disconnect");
+    renderCalendarBridgeStatus();
+    notice(t("Мост отключён. Календарь снова читается через iCal."));
+    await loadCalendarWeek(true);
   } catch (error) { notice(error.message, true); }
   finally { button.disabled = false; }
 });

@@ -224,6 +224,64 @@ def test_calendar_refresh_is_read_only_and_preserves_category(tmp_path, monkeypa
     assert refreshed_prep == original_prep
 
 
+def test_calendar_sync_adds_new_google_events_and_writes_only_on_change(tmp_path, monkeypatch):
+    from megamozg.calendar import CalendarFeed
+    from megamozg.google_calendar_api import GoogleCalendarApi
+
+    work = seed(tmp_path)
+    op(work, "import", "import", {"planning": planning()})
+    feed = [{"id": "lesson", "title": "Lesson", "start": "2027-01-04T11:00:00+03:00",
+             "end": "2027-01-04T13:00:00+03:00"},
+            {"id": "homework", "title": "Homework", "start": "2027-01-05", "end": "2027-01-06", "all_day": True}]
+    calls = []
+    def read_events(_self, first, last, *, force=False, google_calendar=None):
+        calls.append(force)
+        return {"configured": True, "calendar_count": 1, "stale": False, "error": None, "events": deepcopy(feed)}
+    monkeypatch.setattr(CalendarFeed, "events", read_events)
+    monkeypatch.setattr(GoogleCalendarApi, "status", lambda _self: {"authorized": False})
+    work.sync_calendar()
+    revision = work.read()["revision"]
+    assert work.sync_calendar() is None and work.read()["revision"] == revision, "unchanged feed writes nothing"
+    # An event added in Google after the plan was built reaches Day and Week
+    # without an agent running the CLI recalculation.
+    feed.append({"id": "webinar", "title": "Webinar 2", "start": "2027-01-09T12:00:00+03:00",
+                 "end": "2027-01-09T13:00:00+03:00"})
+    synced = work.sync_calendar()
+    assert synced["revision"] == revision + 1
+    events = synced["state"]["planning"]["calendar"]["events"]
+    assert [event["id"] for event in events if event["title"] == "Webinar 2"] == ["webinar"]
+    assert next(event for event in events if event["id"] == "lesson")["category"] == "lesson"
+    assert synced["state"]["planning"]["last_update"]["reason"] == "calendar-sync"
+    assert work.sync_calendar() is None and work.read()["revision"] == revision + 1
+    assert calls[0] is False and True in calls, "comparison reads the cache; the write refreshes the feed"
+    feed.append({"id": "late", "title": "Late", "start": "2027-01-10T12:00:00+03:00",
+                 "end": "2027-01-10T13:00:00+03:00"})
+    monkeypatch.setattr(CalendarFeed, "events", lambda *_args, **_kwargs: {
+        "configured": True, "calendar_count": 1, "stale": True, "error": "offline", "events": []})
+    assert work.sync_calendar() is None and work.read()["revision"] == revision + 1, "a stale feed never shrinks the plan"
+
+
+def test_week_done_and_reopen_use_native_day_outcome_through_the_day_coordinator(tmp_path):
+    from megamozg.work_period import PeriodPlanner
+
+    work = seed(tmp_path)
+    # An active library task once made the very first plan import fail (KeyError 'planning').
+    Store(tmp_path).capture("Library task", kind="task", title="Library task")
+    period = PeriodPlanner(work)
+    def planning_command(request_id, action, data):
+        return period.day_command({"request_id": request_id, "expected_revision": work.read()["revision"],
+                                   "action": action, "data": data})
+    planning_command("import", "import", {"planning": planning()})
+    task = next(row for row in period.model()["tasks"] if row["id"] == "a")
+    assert task["status"] != "completed" and task["completed_on"] is None
+    planning_command("done", "day_outcome", {"task_id": "a", "date": "2027-01-05", "done": True})
+    task = next(row for row in period.model()["tasks"] if row["id"] == "a")
+    assert (task["status"], task["completed_on"], task["effective_remaining_minutes"]) == ("completed", "2027-01-05", 0)
+    planning_command("reopen", "day_outcome", {"task_id": "a", "date": task["completed_on"], "done": False})
+    task = next(row for row in period.model()["tasks"] if row["id"] == "a")
+    assert task["status"] != "completed" and task["completed_on"] is None and task["effective_remaining_minutes"] > 0
+
+
 def test_live_override_is_three_hours_without_calendar_double_count(tmp_path):
     work = seed(tmp_path)
     document = planning()

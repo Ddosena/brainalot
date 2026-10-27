@@ -63,6 +63,8 @@
 
 .cc-completion-transform{position:fixed;z-index:5300;pointer-events:none;isolation:isolate;transform-origin:center}.cc-material-before,.cc-material-after{position:absolute;inset:0;display:block}.cc-material-before>.cc-flat-cube-art,.cc-material-after>.cc-flat-cube-art{display:block;width:100%;height:100%}.cc-material-after{opacity:0}.cc-completion-spark{position:absolute;left:50%;top:50%;width:5px;height:5px;background:#f3d995;clip-path:polygon(50% 0,68% 32%,100% 50%,68% 68%,50% 100%,32% 68%,0 50%,32% 32%);transform-origin:center;opacity:0}.cc-completion-spark:nth-of-type(2n){background:#b6e9d9;width:4px;height:4px}
 @media(prefers-reduced-motion:reduce){.cc-completion-transform,.cc-completion-spark{display:none}}
+.work-constructor .cc-week-task{width:100%;min-width:0;height:auto;white-space:normal}
+.work-constructor .cc-week-task>strong,.work-constructor .cc-week-task>span,.work-constructor .cc-week-task>small{min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere}
 
 /* Compact date navigation keeps the timeline as the main control surface. */
 .work-constructor .cc-timeline-panel .cc-date{display:flex;align-items:center;align-self:center;justify-content:flex-start;flex-wrap:nowrap;gap:3px;width:max-content;min-width:0;flex:0 0 auto;margin:0;white-space:nowrap}

@@ -5,6 +5,8 @@ const ROUTES = Object.freeze({
   '/api/context': '/api/work/period/context',
   '/api/command': '/api/work/period/command',
   '/api/snapshot': '/api/work/period/snapshot',
+  // Native plan facts (a task's completion) use the same CAS through the Day coordinator.
+  '/api/planning': '/api/work/planning',
 });
 
 export function createPeriodTransport(connection) {

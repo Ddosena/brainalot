@@ -21,6 +21,7 @@ from filelock import FileLock
 from icalendar import Calendar
 import recurring_ical_events
 
+from .calendar_palette import event_color
 from .core import ValidationError
 
 # iCal feeds are a compatibility fallback. Google can rate-limit frequent
@@ -31,6 +32,14 @@ ICAL_FAILURE_BACKOFF_MAX = timedelta(hours=2)
 # deliberately separate from the iCal cadence and its quota backoff.
 API_REFRESH_INTERVAL = timedelta(seconds=10)
 API_FAILURE_BACKOFF = timedelta(minutes=2)
+# The Apps Script bridge answers in about a second, so it is read once a
+# minute. One wide window serves the panel's week and Work's horizon alike;
+# per-range caches would overwrite each other and call the script every poll.
+BRIDGE_REFRESH_INTERVAL = timedelta(minutes=1)
+BRIDGE_FAILURE_BACKOFF_MAX = timedelta(minutes=30)
+BRIDGE_WINDOW_PAST = timedelta(days=35)
+BRIDGE_WINDOW_FUTURE = timedelta(days=150)
+BRIDGE_WINDOW_MAX_DAYS = 400
 MAX_FEED_BYTES = 5 * 1024 * 1024
 
 
@@ -115,6 +124,18 @@ class CalendarFeed:
     def _api_meta_path(self, calendar_id: str) -> Path:
         return self.state / f"calendar-api-meta-{calendar_id}.json"
 
+    def _bridge_cache_path(self, calendar_id: str) -> Path:
+        return self.state / f"calendar-bridge-cache-{calendar_id}.json"
+
+    def _bridge_meta_path(self, calendar_id: str) -> Path:
+        return self.state / f"calendar-bridge-meta-{calendar_id}.json"
+
+    def _unlink_caches(self, calendar_id: str) -> None:
+        for path in (self._cache_path(calendar_id), self._meta_path(calendar_id),
+                     self._api_cache_path(calendar_id), self._api_meta_path(calendar_id),
+                     self._bridge_cache_path(calendar_id), self._bridge_meta_path(calendar_id)):
+            path.unlink(missing_ok=True)
+
     def _read_config(self) -> dict:
         if not self.config_path.exists():
             return {"calendars": []}
@@ -166,7 +187,8 @@ class CalendarFeed:
 
     def _last_updated(self, calendar_id: str) -> str | None:
         values = (self._meta(calendar_id).get("last_updated"),
-                  self._read_json(self._api_meta_path(calendar_id)).get("last_updated"))
+                  self._read_json(self._api_meta_path(calendar_id)).get("last_updated"),
+                  self._read_json(self._bridge_meta_path(calendar_id)).get("last_updated"))
         return max((value for value in values if isinstance(value, str)), default=None)
 
     def _public_status(self, config: dict) -> dict:
@@ -194,10 +216,7 @@ class CalendarFeed:
                 # intact and the operation can be retried safely.
                 self.config_path.unlink(missing_ok=True)
                 for item in config["calendars"]:
-                    self._cache_path(item["id"]).unlink(missing_ok=True)
-                    self._meta_path(item["id"]).unlink(missing_ok=True)
-                    self._api_cache_path(item["id"]).unlink(missing_ok=True)
-                    self._api_meta_path(item["id"]).unlink(missing_ok=True)
+                    self._unlink_caches(item["id"])
                 return self._public_status({"calendars": []})
             existing = next((item for item in config["calendars"] if item["ical_url"] == url), None)
             if existing:
@@ -221,10 +240,7 @@ class CalendarFeed:
                 _atomic_write(self.config_path, json.dumps(config, ensure_ascii=False).encode("utf-8"))
             else:
                 self.config_path.unlink(missing_ok=True)
-            self._cache_path(calendar_id).unlink(missing_ok=True)
-            self._meta_path(calendar_id).unlink(missing_ok=True)
-            self._api_cache_path(calendar_id).unlink(missing_ok=True)
-            self._api_meta_path(calendar_id).unlink(missing_ok=True)
+            self._unlink_caches(calendar_id)
             return self._public_status(config)
 
     def _download(self, url: str) -> bytes:
@@ -323,10 +339,15 @@ class CalendarFeed:
                 continue
             event_id = hashlib.sha256((item["id"] + "|" + uid + "|" + start.isoformat()).encode("utf-8")).hexdigest()[:24]
             occurrence_id = hashlib.sha256((item["id"] + "|" + uid + "|" + slot).encode("utf-8")).hexdigest()[:24]
-            events.append({"id": event_id, "occurrence_id": occurrence_id,
-                           "title": str(raw.get("summary", "Событие"))[:200],
-                           "start": start.isoformat(), "end": end.isoformat(), "all_day": all_day,
-                           "dates": days, "calendar_id": item["id"], "calendar_name": item["name"]})
+            event = {"id": event_id, "occurrence_id": occurrence_id,
+                     "title": str(raw.get("summary", "Событие"))[:200],
+                     "start": start.isoformat(), "end": end.isoformat(), "all_day": all_day,
+                     "dates": days, "calendar_id": item["id"], "calendar_name": item["name"]}
+            # iCal has no event colours; only API and bridge reads carry them.
+            color = event_color(raw)
+            if color:
+                event["color"], event["color_name"] = color
+            events.append(event)
             references[event_id] = {"ical_uid": uid, "start": start.isoformat(),
                                     "end": end.isoformat(), "all_day": all_day}
         return events, references
@@ -363,6 +384,52 @@ class CalendarFeed:
                             "refresh_failed": True}, True
         _atomic_write(meta_path, json.dumps(meta).encode("utf-8"))
         return matching_cache, meta, failed
+
+    def _refresh_bridge(self, item: dict, first: date, last: date, bridge,
+                        *, force: bool = False) -> tuple[list[dict] | None, dict, bool]:
+        """Raw bridge events of a window covering first..last, or None without one."""
+        calendar_id = item["id"]
+        cache_path, meta_path = self._bridge_cache_path(calendar_id), self._bridge_meta_path(calendar_id)
+        cache, meta = self._read_json(cache_path), self._read_json(meta_path)
+        def covering(value):
+            return (value.get("events") if isinstance(value.get("events"), list)
+                    and isinstance(value.get("start"), str) and isinstance(value.get("end"), str)
+                    and value["start"] <= first.isoformat() and last.isoformat() <= value["end"] else None)
+        cached = covering(cache)
+        now, last_attempt = datetime.now().astimezone(), meta.get("last_attempt")
+        if last_attempt and not force:
+            try:
+                elapsed = now - datetime.fromisoformat(last_attempt)
+                if meta.get("refresh_failed"):
+                    failures = max(int(meta.get("failure_count", 1)), 1)
+                    if elapsed < min(BRIDGE_REFRESH_INTERVAL * (2 ** (failures - 1)), BRIDGE_FAILURE_BACKOFF_MAX):
+                        return cached, meta, True
+                elif cached is not None and elapsed < BRIDGE_REFRESH_INTERVAL:
+                    return cached, meta, False
+            except (ValueError, TypeError, OverflowError):
+                pass
+        today = now.date()
+        window_first, window_last = min(first, today - BRIDGE_WINDOW_PAST), max(last, today + BRIDGE_WINDOW_FUTURE)
+        if (window_last - window_first).days > BRIDGE_WINDOW_MAX_DAYS:
+            window_first, window_last = first, last
+        local_zone = now.tzinfo
+        try:
+            source = bridge.list_events(self._google_calendar_id(item),
+                                        datetime.combine(window_first, time.min, local_zone),
+                                        datetime.combine(window_last + timedelta(days=1), time.min, local_zone))
+            cache = {"start": window_first.isoformat(), "end": window_last.isoformat(), "events": source}
+            _atomic_write(cache_path, json.dumps(cache, ensure_ascii=False).encode("utf-8"))
+            meta, failed, cached = {"last_attempt": now.isoformat(), "last_updated": now.isoformat(),
+                                    "refresh_failed": False, "failure_count": 0}, False, source
+        except Exception:
+            try:
+                failures = max(int(meta.get("failure_count", 0)), 0) + 1
+            except (ValueError, TypeError):
+                failures = 1
+            meta, failed = {"last_attempt": now.isoformat(), "last_updated": meta.get("last_updated"),
+                            "refresh_failed": True, "failure_count": failures}, True
+        _atomic_write(meta_path, json.dumps(meta).encode("utf-8"))
+        return cached, meta, failed
 
     def _parse_events(self, raw: bytes, item: dict, first: date, last: date) -> list[dict]:
         calendar, local_zone = Calendar.from_ical(raw), datetime.now().astimezone().tzinfo
@@ -481,13 +548,22 @@ class CalendarFeed:
 
     def invalidate(self, calendar_id: str) -> None:
         with self.lock:
-            self._cache_path(calendar_id).unlink(missing_ok=True)
-            self._meta_path(calendar_id).unlink(missing_ok=True)
-            self._api_cache_path(calendar_id).unlink(missing_ok=True)
-            self._api_meta_path(calendar_id).unlink(missing_ok=True)
+            self._unlink_caches(calendar_id)
+
+    def invalidate_bridge(self) -> None:
+        """Forget bridge reads after the bridge is connected again or removed."""
+        with self.lock:
+            for item in self._read_config()["calendars"]:
+                self._bridge_cache_path(item["id"]).unlink(missing_ok=True)
+                self._bridge_meta_path(item["id"]).unlink(missing_ok=True)
 
     def events(self, first: date, last: date, *, force: bool = False,
-               google_calendar=None) -> dict:
+               google_calendar=None, bridge=None) -> dict:
+        """Events of all calendars: OAuth API, else the bridge, else iCal; then caches.
+
+        ``bridge`` is used only without ``google_calendar``: OAuth stays the
+        source that edits may rely on.
+        """
         if last < first or (last - first).days > 62:
             raise ValidationError("Период календаря: от 1 до 63 дней")
         with self.lock:
@@ -497,6 +573,7 @@ class CalendarFeed:
             refreshed = []
             for item in config["calendars"]:
                 api_cache, api_meta = None, {}
+                bridge_events, bridge_meta = None, {}
                 if google_calendar is not None:
                     api_cache, api_meta, api_failed = self._refresh_api(
                         item, first, last, google_calendar, force=force)
@@ -509,6 +586,12 @@ class CalendarFeed:
                     # is unavailable, without retrying a rejected refresh token.
                     api_cache = self._matching_api_cache(item["id"], first, last)
                     api_meta = self._read_json(self._api_meta_path(item["id"]))
+                    if bridge is not None:
+                        bridge_events, bridge_meta, bridge_failed = self._refresh_bridge(
+                            item, first, last, bridge, force=force)
+                        if bridge_events is not None and not bridge_failed:
+                            refreshed.append(("bridge", item, bridge_events, False))
+                            continue
                 # A failed API read must not pin the panel to an old API week.
                 # Google may still publish the same calendar through iCal.
                 raw, ical_meta, ical_failed = self._refresh(item, first, last, force=force)
@@ -517,11 +600,15 @@ class CalendarFeed:
                         return datetime.fromisoformat(meta["last_updated"]).timestamp()
                     except (KeyError, TypeError, ValueError, OverflowError):
                         return float("-inf")
-                if raw is not None and (api_cache is None or
-                                        last_success(ical_meta) >= last_success(api_meta)):
-                    refreshed.append(("ical", item, raw, ical_failed))
-                elif api_cache is not None:
-                    refreshed.append(("api", item, api_cache, True))
+                # The freshest copy wins; on a tie iCal, which was just read.
+                candidates = [(last_success(ical_meta), 2, "ical", raw, ical_failed)] if raw is not None else []
+                if api_cache is not None:
+                    candidates.append((last_success(api_meta), 0, "api", api_cache, True))
+                if bridge_events is not None:
+                    candidates.append((last_success(bridge_meta), 1, "bridge", bridge_events, True))
+                if candidates:
+                    _, _, source, payload, failed = max(candidates, key=lambda row: row[:2])
+                    refreshed.append((source, item, payload, failed))
                 else:
                     refreshed.append(("ical", item, raw, ical_failed))
             status = self._public_status(config)
@@ -533,6 +620,8 @@ class CalendarFeed:
             try:
                 if source == "api":
                     events.extend(payload["events"])
+                elif source == "bridge":
+                    events.extend(self._parse_api_events(payload, item, first, last)[0])
                 else:
                     events.extend(self._parse_events_cached(payload, item, first, last))
             except Exception:

@@ -54,13 +54,18 @@ export function createDayBridge(root, ctx, {createConstructor, api, loadingText 
   }
   root.textContent = loadingText;
   void schedule('render');
-  const poll=ctx.liveRefresh?setPoll(()=>{void schedule('remoteChanged');},750):null;
+  // Hidden pages (the desktop hides its full window without Page Visibility) do not poll.
+  let visible=true;
+  const doc=globalThis.document;
+  const visibility=event=>{visible=event.detail?.visible!==false;if(visible&&!disposed)void schedule('remoteChanged');};
+  doc?.addEventListener?.('brainalot:visibility',visibility);
+  const poll=ctx.liveRefresh?setPoll(()=>{if(visible&&!doc?.hidden)void schedule('remoteChanged');},750):null;
   poll?.unref?.();
   return {
     render() {return schedule('render');},
     remoteChanged() {return schedule('remoteChanged');},
     async ready() {await pending;if(!delegate)throw initialError||new Error(loadingText);},
     async prepareLeave() {await pending;return delegate?.prepareLeave?.();},
-    destroy() {disposed = true;if(poll!==null)clearPoll(poll);delegate?.destroy();},
+    destroy() {disposed = true;if(poll!==null)clearPoll(poll);doc?.removeEventListener?.('brainalot:visibility',visibility);delegate?.destroy();},
   };
 }

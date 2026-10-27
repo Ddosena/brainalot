@@ -237,6 +237,29 @@ def test_window_modes_are_visible_topmost_and_native_close_exits(tmp_path, monke
     host.destroy()
 
 
+def test_pin_lets_the_full_window_go_behind_others_and_is_remembered(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path, 8780, "test-token", lambda: None)
+    monkeypatch.setattr(host, "_areas", lambda: [desktop.WorkArea(0, 0, 1920, 1040)])
+    placed = []
+    monkeypatch.setattr(desktop, "set_native_rect",
+                        lambda window, rect, minimum=None, *, on_top=True: placed.append((window, on_top)))
+    host.create_windows(Webview())
+    assert host.full.on_top is True and host.full_on_top is True
+    assert host.window_action("pin", None)["pinned"] is False
+    assert placed[-1] == (host.full, False)
+    assert desktop.DesktopBridge(host).bootstrap()["full_on_top"] is False
+    placed.clear()
+    host.window_action("card")
+    assert all(on_top for window, on_top in placed if window is host.widget), "compact views stay above"
+    with pytest.raises(ValueError):
+        host.window_action("pin", "yes")
+    again = desktop.DesktopHost(tmp_path, 8780, "test-token", lambda: None)
+    assert again.full_on_top is False
+    again.create_windows(Webview())
+    assert again.full.on_top is False and again.widget.on_top is True
+    assert again.window_action("pin", True)["pinned"] is True
+
+
 def test_work_expansion_restores_window_without_replacing_saved_size(tmp_path, monkeypatch):
     host = desktop.DesktopHost(tmp_path, 8780, "test-token", lambda: None)
     area = desktop.WorkArea(-1920, 0, 1920, 1040)

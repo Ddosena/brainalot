@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import hmac
 import hashlib
+import logging
 import os
 import math
 import re
+import threading
 from datetime import date, datetime, timedelta
 import time as _time
 from contextlib import asynccontextmanager
@@ -20,6 +22,7 @@ from . import API_VERSION, __version__
 from .core import ConflictError, NotFoundError, Store, ValidationError
 from .work_delete import DeleteStateError
 from .calendar import CalendarFeed
+from .calendar_bridge import CalendarBridge
 from .dictation_service import DictationService
 from .google_calendar_api import GoogleCalendarApi
 from .voice import VoiceService, VoiceUnavailableError
@@ -40,6 +43,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     store = Store(root)
     calendar = CalendarFeed(root)
     google_calendar = GoogleCalendarApi(root, port=port)
+    bridge = CalendarBridge(root)
     dictation = DictationService(store, calendar, google_calendar)
     voice = VoiceService(store)
     chats = ChatStore(root) if features.WORK_ENABLED else None
@@ -52,12 +56,32 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     spotify = spotify_controller if spotify_controller is not None else SpotifyController(
         platform="disabled" if os.environ.get("BRAINALOT_DISABLE_MEDIA") == "1" else None)
 
+    stop_calendar_sync = threading.Event()
+
+    def sync_work_calendar():
+        # Day and Week plan against a stored Calendar snapshot. Keep it current
+        # by content; a concurrent user edit simply wins and is retried later.
+        delay, warned = 5, -3600.0
+        while not stop_calendar_sync.wait(delay):
+            delay = 60
+            try:
+                work.sync_calendar()
+            except (ConflictError, DeleteStateError):
+                pass
+            except Exception:
+                if _time.monotonic()-warned >= 3600:
+                    warned = _time.monotonic()
+                    logging.getLogger("brainalot.work").warning("Work calendar sync failed", exc_info=True)
+
     @asynccontextmanager
     async def lifespan(app):
         await run_in_threadpool(timer.start_service)
+        if work is not None:
+            threading.Thread(target=sync_work_calendar, name="brainalot-work-calendar", daemon=True).start()
         try:
             yield
         finally:
+            stop_calendar_sync.set()
             try:
                 await run_in_threadpool(timer.stop_service)
             finally:
@@ -342,13 +366,15 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     def work_state(request: Request):
         return conditional_json(request, work.read())
 
+    # Day and Week poll these 0.5-1 MB projections every 750 ms while visible:
+    # an unchanged plan answers 304 instead of resending and reparsing it.
     @app.get("/api/work/period/model")
-    def work_period_model():
-        return period.model()
+    def work_period_model(request: Request):
+        return conditional_json(request, period.model())
 
     @app.get("/api/work/period/day")
-    def work_period_day():
-        return period.day_model()
+    def work_period_day(request: Request):
+        return conditional_json(request, period.day_model())
 
     @app.get("/api/work/period/snapshot")
     def work_period_snapshot():
@@ -479,7 +505,27 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.get("/api/calendar/config")
     def calendar_config():
-        return {**calendar.status(), "write_access": google_calendar.status()}
+        return {**calendar.status(), "write_access": google_calendar.status(), "bridge": bridge.status()}
+
+    @app.post("/api/calendar/bridge/prepare")
+    def calendar_bridge_prepare():
+        # The key goes into the script text the owner pastes into Apps Script.
+        return bridge.prepare()
+
+    @app.post("/api/calendar/bridge")
+    async def calendar_bridge_connect(request: Request):
+        data = await payload(request, {"url"})
+        def connect():
+            result = bridge.connect(data.get("url"))
+            calendar.invalidate_bridge()
+            return result
+        return await run_in_threadpool(connect)
+
+    @app.delete("/api/calendar/bridge")
+    def calendar_bridge_disconnect():
+        result = bridge.disconnect()
+        calendar.invalidate_bridge()
+        return result
 
     @app.post("/api/calendar/oauth/client")
     async def calendar_oauth_client(request: Request):
@@ -528,7 +574,8 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
         except ValueError as exc:
             raise ValidationError("Даты календаря должны быть YYYY-MM-DD") from exc
         direct_api = google_calendar if google_calendar.status()["authorized"] else None
-        result = calendar.events(first, last, force=force, google_calendar=direct_api)
+        result = calendar.events(first, last, force=force, google_calendar=direct_api,
+                                 bridge=bridge if bridge.configured() else None)
         # Keep the activity prompt consistent with "did not happen" in the time
         # summary. Enrich the response, never the calendar's cached source data.
         skipped = set(timer.calendar_skips())

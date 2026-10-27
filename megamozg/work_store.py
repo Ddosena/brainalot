@@ -208,6 +208,71 @@ class WorkStore(SharedState):
                        command["state_blob"], encoded(descriptors)))
             return self.remember(db, "work", command, self._read(db))
 
+    def _calendar_response(self, planning, *, force):
+        """Read the whole planning horizon from Brainalot Calendar as one response."""
+        from datetime import date, timedelta
+        from .calendar import CalendarFeed
+        from .calendar_bridge import CalendarBridge
+        from .google_calendar_api import GoogleCalendarApi
+        first = date.fromisoformat(planning["settings"]["start"])
+        last = date.fromisoformat(planning["settings"]["end"])
+        feed = CalendarFeed(self.root)
+        google = GoogleCalendarApi(self.root)
+        api = google if google.status().get("authorized") else None
+        bridge = CalendarBridge(self.root)
+        readers = {"google_calendar": api, **({"bridge": bridge} if bridge.configured() else {})}
+        responses = []
+        cursor = first
+        while cursor <= last:
+            chunk_end = min(last, cursor + timedelta(days=62))
+            responses.append(feed.events(cursor, chunk_end, force=force, **readers))
+            cursor = chunk_end + timedelta(days=1)
+        identities = set()
+        events = []
+        for part in responses:
+            for event in part["events"]:
+                identity = (event.get("calendar_id"), event.get("occurrence_id") or event.get("id"))
+                if identity not in identities:
+                    identities.add(identity)
+                    events.append(event)
+        counts = {part.get("calendar_count") for part in responses}
+        return {
+            "events": events,
+            "configured": all(part.get("configured") for part in responses),
+            "calendar_count": responses[0].get("calendar_count", 0) if responses else 0,
+            "stale": any(part.get("stale") or part.get("error") for part in responses) or len(counts) > 1,
+            "error": "Неполный плановый снимок календаря" if
+                     any(part.get("error") for part in responses) or len(counts) > 1 else None,
+        }
+
+    def sync_calendar(self):
+        """Bring the plan's Calendar snapshot up to date without an agent.
+
+        The snapshot used to change only through an explicit CLI recalculation,
+        so events added in Google never reached Day or Week. Compare the local
+        feed cache by content and recalculate only when an event really changed.
+        """
+        current = self.read()
+        planning = (current.get("state") or {}).get("planning")
+        if not planning or not planning.get("settings") or "deletion_state" in current:
+            return None
+        response = self._calendar_response(planning, force=False)
+        if response["stale"] or response["error"] or not response["configured"]:
+            return None
+        def content(events):
+            # A recoloured event moves between project rulers, so colour counts too.
+            return sorted(json.dumps([event.get("calendar_id"), event.get("occurrence_id") or event.get("id"),
+                                      event.get("start"), event.get("end"), event.get("title"),
+                                      bool(event.get("all_day")), event.get("color"), event.get("color_name")],
+                                     ensure_ascii=False) for event in events)
+        incoming = content(response["events"])
+        if incoming == content(planning.get("calendar", {}).get("events", [])):
+            return None
+        digest = hashlib.sha256("\n".join(incoming).encode("utf-8")).hexdigest()[:24]
+        return self.planning_operation({"request_id": f"calendar-sync-{current['revision']}-{digest}",
+                                        "expected_revision": current["revision"], "action": "recalculate",
+                                        "data": {"refresh_calendar": True, "reason": "calendar-sync"}})
+
     def planning_operation(self, command):
         """Apply a typed planning edit under the existing Work CAS and receipt.
 
@@ -354,37 +419,7 @@ class WorkStore(SharedState):
                 if type(refresh) is not bool:
                     raise ValidationError("refresh_calendar: требуется bool")
                 if refresh:
-                    from .calendar import CalendarFeed
-                    from .google_calendar_api import GoogleCalendarApi
-                    first = date.fromisoformat(planning["settings"]["start"])
-                    last = date.fromisoformat(planning["settings"]["end"])
-                    feed = CalendarFeed(self.root)
-                    google = GoogleCalendarApi(self.root)
-                    api = google if google.status().get("authorized") else None
-                    responses = []
-                    cursor = first
-                    while cursor <= last:
-                        chunk_end = min(last, cursor + timedelta(days=62))
-                        responses.append(feed.events(cursor, chunk_end, force=True, google_calendar=api))
-                        cursor = chunk_end + timedelta(days=1)
-                    identities = set()
-                    events = []
-                    for part in responses:
-                        for event in part["events"]:
-                            identity = (event.get("calendar_id"), event.get("occurrence_id") or event.get("id"))
-                            if identity not in identities:
-                                identities.add(identity)
-                                events.append(event)
-                    counts = {part.get("calendar_count") for part in responses}
-                    response = {
-                        "events": events,
-                        "configured": all(part.get("configured") for part in responses),
-                        "calendar_count": responses[0].get("calendar_count", 0),
-                        "stale": any(part.get("stale") or part.get("error") for part in responses) or len(counts) > 1,
-                        "error": "Неполный плановый снимок календаря" if
-                                 any(part.get("error") for part in responses) or len(counts) > 1 else None,
-                    }
-                    planning = merge_calendar_refresh(planning, response)
+                    planning = merge_calendar_refresh(planning, self._calendar_response(planning, force=True))
                 reason = data.get("reason", "recalculate")
                 if not isinstance(reason, str) or len(reason) > 300:
                     raise ValidationError("reason: текст до 300 символов")

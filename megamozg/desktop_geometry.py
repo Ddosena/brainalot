@@ -273,7 +273,7 @@ def native_rect(window):
     return {"x": int(window.x), "y": int(window.y), "width": int(window.width), "height": int(window.height)}
 
 
-def set_native_rect(window, rect, minimum=None):
+def set_native_rect(window, rect, minimum=None, *, on_top=True):
     native = getattr(window, "native", None)
     if native is not None and hasattr(native, "Invoke"):
         from System import Action
@@ -284,9 +284,14 @@ def set_native_rect(window, rect, minimum=None):
         def update():
             if minimum:
                 native.MinimumSize = Size(*minimum)
-            # HWND_TOPMOST + NOACTIVATE. Updating geometry never steals focus.
-            user.SetWindowPos(int(native.Handle.ToInt64()), -1, rect["x"], rect["y"],
-                              rect["width"], rect["height"], 0x0010)
+            # On the UI thread WinForms moves the window between the topmost and
+            # normal bands itself; pywebview's setter would write it off-thread.
+            if bool(native.TopMost) != on_top:
+                native.TopMost = on_top
+            # NOACTIVATE: geometry never steals focus. An unpinned window keeps
+            # its z-order (NOZORDER) so it stays behind the app the person uses.
+            user.SetWindowPos(int(native.Handle.ToInt64()), -1 if on_top else 0, rect["x"], rect["y"],
+                              rect["width"], rect["height"], 0x0010 if on_top else 0x0014)
         native.Invoke(Action(update))
     else:
         window.resize(rect["width"], rect["height"])
