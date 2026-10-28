@@ -13,7 +13,7 @@ from . import library_rules
 
 NAMESPACE = "period_planner"
 DELETE_REASON = "Удалено пользователем"
-DETAIL_FIELDS = frozenset({"output", "steps", "comment", "links", "groups", "resource_drafts", "planned_date"})
+DETAIL_FIELDS = frozenset({"output", "steps", "comment", "links", "groups", "resource_drafts", "planned_date", "sources"})
 
 
 def validate_details(row, patch, planning):
@@ -29,6 +29,24 @@ def validate_details(row, patch, planning):
         steps = patch["steps"]
         if not isinstance(steps, list) or len(steps) > 20 or any(not isinstance(step, str) or not step.strip() or len(step) > 500 for step in steps):
             raise ValidationError("constructor steps: до20 шагов")
+    if "sources" in patch:
+        from urllib.parse import urlparse
+        sources = patch["sources"]
+        if not isinstance(sources, list) or len(sources) > 100:
+            raise ValidationError("Источники: нужен список до 100 записей")
+        seen = set()
+        for source in sources:
+            if (not isinstance(source, dict) or set(source) != {"id", "url", "text"}
+                    or not isinstance(source["id"], str) or not source["id"] or len(source["id"]) > 100
+                    or source["id"] in seen or not isinstance(source["text"], str)
+                    or len(source["text"]) > 1000 or not isinstance(source["url"], str)
+                    or len(source["url"]) > 2048 or not (source["text"].strip() or source["url"])):
+                raise ValidationError("Неверный источник кубика")
+            if source["url"]:
+                parsed = urlparse(source["url"])
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValidationError("Ссылка источника должна быть http(s)")
+            seen.add(source["id"])
     wp._constructor_resources({**row, **patch})
     if "resource_drafts" in patch:
         wp._constructor_resources(patch["resource_drafts"], drafts=True)
@@ -43,7 +61,7 @@ def validate_details(row, patch, planning):
 def enrich_details(state, cubes):
     overrides = state.get(NAMESPACE, {}).get("cube_details", {})
     return [{**deepcopy(row), **{key: deepcopy(value) for key, value in overrides.get(row["id"], {}).items()
-        if key in DETAIL_FIELDS}} for row in cubes]
+        if key in DETAIL_FIELDS and not (row.get("standalone") and key == "sources")}} for row in cubes]
 
 
 def _fields(data, fields):
@@ -57,20 +75,56 @@ def _title(value):
     return value.strip()
 
 
-def _unstarted(row, *, inactive_cleanup=False):
+def _unstarted(row, *, inactive_cleanup=False, stale_cleanup=False):
     if row.get("status") == "cancelled":
         raise ValidationError("Кубик уже удалён или отменён; его история сохранена")
     if (row.get("progress_percent") or row.get("actual_minutes")
             or row.get("historical_facts") or row.get("factual") or row.get("started")
             or row.get("status") in {"started", "completed"}):
         raise ValidationError("У кубика уже есть факты выполнения: удаление и объединение запрещены")
-    if not row.get("available") and not (inactive_cleanup and library_rules.can_cleanup(row)):
+    if not row.get("available") and not stale_cleanup and not (inactive_cleanup and library_rules.can_cleanup(row)):
         raise ValidationError("Кубик недоступен: проверьте остаток и границы ответственности")
 
 
 def _placement(row):
     return {"date": row.get("selected_date"), "start": row.get("start")}
 
+
+
+def stale_cleanup_allowed(state, row):
+    """Only hide an unavailable composition when every retained source is unstarted."""
+    ext = state.get(NAMESPACE, {})
+    cube_id = row.get("id")
+    if not row.get("allocation_stale") or cube_id not in ext.get("merged_cubes", {}):
+        return False
+    if row.get("status") in {"started", "completed", "cancelled"} or any(row.get(field) for field in
+            ("progress_percent", "actual_minutes", "historical_facts", "factual", "started")):
+        return False
+    aliases = set(row.get("source_ids") or [])
+    aliases.update(cid[len("planned-"):] for cid in list(aliases) if cid.startswith("planned-"))
+    reports = state["planning"].get("completed_cubes", {})
+    native = state["planning"].get("constructor", {}).get("cubes", {})
+    if any(cid in reports for cid in aliases):
+        return False
+    if any(cube.get("blueprint_ref") in aliases and cid in reports for cid, cube in native.items()):
+        return False
+    pending, visited = [cube_id], set()
+    merges = ext.get("merges", {})
+    while pending:
+        key = pending.pop()
+        if key in visited:
+            continue
+        visited.add(key)
+        record = merges.get(key)
+        if not isinstance(record, dict) or not isinstance(record.get("sources"), list) or not record["sources"]:
+            return False
+        for source in record["sources"]:
+            if not isinstance(source, dict) or any(source.get(field) for field in
+                    ("progress_percent", "actual_minutes", "historical_facts", "factual", "started")):
+                return False
+            if source.get("id") in merges:
+                pending.append(source["id"])
+    return True
 
 def delete(state, data, model):
     """Cancel exactly one unstarted cube, including a cube selected on a day."""
@@ -86,9 +140,10 @@ def delete(state, data, model):
         if any(event["id"] == cube_id for event in model["events"]):
             raise ValidationError("Календарное событие нельзя удалить действием для кубика")
         raise ValidationError("Кубик не найден или уже объединён; обновите экран")
-    if row.get("kind") not in {"task", "prep", "weekly_review", "calendar_optional", "brainalot"}:
+    if row.get("kind") not in {"task", "prep", "weekly_review", "calendar_optional", "brainalot", "repeatable"}:
         raise ValidationError("Этот источник нельзя удалить действием для кубика")
-    _unstarted(row, inactive_cleanup=True)
+    stale_cleanup = stale_cleanup_allowed(state, row)
+    _unstarted(row, inactive_cleanup=True, stale_cleanup=stale_cleanup)
     result = deepcopy(state)
     ext = result.setdefault(NAMESPACE, {})
     ext.setdefault("cancellations", {})[cube_id] = {
@@ -98,7 +153,9 @@ def delete(state, data, model):
         "prior_placement_override": deepcopy(ext.get("placements", {}).get(cube_id)),
     }
     if row.get("source_task_allocations"):
-        ext["cancellations"][cube_id]["source_task_allocations"] = deepcopy(_row_allocations(row))
+        # A display-duration override does not change native source allocations.
+        original_minutes = sum(part["minutes"] for part in row["source_task_allocations"])
+        ext["cancellations"][cube_id]["source_task_allocations"] = deepcopy(_row_allocations({**row, "minutes": original_minutes}))
     # A null override also masks a preserved native lock/source selection.
     ext.setdefault("placements", {})[cube_id] = {"date": None, "start": None}
     if ext.get("context", {}).get("cube_id") == cube_id:

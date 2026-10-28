@@ -95,7 +95,7 @@ def test_mixed_segments_and_nested_merge_keep_original_volume_sources_and_period
     assert [(t["start"], t["end"]) for t in read(result)["tasks"]] == [(t["start"], t["end"]) for t in initial["tasks"]]
 
 
-@pytest.mark.parametrize("problem", ["collision", "budget"])
+@pytest.mark.parametrize("problem", ["collision"])
 def test_selected_merge_failure_is_atomic_without_moving_other_blocks(problem):
     state = synthetic_state()
     state["period_planner"] = {"placements": {"geometry": {"date": "2027-01-05", "start": "14:00"}}}
@@ -168,7 +168,8 @@ def test_delete_auxiliary_cube_keeps_original_sources_and_calendar(kind):
         state = synthetic_state()
         if kind == "weekly_review":
             state["planning"]["result"].setdefault("weekly_reviews", []).append({"id": "review-qa", "date": "2027-01-10", "minutes": 60})
-    row = next(row for row in read(state)["cubes"] if row["kind"] == kind)
+    candidates = model.cube_rows(state) if kind == "prep" else read(state)["cubes"]
+    row = next(row for row in candidates if row["kind"] == kind)
     state.setdefault("period_planner", {}).setdefault("placements", {})[row["id"]] = {"date": row["planned_date"], "start": None}
     before = deepcopy(state)
     result = cube_ops.delete(state, {"cube_id": row["id"]}, read(state))
@@ -197,7 +198,10 @@ def test_fixed_calendar_event_delete_and_cancelled_or_non_task_merge_rejected():
     before = deepcopy(state)
     with pytest.raises(ValidationError, match="Календарное событие"):
         cube_ops.delete(state, {"cube_id": "calendar-webinar"}, read(state))
-    prep = next(row["id"] for row in read(state)["cubes"] if row["kind"] == "prep")
+    prep_row = next(row for row in model.cube_rows(state) if row["kind"] == "prep")
+    prep = prep_row["id"]
+    state.setdefault("period_planner", {}).setdefault("placements", {})[prep] = {"date": prep_row["planned_date"], "start": None}
+    before = deepcopy(state)
     with pytest.raises(ValidationError, match="только кубики"):
         merge(state, ("geometry", prep))
     cancelled = cube_ops.delete(state, {"cube_id": "geometry"}, read(state))

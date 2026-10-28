@@ -15,7 +15,7 @@ import secrets
 import sqlite3
 import tempfile
 import time
-from contextlib import contextmanager, closing
+from contextlib import contextmanager, closing, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 import zipfile
@@ -52,7 +52,7 @@ IMPORTANCE_WEIGHTS = {"low": 1, "normal": 2, "high": 3, "critical": 4}
 PROJECT_IDEA_RECALL_INTERVAL = 20
 IMPORTANCE_LABELS = {"low": "низкая", "normal": "обычная", "high": "высокая", "critical": "очень высокая"}
 STATUSES = {"inbox", "active", "done", "cancelled", "archived"}
-FIELDS = {"title", "body", "kind", "due", "media_type", "status", "tags", "url", "context_id", "topic", "importance", "importance_score", "show_in_carousel", "show_in_unscheduled", "planning_horizon", "attachments"}
+FIELDS = {"title", "body", "kind", "due", "media_type", "status", "tags", "url", "context_id", "topic", "importance", "importance_score", "show_in_carousel", "show_in_unscheduled", "planning_horizon", "attachments", "activity_kind", "work_cube"}
 FOLDERS = {
     "inbox": "1 Входящие", "task": "2 Дела/Задачи", "purchase": "2 Дела/Покупки",
     "media": "3 Библиотека", "idea": "4 Идеи и мысли/Идеи",
@@ -91,6 +91,8 @@ def legacy_importance(score, kind):
 
 
 def validate(meta: dict) -> None:
+    from .work_activity import validate_note_activity
+    validate_note_activity(meta, ValidationError)
     attached = meta.get("attachments", [])
     if (not isinstance(attached, list) or len(attached) > attachment_tools.MAX_COUNT
             or any(not isinstance(item, dict) or set(item) != {"id", "name", "mime", "size", "path"}
@@ -244,6 +246,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS captures (
                     external_id TEXT PRIMARY KEY, payload TEXT NOT NULL,
                     note_id TEXT NOT NULL, created TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS work_note_requests (
+                    request_id TEXT PRIMARY KEY, command TEXT NOT NULL,
+                    operation_id TEXT NOT NULL, note_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS operations (
                     id TEXT PRIMARY KEY, note_id TEXT NOT NULL, kind TEXT NOT NULL,
                     changes TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL,
@@ -483,11 +488,8 @@ class Store:
     @staticmethod
     def _clone(note: dict) -> dict:
         # Callers change the notes they get; the cached copy must stay as it was read from disk.
-        copy = dict(note)
-        for key, value in copy.items():
-            if isinstance(value, list):
-                copy[key] = [dict(item) if isinstance(item, dict) else item for item in value]
-        return copy
+        from copy import deepcopy
+        return deepcopy(note)
 
     def _read_note(self, relative: str, *, cached_note: dict | None = None) -> tuple[dict | None, str | None]:
         try:
@@ -578,7 +580,8 @@ class Store:
     def capture(self, text, *, kind="inbox", title=None, due=None, media_type=None,
                 url=None, tags=None, source="manual", external_id=None, source_capture_id=None,
                 context_id=None, topic=None, importance="normal", show_in_unscheduled=False,
-                planning_horizon=None, attachments=None, importance_score=None):
+                planning_horizon=None, attachments=None, importance_score=None,
+                activity_kind=None, work_cube=None, _work_command=None):
         if importance_score is not None:
             importance = legacy_importance(importance_score, kind)
         elif isinstance(importance, str) and importance in LEGACY_IMPORTANCE_SCORES:
@@ -607,6 +610,11 @@ class Store:
                     importance_score=importance_score, show_in_carousel=True,
                     show_in_unscheduled=show_in_unscheduled, planning_horizon=planning_horizon,
                     manual_order=None, attachments=attachments)
+        for key, value in (("activity_kind", activity_kind), ("work_cube", work_cube)):
+            if value is not None:
+                from copy import deepcopy
+                payload[key] = deepcopy(value)
+                meta[key] = deepcopy(value)
         validate(meta)
         external_id = external_id or uuid4().hex
         with self.lock, self._db() as db:
@@ -644,10 +652,16 @@ class Store:
             changes = [dict(path=original_path, before=None, after=original),
                        dict(path=relative, before=None, after=encode_note(meta, body))]
             db.execute("INSERT INTO captures VALUES (?,?,?,?)", (external_id, json_text(payload), meta["id"], meta["created"]))
-            self._operation(db, meta["id"], "capture", changes)
+            operation_id = None
+            if _work_command is not None:
+                from .shared_state import encoded
+                operation_id = uuid4().hex
+                db.execute("INSERT INTO work_note_requests VALUES(?,?,?,?)",
+                           (_work_command["request_id"], encoded(_work_command), operation_id, meta["id"]))
+            self._operation(db, meta["id"], "capture", changes, operation_id=operation_id)
             return self._find(meta["id"])
 
-    def _update(self, db, note, patch, expected_version, *, reverses=None, operation_kind="update"):
+    def _update(self, db, note, patch, expected_version, *, reverses=None, operation_kind="update", operation_id=None):
         if not isinstance(patch, dict) or not patch or set(patch) - FIELDS:
             raise ValidationError("Пустое изменение или неподдерживаемое поле")
         if not expected_version or note["version"] != expected_version:
@@ -667,6 +681,18 @@ class Store:
             body = body.replace("\r\n", "\n").replace("\r", "\n")
         old_title = meta["title"]
         meta.update(patch)
+        if meta.get("work_cube") is not None:
+            meta["work_cube"] = dict(meta["work_cube"]) if isinstance(meta["work_cube"], dict) else meta["work_cube"]
+            if isinstance(meta["work_cube"], dict):
+                if not meta.get("due"):
+                    meta["work_cube"]["start"] = None
+                if "status" in patch and "work_cube" not in patch:
+                    if patch["status"] == "done":
+                        meta["work_cube"]["progress_percent"] = 100
+                    elif patch["status"] == "active" and note["status"] == "done":
+                        meta["work_cube"]["progress_percent"] = 0
+            if meta.get("kind") != "task":
+                meta.pop("work_cube", None)
         if "importance_score" in patch:
             meta["importance"] = legacy_importance(patch["importance_score"], meta["kind"])
         elif "importance" in patch:
@@ -708,11 +734,58 @@ class Store:
             # Create target first; durable journal can finish removal after restart.
             changes = [dict(path=relative, before=None, after=after),
                        dict(path=note["path"], before=before, after=None)]
-        self._operation(db, note["id"], "undo" if reverses else operation_kind, changes, reverses)
+        self._operation(db, note["id"], "undo" if reverses else operation_kind, changes, reverses, operation_id=operation_id)
         return self._find(note["id"])
 
+    @staticmethod
+    def _work_source_eligible(meta):
+        return meta.get("kind") == "task" and meta.get("status") in ("active", "done")
+
+    def _source_removal_reservation(self, note_id, patch, expected_version):
+        """Preflight, release Note lock, then reserve time before a source disappears.
+
+        The later write still checks the exact preflight hash. No Note lock is
+        held while waiting for time, matching TimeStore's time→notes order.
+        """
+        if not isinstance(patch, dict) or not {"kind", "status"}.intersection(patch):
+            return nullcontext()
+        for field, allowed, message in (("kind", KINDS, "Неизвестный тип записи"),
+                                        ("status", STATUSES, "Неизвестный статус")):
+            if field in patch and (not isinstance(patch[field], str) or patch[field] not in allowed):
+                raise ValidationError(message)
+        with self.lock:
+            note = self._find(note_id)
+            if note["version"] != expected_version:
+                raise ConflictError("Заметка уже изменена. Обновите список и повторите решение")
+            removing = self._work_source_eligible(note) and not self._work_source_eligible({**note, **patch})
+        if not removing:
+            return nullcontext()
+        from .work_delete import timer_reservation_many
+        return timer_reservation_many(self.root, ["brainalot-"+note_id])
+
+    def _undo_source_removal_id(self, operation_id):
+        """Read immutable journal images before acquiring a timer reservation."""
+        with self._db() as db:
+            operation = db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+        if operation is None:
+            return None
+        for change in json.loads(operation["changes"]):
+            try:
+                after = decode_note(change["after"])[0] if change["after"] else {}
+            except (ValueError, TypeError, yaml.YAMLError):
+                continue  # Original capture prose is not a Note frontmatter record.
+            try:
+                before = decode_note(change["before"])[0] if change["before"] else {}
+            except (ValueError, TypeError, yaml.YAMLError):
+                before = {}
+            proposed = {**after, "status": "archived"} if operation["kind"] == "capture" else before
+            if self._work_source_eligible(after) and not self._work_source_eligible(proposed):
+                return operation["note_id"]
+        return None
+
     def update(self, note_id, patch, expected_version):
-        with self.lock, self._db() as db:
+        reservation = self._source_removal_reservation(note_id, patch, expected_version)
+        with reservation, self.lock, self._db() as db:
             self._recover(db)
             return self._update(db, self._find(note_id), patch, expected_version)
 
@@ -782,9 +855,13 @@ class Store:
             changes.append(dict(path=original_path, before=original_before, after=None))
         return changes
 
-    def delete(self, note_id, expected_version, *, operation_id=None, _coordinated=False):
+    def delete(self, note_id, expected_version, *, operation_id=None, _coordinated=False, _work_command=None):
         """Remove a note and its source copy through one reversible operation."""
         if not _coordinated and operation_id is None:
+            from .work_library_link import delete_canonical_note
+            canonical = delete_canonical_note(self.root, note_id, expected_version)
+            if canonical is not None:
+                return canonical
             from .work_delete import delete_linked_note
             linked = delete_linked_note(self.root, note_id, expected_version)
             if linked is not None:
@@ -813,6 +890,11 @@ class Store:
                 from .work_delete import guard_library_delete
                 guard_library_delete(self.root, note_id)
             changes = self._delete_changes(note_id, expected_version)
+            if _work_command is not None:
+                from .shared_state import encoded
+                operation_id = operation_id or uuid4().hex
+                db.execute("INSERT INTO work_note_requests VALUES(?,?,?,?)",
+                           (_work_command["request_id"], encoded(_work_command), operation_id, note_id))
             operation_id = self._operation(db, note_id, "delete", changes, operation_id=operation_id)
             return {"id": note_id, "deleted": True, "operation_id": operation_id}
 
@@ -964,13 +1046,13 @@ class Store:
         return result
 
     def feedback(self, note_id, action, expected_version):
+        if action == "archive":
+            return self.update(note_id, {"status": "archived"}, expected_version)
         with self.lock, self._db() as db:
             self._recover(db)
             note = self._find(note_id)
             if note["version"] != expected_version:
                 raise ConflictError("Заметка уже изменена. Обновите список")
-            if action == "archive":
-                return self._update(db, note, {"status": "archived"}, expected_version)
             if action not in {"soon", "later"}:
                 raise ValidationError("Неизвестная команда карточки")
             row = db.execute("SELECT * FROM schedule WHERE note_id=?", (note_id,)).fetchone()
@@ -985,8 +1067,13 @@ class Store:
             self._recover(db)
             return [dict(row) for row in db.execute("SELECT id,note_id,kind,status,created,error,reverses FROM operations ORDER BY rowid DESC LIMIT 200")]
 
-    def undo(self, operation_id):
-        with self.lock, self._db() as db:
+    def undo(self, operation_id, *, _work_command=None, _lifetime_reserved=False):
+        removed_note_id = None if _lifetime_reserved else self._undo_source_removal_id(operation_id)
+        reservation = nullcontext()
+        if removed_note_id is not None:
+            from .work_delete import timer_reservation_many
+            reservation = timer_reservation_many(self.root, ["brainalot-"+removed_note_id])
+        with reservation, self.lock, self._db() as db:
             self._recover(db)
             op = db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
             if not op:
@@ -1002,12 +1089,18 @@ class Store:
             for c in changes:
                 if self._content(c["path"]) != c["after"]:
                     raise ConflictError("После операции заметка менялась. Автоматическая отмена остановлена")
+            undo_id = None
+            if _work_command is not None:
+                from .shared_state import encoded
+                undo_id = uuid4().hex
+                db.execute("INSERT INTO work_note_requests VALUES(?,?,?,?)",
+                           (_work_command["request_id"], encoded(_work_command), undo_id, op["note_id"]))
             if op["kind"] == "capture":
                 note = self._find(op["note_id"])
                 # Original captures are retained, even when the user undoes capture.
-                return self._update(db, note, {"status": "archived"}, note["version"], reverses=operation_id)
+                return self._update(db, note, {"status": "archived"}, note["version"], reverses=operation_id, operation_id=undo_id)
             inverse = [dict(path=c["path"], before=c["after"], after=c["before"]) for c in reversed(changes)]
-            self._operation(db, op["note_id"], "undo", inverse, reverses=operation_id)
+            self._operation(db, op["note_id"], "undo", inverse, reverses=operation_id, operation_id=undo_id)
             return self._find(op["note_id"])
 
     def backup(self, destination):

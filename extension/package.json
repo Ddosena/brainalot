@@ -1,7 +1,7 @@
 {
   "name": "brainalot-chrome",
   "private": true,
-  "version": "0.2.25",
+  "version": "0.2.28",
   "type": "module",
   "scripts": { "test": "node --test tests/*.test.mjs" }
 }

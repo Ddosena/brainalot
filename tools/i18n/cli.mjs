@@ -24,7 +24,7 @@ const EXTENSION = join(ROOT, "extension");
 const CATALOG = join(EXTENSION, "locales", "en.js");
 const RUNTIME_FILES = new Set(["i18n.js"]);
 const SERVER_FILES = ["api.py", "core.py", "calendar.py", "calendar_bridge.py", "google_calendar_api.py", "attachments.py",
-  "focus_overlay.py", "dictation.py", "dictation_service.py", "voice.py", "chats.py", "work_inbox.py", "telegram_chats.py", "work_delete.py"];
+  "focus_overlay.py", "dictation.py", "dictation_service.py", "voice.py", "chats.py", "work_inbox.py", "telegram_chats.py", "work_delete.py", "work_manual.py", "work_activity.py", "work_library_link.py", "time_tracking.py"];
 export const MANIFEST_MESSAGES = {
   extName: { field: ["name"], en: "Brainalot" },
   extDescription: { field: ["description"], en: "Local manager for thoughts, tasks and schedule in the Chrome side panel." },
@@ -37,7 +37,8 @@ const listed = (directory, extension) => (existsSync(directory) ? readdirSync(di
 
 export function scriptFiles(root = ROOT) {
   return listed(join(root, "extension"), ".js").filter(name => !RUNTIME_FILES.has(name))
-    .map(name => join(root, "extension", name));
+    .map(name => join(root, "extension", name))
+    .concat(listed(join(root, "extension", "work-ui"), ".js").map(name => join(root, "extension", "work-ui", name)));
 }
 
 export function pageFiles(root = ROOT) {

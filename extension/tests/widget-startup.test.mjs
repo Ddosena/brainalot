@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import * as model from '../widget-model.js';
 import {FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor} from '../focus-timer.js';
-import {normalizeTimePreset,timerFields} from '../time-client.js';
+import {normalizeTimePreset,timerFields,classifiedTimeTask,stopMatchingTimeTask} from '../time-client.js';
 
 async function start({saved={},state={status:'idle',mode:'pomodoro',elapsed_ms:0,duration_ms:1500000},pending=null,catalog=Promise.resolve({notes:[]}),apiOverride=null}={}) {
   const source=(await readFile(new URL('../widget.js',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
@@ -16,13 +16,14 @@ async function start({saved={},state={status:'idle',mode:'pomodoro',elapsed_ms:0
   const chrome={storage:{local:{async get(keys){return typeof keys==='string'?{[keys]:saved[keys]}:Object.fromEntries((keys||Object.keys(saved)).map(key=>[key,saved[key]]));},
     async set(items){writes.push(items);Object.assign(saved,items);}},onChanged:{addListener(){}}}};
   let listener,failRefresh=false,gesture;
-  const timeClient={state,pending,async refresh(){if(failRefresh){failRefresh=false;throw new Error('Actual network failure');}listener?.();return this.state;},subscribe(fn){listener=fn;fn();}};
+  const timeClient={state,pending,async refresh(){if(failRefresh){failRefresh=false;throw new Error('Actual network failure');}listener?.();return this.state;},subscribe(fn){listener=fn;fn();},async commandWithReceipt(receipt){if(receipt.expected_revision!==this.state.revision)throw Object.assign(new Error('conflict'),{status:409});await this.command(receipt.action);return this.refresh();}};
   const native={async bootstrap(){return{widget_mode:'bar'};},async window_action(action,args){actions.push([action,args]);return{ok:true};}};
   const env={native,timeClient,sharedApi:async(route,...args)=>apiOverride?apiOverride(route,...args):route==='/api/notes'?catalog:route==='/api/time/tasks'?{tasks:(await catalog).notes.map(note=>({source:'library',id:note.id,title:note.title}))}:route==='/api/time/totals'?{rows:[]}:{events:[]},
-    elapsedAt:()=>2000,formatTime:()=> '00:02',formatTotal:()=> '0 мин',getTimePreset:async()=>normalizeTimePreset(null),saveTimePreset:async value=>value,normalizeTimePreset,timerFields,
+    elapsedAt:()=>2000,formatTime:()=> '00:02',formatTotal:()=> '0 мин',getTimePreset:async()=>normalizeTimePreset(null),saveTimePreset:async value=>value,normalizeTimePreset,timerFields,classifiedTimeTask,stopMatchingTimeTask,
     applyDocument(){},async syncLocale(){},localeChange:()=>false,t:(text,args)=>text.replace(/\{(\w+)\}/g,(_,key)=>args?.[key]??''),calendarImportanceLevel:()=>null,
     ...model,installWindowGestures:(_native,options)=>{gesture=options;},document,chrome,
-    FOCUS_OVERLAY_COLOR_KEY,NEON_COLORS,normalizeNeonColor,mountSpotifyPlayer:()=>({visible:false,setVisible(){}}),
+    FOCUS_OVERLAY_COLOR_KEY,NEON_COLORS,normalizeNeonColor,mountSpotifyPlayer:()=>({visible:false,setVisible(){}}),locale:()=>'ru',
+    attachDictation:()=>({cancel(){},report(){}}), mountTheme:()=>({}), applyTheme:()=>{},
     window:{addEventListener(name,fn){events[name]=fn;}},Option:function(text,value){return{text,value};},setInterval:fn=>intervals.push(fn)};
   const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;
   await new AsyncFunction(...Object.keys(env),source)(...Object.values(env));
@@ -110,18 +111,18 @@ test('peer paused task supersedes stale persisted choice; intentional paused cho
       ...(action==='switch_task'?{task:fields.task}:{}),...(action==='resume'?{status:'running'}:{})};return app.timeClient.state;
   };
   await app.nodes.get('widget-run').onclick();
-  assert.deepEqual(commands,[{action:'resume'}],'Play must not switch B back to stale saved A');
+  assert.deepEqual(commands,[{action:'switch_task',task:classifiedTimeTask(b)},{action:'resume'}],'Play may classify future time on B but must not switch it back to stale saved A');assert.equal(b.activity_kind,undefined,'legacy task reference is not mutated');
   app.timeClient.state={...app.timeClient.state,status:'paused',revision:7};await app.intervals[0]();
   app.events['brainalot-widget-mode']({detail:'card'});await app.nodes.get('widget-task').onclick();await new Promise(setImmediate);
   const rowA=app.nodes.get('widget-task-list').children.find(row=>row.dataset.task==='library:a');await rowA.onclick();await new Promise(setImmediate);
   assert.equal(app.nodes.get('widget-burning').textContent,'A');assert.equal(app.saved['desktop:selected-task-revision'],7);
-  assert.equal(commands.length,1,'intentional selection while paused sends no command');
+  assert.equal(commands.length,2,'intentional selection while paused sends no command');
   const reloaded=await start({saved:app.saved,state:app.timeClient.state,catalog});
   assert.equal(reloaded.nodes.get('widget-burning').textContent,'A','same paused revision preserves explicit selection after reload');
   reloaded.timeClient.state={...reloaded.timeClient.state,revision:8};await reloaded.intervals[0]();
   assert.equal(reloaded.nodes.get('widget-burning').textContent,'B','next shared revision invalidates the local selection');
   await app.nodes.get('widget-run').onclick();
-  assert.deepEqual(commands.slice(1),[{action:'switch_task',task:a},{action:'resume'}],'explicit paused selection takes effect only on Play');
+  assert.deepEqual(commands.slice(2),[{action:'switch_task',task:classifiedTimeTask(a)},{action:'resume'}],'explicit paused selection takes effect only on Play');
 });
 
 for (const resumed of ['a','b']) test(`completion patch-stage recovery stops matching task only (peer resumed ${resumed})`,async()=>{
@@ -152,9 +153,10 @@ test('Add gates duplicate submits before awaiting serverToday and captures the f
     return{values:{},rows:[],events:[]};
   };
   const app=await start({state:{status:'idle',mode:'stopwatch',task:null,revision:1,elapsed_ms:0,duration_ms:0},apiOverride});
-  date='2026-10-21';blocked=true;app.getNode('widget-new-title').value='One durable task';
-  const first=app.nodes.get('widget-new-form').onsubmit({preventDefault(){}});
-  const second=app.nodes.get('widget-new-form').onsubmit({preventDefault(){}});
+  date='2026-10-21';blocked=true;app.nodes.get('widget-new').onclick();app.getNode('widget-search').value='One durable task';
+  assert.equal(app.nodes.get('widget-find').dataset.adding,'true','the pencil turns the search field into a new task field');
+  const first=app.nodes.get('widget-find').onsubmit({preventDefault(){}});
+  const second=app.nodes.get('widget-find').onsubmit({preventDefault(){}});
   assert.equal(captures.length,0);release();await Promise.all([first,second]);
   assert.equal(captures.length,1);assert.equal(captures[0].due,'2026-10-21');assert.ok(captures[0].external_id.startsWith('widget:'));
 });
@@ -163,7 +165,7 @@ test('idle break Play starts the visible break with its shared five-minute prese
   const task={source:'library',id:'a',title:'A'},commands=[];
   const app=await start({saved:{'desktop:selected-task':task,'desktop:selected-task-revision':1},state:{revision:1,status:'idle',mode:'break',task,elapsed_ms:0,duration_ms:300000},catalog:Promise.resolve({notes:[{...task,kind:'task',status:'active'}]})});
   app.timeClient.command=async(action,fields)=>{commands.push({action,...fields});return app.timeClient.state={...app.timeClient.state,...fields,status:'running',revision:2};};
-  await app.nodes.get('widget-run').onclick();assert.deepEqual(commands,[{action:'start',mode:'break',duration_ms:300000,task}]);
+  await app.nodes.get('widget-run').onclick();assert.deepEqual(commands,[{action:'start',mode:'break',duration_ms:300000,task:classifiedTimeTask(task)}]);
 });
 
 for(const hasReceipt of[true,false])test(`activity activation recovery after peer stop ${hasReceipt?'resolves exact receipt':'retains missing-receipt legacy error'}`,async()=>{
@@ -197,6 +199,53 @@ for(const rejected of[false,true])test(`overtaken activity ${rejected?'rejection
     app.timeClient.commandWithReceipt=async()=>{if(rejected)throw Object.assign(new Error('CAS rejected'),{status:409});return app.timeClient.state;};
     const commands=[];app.timeClient.command=async(action,fields={})=>{commands.push({action,...fields});app.timeClient.state={...app.timeClient.state,...(action==='switch_task'?{task:fields.task}:{}),status:action==='resume'?'running':app.timeClient.state.status,revision:app.timeClient.state.revision+1};return app.timeClient.state;};
     await app.nodes.get('widget-retry').onclick();assert.equal(app.nodes.get('widget-burning').textContent,expected.title);assert.deepEqual(app.saved['desktop:selected-task'],local||undefined);assert.equal(app.timeClient.state.revision,7);
-    await app.nodes.get('widget-run').onclick();assert.deepEqual(commands,local?[{action:'switch_task',task:c},{action:'resume'}]:[{action:'resume'}]);
+    await app.nodes.get('widget-run').onclick();assert.deepEqual(commands,[{action:'switch_task',task:classifiedTimeTask(local||b)},{action:'resume'}]);
   }
+});
+
+test('Play without a task opens the picker and starts the timer once a task is chosen',async()=>{
+  const task={source:'library',id:'a',title:'A'},commands=[];
+  const app=await start({state:{revision:1,status:'idle',mode:'pomodoro',task:null,elapsed_ms:0,duration_ms:1500000},catalog:Promise.resolve({notes:[{...task,kind:'task',status:'active'}]})});
+  app.timeClient.command=async(action,fields)=>{commands.push({action,...fields});return app.timeClient.state={...app.timeClient.state,...fields,status:'running',revision:2};};
+  app.events['brainalot-widget-mode']({detail:'card'});
+  await app.nodes.get('widget-run').onclick();await new Promise(setImmediate);
+  assert.equal(app.nodes.get('widget-picker').hidden,false);
+  assert.equal(app.nodes.get('widget-picker-title').textContent,'Выберите задачу, чтобы начать');
+  assert.deepEqual(commands,[]);
+  const row=app.nodes.get('widget-task-list').children.find(item=>item.dataset.task==='library:a');
+  await row.onclick();await new Promise(setImmediate);
+  assert.deepEqual(commands,[{action:'start',mode:'pomodoro',duration_ms:1500000,task:classifiedTimeTask(task)}]);
+  assert.equal(app.nodes.get('widget-popup').hidden,true);
+});
+
+test('choosing from the picker without Play only selects; Enter in search takes the first match',async()=>{
+  const a={source:'library',id:'a',title:'Alpha'},b={source:'library',id:'b',title:'Beta'},commands=[];
+  const app=await start({state:{revision:1,status:'idle',mode:'pomodoro',task:null,elapsed_ms:0,duration_ms:1500000},catalog:Promise.resolve({notes:[a,b].map(task=>({...task,kind:'task',status:'active'}))})});
+  app.timeClient.command=async(action,fields)=>{commands.push({action,...fields});return app.timeClient.state;};
+  app.events['brainalot-widget-mode']({detail:'card'});
+  await app.nodes.get('widget-task').onclick();await new Promise(setImmediate);
+  assert.equal(app.nodes.get('widget-picker-title').textContent,'Перейти к задаче');
+  app.getNode('widget-search').value='bet';app.nodes.get('widget-search').oninput();
+  await app.nodes.get('widget-find').onsubmit({preventDefault(){}});await new Promise(setImmediate);
+  assert.equal(app.nodes.get('widget-burning').textContent,'Beta');
+  assert.deepEqual(commands,[]);
+});
+
+test('a task added after Play without a task starts the timer for it exactly once',async()=>{
+  const captures=[],notes=[],commands=[];
+  const apiOverride=async(route,method,body)=>{
+    if(route==='/api/notes')return{notes};
+    if(route==='/api/time/tasks')return{today:'2026-10-27',tasks:[]};
+    if(route==='/api/captures'){captures.push(body);const note={id:'new',title:body.title,due:body.due,kind:'task',status:'active',version:1};notes.push(note);return note;}
+    return{values:{},rows:[],events:[]};
+  };
+  const app=await start({state:{status:'idle',mode:'stopwatch',task:null,revision:1,elapsed_ms:0,duration_ms:0},apiOverride});
+  app.timeClient.command=async(action,fields)=>{commands.push({action,...fields});return app.timeClient.state={...app.timeClient.state,...fields,status:'running',revision:2};};
+  app.events['brainalot-widget-mode']({detail:'card'});
+  await app.nodes.get('widget-run').onclick();await new Promise(setImmediate);
+  app.nodes.get('widget-new').onclick();app.getNode('widget-search').value='Fresh task';
+  await app.nodes.get('widget-new').onclick();await new Promise(setImmediate);
+  assert.equal(captures.length,1);
+  assert.deepEqual(commands,[{action:'start',mode:'stopwatch',task:{source:'library',id:'new',title:'Fresh task',activity_kind:'personal'}}]);
+  assert.equal(app.saved['desktop:widget-operation'],null);
 });

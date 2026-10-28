@@ -148,15 +148,15 @@ def test_unknown_sage_drop_defaults_local_30_at_exact_pointer_and_is_resizable(c
     sage = next(row for row in planner.model()['cubes'] if row.get('calendar_role') == 'evergreen')
     before = planner.snapshot()
     payload = {'request_id': 'sage-drop-once', 'expected_revision': before['revision'], 'action': 'cube_drop',
-        'data': {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '14:03'}}
+        'data': {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '14:03'}}
     result = planner.command(payload)
     row = next(row for row in result['cubes'] if row['id'] == sage['id'])
-    assert row['minutes'] == 30 and row['selected_date'] == '2027-01-06' and row['start'] == '14:03'
+    assert row['minutes'] == 30 and row['selected_date'] == sage['source_date'] and row['start'] == '14:03'
     assert row['duration_provisional'] and row['can_resize'] and not row['duration_unknown'] and not row['requires_estimate']
     assert row['source_duration_minutes'] is None
     assert planner.snapshot()['state']['planning'] == before['state']['planning']
     assert planner.command(payload) == result and planner.snapshot()['revision'] == result['revision']
-    command(planner, 'cube_resize', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '14:03', 'minutes': 45})
+    command(planner, 'cube_resize', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '14:03', 'minutes': 45})
     assert next(row for row in planner.model()['cubes'] if row['id'] == sage['id'])['minutes'] == 45
 
 
@@ -165,8 +165,8 @@ def test_unknown_sage_drop_shrinks_only_at_same_start_and_failure_is_atomic(colo
     command(planner, 'calendar_source_import', {'source': source})
     sage = next(row for row in planner.model()['cubes'] if row.get('calendar_role') == 'evergreen')
     # A chosen ordinary task at14:20 bounds the gap; no modal or relocation.
-    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-06', 'start': '14:20'})
-    result = command(planner, 'cube_drop', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '14:03'})
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': sage['source_date'], 'start': '14:20'})
+    result = command(planner, 'cube_drop', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '14:03'})
     row = next(row for row in result['cubes'] if row['id'] == sage['id'])
     assert row['minutes'] == 15 and row['start'] == '14:03'
     command(planner, 'cube_return', {'cube_id': sage['id']})
@@ -177,7 +177,7 @@ def test_unknown_sage_drop_shrinks_only_at_same_start_and_failure_is_atomic(colo
     other = model.PeriodPlanner(synthetic_store(planner.store.root/'other', state))
     before = other.snapshot()
     with pytest.raises(ValidationError):
-        command(other, 'cube_drop', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '14:18'})
+        command(other, 'cube_drop', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '14:18'})
     assert other.snapshot() == before
     with pytest.raises(ConflictError):
         command(planner, 'cube_drop', {'cube_id': sage['id'], 'date': '2027-01-07', 'start': '14:00'}, revision=1)
@@ -212,9 +212,9 @@ def test_floating_drop_and_duration_edit_preserve_null_time(library_planner):
     optional = model.PeriodPlanner(synthetic_store(planner.store.root/'calendar', state))
     command(optional, 'calendar_source_import', {'source': source})
     sage = next(row for row in optional.model()['cubes'] if row.get('calendar_role') == 'evergreen')
-    result = command(optional, 'cube_drop', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': None})
+    result = command(optional, 'cube_drop', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': None})
     row = next(row for row in result['cubes'] if row['id'] == sage['id'])
-    assert row['minutes'] == 30 and row['start'] is None and row['selected_date'] == '2027-01-06'
+    assert row['minutes'] == 30 and row['start'] is None and row['selected_date'] == sage['source_date']
 
 
 def test_ambiguous_library_note_ids_never_offer_two_executable_sources(library_planner):
@@ -235,12 +235,12 @@ def test_accepted_day_constructor_drop_uses_same_atomic_unknown_estimate(color_p
     command(planner, 'calendar_source_import', {'source': source})
     sage = next(row for row in planner.model()['cubes'] if row.get('calendar_role') == 'evergreen')
     before = planner.snapshot()
-    saved = send(planner, 'constructor_select', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '14:03'})
+    saved = send(planner, 'constructor_select', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '14:03'})
     assert saved['revision'] == before['revision']+1 and saved['state']['planning'] == before['state']['planning']
     row = next(row for row in planner.model()['cubes'] if row['id'] == sage['id'])
-    assert row['minutes'] == 30 and row['selected_date'] == '2027-01-06' and row['start'] == '14:03'
+    assert row['minutes'] == 30 and row['selected_date'] == sage['source_date'] and row['start'] == '14:03'
     assert row['duration_provisional'] and row['can_resize']
-    moved = send(planner, 'constructor_timeline', {'cube_id': sage['id'], 'date': '2027-01-06', 'start': '15:03'})
+    moved = send(planner, 'constructor_timeline', {'cube_id': sage['id'], 'date': sage['source_date'], 'start': '15:03'})
     assert moved['revision'] == saved['revision']+1
     assert next(row for row in planner.model()['cubes'] if row['id'] == sage['id'])['start'] == '15:03'
 
@@ -381,3 +381,46 @@ def test_virtual_work_details_reject_identity_facts_and_invalid_resources_atomic
     with pytest.raises(ValidationError):
         send(planner, 'constructor_cube', {'cube_id': key, 'comment': 'Must not partially persist', **unsafe})
     assert planner.snapshot() == before
+
+
+def test_native_note_alias_timer_follows_live_source_and_blocks_deleted_note(tmp_path):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    library = Store(tmp_path)
+    note = library.capture('Timed note', kind='task')
+    state = synthetic_state()
+    state['planning'] = wp.apply_action(state['planning'], 'constructor_cube', {'cube_id': 'native-note-alias',
+        'kind': 'brainalot', 'source_ref': note['id'], 'title': 'Timed note', 'minutes': 60})
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    clock = FakeClock()
+    timer = TimeStore(tmp_path, lambda: clock.wall, lambda: clock.mono)
+    ref = {'source': 'work', 'id': 'work-cube:native-note-alias', 'title': 'Timed note', 'activity_kind': 'personal'}
+    started = cmd(timer, 'start', 0, 'linked-alias-start', task=ref)
+    stopped = cmd(timer, 'stop', started['revision'], 'linked-alias-stop')
+    library.delete(note['id'], note['version'])
+    with pytest.raises(ConflictError):
+        cmd(timer, 'start', stopped['revision'], 'linked-alias-deleted', task=ref)
+
+
+def test_timer_reservation_protects_both_native_and_canonical_note_aliases(tmp_path):
+    from megamozg.time_tracking import TimeStore
+    from megamozg.work_delete import timer_reservation_many
+    from test_time_tracking import FakeClock, cmd
+    library = Store(tmp_path)
+    note = library.capture('Alias-protected', kind='task')
+    state = synthetic_state()
+    state['planning'] = wp.apply_action(state['planning'], 'constructor_cube', {'cube_id': 'native-note-alias',
+        'kind': 'brainalot', 'source_ref': note['id'], 'title': 'Alias-protected', 'minutes': 60})
+    synthetic_store(tmp_path, state)
+    clock = FakeClock()
+    timer = TimeStore(tmp_path, lambda: clock.wall, lambda: clock.mono)
+    canonical = 'brainalot-' + note['id']
+    started = cmd(timer, 'start', 0, 'canonical-running', task={'source': 'work', 'id': 'work-cube:' + canonical, 'title': 'Note'})
+    with pytest.raises(ConflictError):
+        with timer_reservation_many(tmp_path, ['native-note-alias']):
+            pass
+    stopped = cmd(timer, 'stop', started['revision'], 'canonical-stop')
+    alias = cmd(timer, 'start', stopped['revision'], 'alias-running', task={'source': 'work', 'id': 'work-cube:native-note-alias', 'title': 'Note'})
+    with pytest.raises(ConflictError):
+        with timer_reservation_many(tmp_path, [canonical]):
+            pass

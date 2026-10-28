@@ -1,16 +1,16 @@
 import { isDesktop } from "./desktop-platform.js";
-import { capturePayload, currentWeekDueOptions, normalizeTheme, tabCapture } from "./panel-state.js";
-import { DRAFT_KEY, DRAFT_VERSION, isOutdatedWorker, normalizeDesign, normalizeDraft } from "./capture-window.js";
+import { capturePayload, currentWeekDueOptions, tabCapture } from "./panel-state.js";
+import { DRAFT_KEY, DRAFT_VERSION, isOutdatedWorker, normalizeDraft } from "./capture-window.js";
 import { checkAttachmentLimit, renderAttachmentList, storeAttachment } from "./attachments.js";
 import { applyDocument, locale, localeChange, syncLocale, t, translateServerMessage } from "./i18n.js";
 import { AUTO, describePlan, dictationOverrides, dictationPayload, scheduleOverride, usesDictation } from "./dictation.js";
 import { attachDictation } from "./voice-recorder.js";
+import {sharedApi} from "./time-client.js";
+import {applyTheme, mountTheme} from "./theme.js";
 import { validImportanceScore, scoreForLegacy } from "./importance-score.js";
 
 applyDocument();
 const $ = id => document.getElementById(id);
-const THEME_KEY = "panel:theme";
-const DESIGN_KEY = "panel:design";
 const CONFIG_KEY = "connection";
 const PREVIEW_DELAY_MS = 350;
 const AUTO_SELECTS = [["capture-kind", "kind"], ["capture-schedule", "schedule"], ["capture-context", "context"],
@@ -44,12 +44,8 @@ function moscowToday() {
     .formatToParts(new Date()).filter(part => part.type !== "literal").map(part => [part.type, part.value]));
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
-function applyAppearance(saved) {
-  const theme = normalizeTheme(saved[THEME_KEY]);
-  if (theme === "system") delete document.documentElement.dataset.theme;
-  else document.documentElement.dataset.theme = theme;
-  document.documentElement.dataset.design = normalizeDesign(saved[DESIGN_KEY]);
-}
+mountTheme({api:sharedApi}, {onChange:value => applyTheme(document.documentElement, value)});
+
 function scheduleOptions(selected = AUTO) {
   const select = $("capture-schedule");
   const today = moscowToday();
@@ -308,8 +304,7 @@ function previousContext(id) {
   $("capture-context").append(option);
 }
 async function initialize() {
-  const saved = await chrome.storage.local.get([DRAFT_KEY, THEME_KEY, DESIGN_KEY]);
-  applyAppearance(saved);
+  const saved = await chrome.storage.local.get([DRAFT_KEY]);
   // The desktop host has no browser tab to capture. Its adapter returns to the
   // day through finish-capture instead of closing the application window.
   $("save-tab").hidden = isDesktop;
@@ -502,9 +497,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   // The draft is saved on every change, so a reload in the new language keeps it.
   if (localeChange(changes)) { location.reload(); return; }
-  if (changes[THEME_KEY] || changes[DESIGN_KEY]) {
-    void chrome.storage.local.get([THEME_KEY, DESIGN_KEY]).then(applyAppearance);
-  }
 });
 void syncLocale();
 void initialize().catch(failure => error(failure.message || t("Не удалось восстановить черновик.")));

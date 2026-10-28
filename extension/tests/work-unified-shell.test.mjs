@@ -79,6 +79,12 @@ test('selecting the active route does not flush, commit, or reload the child',as
   assert.equal(h.sources.length,1);
 });
 
+test('an empty UTC placeholder does not override the child local day before planning starts',async t => {
+  const h=await started(t,{router:{api:async()=>({revision:0,planning_initialized:false,context:{date:'2026-10-27'}})}});
+  assert.equal(h.url().searchParams.has('date'),false);
+  assert.equal(h.router.state.date,null);
+});
+
 test('Day to Week waits for saved child date and a successful strict context commit',async t => {
   let releaseCommit;
   const h = await started(t,{commit:() => new Promise(resolve => { releaseCommit = resolve; })});

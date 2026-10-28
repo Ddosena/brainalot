@@ -1,4 +1,4 @@
-import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, taskKey, getTimePreset, timerFields } from "./time-client.js";
+import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, taskKey, getTimePreset, timerFields, classifiedTimeTask } from "./time-client.js";
 import { t } from "./i18n.js";
 import { WORK_ENABLED } from "./work-availability.js";
 const icon = '<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="12" cy="14" r="8"/><path d="M12 6V2m-3 0h6m-3 8v5l3 2M18 7l2-2"/></svg>';
@@ -48,6 +48,7 @@ async function refreshTotals() {
 }
 timeClient.subscribe(() => {renderRows(); currentUI?.render();});
 export function taskTimeButton(task) {
+  task=classifiedTimeTask(task);
   initRowModes();
   const root = document.createElement("span"); root.className = "task-time-controls";
   const total = document.createElement("output"); total.className = "task-time-total";
@@ -101,7 +102,7 @@ export function mountTimeUI(host) {
   let tasks = [], chosenMode = "stopwatch", pendingNotice = false, interruptionNotice = false, pollNotice = false;
   const error = err => { pollNotice = false; interruptionNotice = false; pendingNotice = !!timeClient.pending; $(".time-error").hidden = false; $(".time-error").textContent = err.message; $(".time-retry").hidden = !timeClient.pending; };
   async function act(action, fields = {}) {
-    try { await timeClient.command(action, fields); $(".time-error").hidden = true; render(); await refreshTotals(); }
+    try {if(fields.task)fields={...fields,task:classifiedTimeTask(fields.task)};if(action==='resume'&&timeClient.state?.task){const live=tasks.find(task=>taskKey(task)===taskKey(timeClient.state.task))||timeClient.state.task,next=classifiedTimeTask(live);if(next.activity_kind!==timeClient.state.task.activity_kind)await timeClient.command('switch_task',{task:next});}await timeClient.command(action, fields); $(".time-error").hidden = true; render(); await refreshTotals(); }
     catch (err) { error(err); }
   }
   function render() {
@@ -155,7 +156,7 @@ export function mountTimeUI(host) {
   }
   $(".time-search").oninput = taskOptions;
   $(".time-tasks").onchange = () => { const selected = $(".time-tasks").value === "" ? null : tasks[Number($(".time-tasks").value)]; void act("switch_task", { task: selected }); };
-  wrap.addEventListener("toggle", async () => { if (!wrap.open) return; try { tasks = (await sharedApi("/api/time/tasks")).tasks.filter(task => WORK_ENABLED || task.source !== "work"); taskOptions(); } catch (err) { error(err); } });
+  wrap.addEventListener("toggle", async () => { if (!wrap.open) return; try {const [catalog,notes]=await Promise.all([sharedApi('/api/time/tasks'),sharedApi('/api/notes')]);const kinds=new Map((notes.notes||[]).map(note=>[note.id,note.activity_kind]));tasks=catalog.tasks.filter(task=>WORK_ENABLED||task.source!=='work').map(task=>classifiedTimeTask(task,task.source==='library'?kinds.get(task.id):null));taskOptions(); } catch (err) { error(err); } });
   $(".time-retry").onclick = async () => { try { await timeClient.retry(); $(".time-error").hidden = true; $(".time-retry").hidden = true; render(); await refreshTotals(); } catch (err) { error(err); } };
   const today = new Date(); $(".time-day").value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
   $(".time-zone").value = Intl.DateTimeFormat().resolvedOptions().timeZone;

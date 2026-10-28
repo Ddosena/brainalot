@@ -1,6 +1,7 @@
 """Full Work documents and immutable chunked blobs, committed atomically with CAS."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import base64
 import binascii
 import hashlib
@@ -204,8 +205,21 @@ class WorkStore(SharedState):
                     project_task_importance(document["planning"])
             if incoming.get("planning") != previous.get("planning") and command.get("restore_import") is not True:
                 raise ValidationError("План Work меняется только через /api/work/planning")
+            digest = command["state_blob"]
+            # A legacy Work client may round-trip an older document without the
+            # server-owned completion dates. Keep those facts on ordinary commits;
+            # an explicit full restore remains an exact restore of its blob.
+            dates = previous.get("period_planner", {}).get("goal_completed_on")
+            if dates and command.get("restore_import") is not True:
+                raw_incoming = json.loads(self._blob(db, digest))
+                if raw_incoming.get("period_planner", {}).get("goal_completed_on") != dates:
+                    raw_incoming.setdefault("period_planner", {})["goal_completed_on"] = dates
+                    raw = encoded(raw_incoming).encode("utf-8")
+                    digest = hashlib.sha256(raw).hexdigest()
+                    db.execute("INSERT OR IGNORE INTO work_blobs VALUES(?,?)", (digest, raw))
+                    descriptors = self._validate(db, digest, command.get("images"))
             db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (revision + 1, int(time.time()*1000),
-                       command["state_blob"], encoded(descriptors)))
+                       digest, encoded(descriptors)))
             return self.remember(db, "work", command, self._read(db))
 
     def _calendar_response(self, planning, *, force):
@@ -273,6 +287,44 @@ class WorkStore(SharedState):
                                         "expected_revision": current["revision"], "action": "recalculate",
                                         "data": {"refresh_calendar": True, "reason": "calendar-sync"}})
 
+    def manual_start(self, command):
+        """Start an empty plan by hand: no agent import, no network.
+
+        A brand-new vault has no Work state at all; an older one may have
+        projects and boards but no plan. Both get the same empty plan.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        from .work_delete import recover, ensure_writable
+        from .work_manual import start_state
+        data = command["data"]
+        if not isinstance(data, dict) or set(data) - {"timezone"}:
+            raise ValidationError("manual_start: допускается только timezone")
+        timezone = data.get("timezone", "Europe/Moscow")
+        try:
+            today = datetime.now(ZoneInfo(timezone)).date()
+        except (ZoneInfoNotFoundError, TypeError, ValueError) as exc:
+            raise ValidationError("timezone: нужна IANA-зона") from exc
+        recover(self)
+        with self.db() as db:
+            ensure_writable(db)
+            old = self.receipt(db, "work", command)
+            if old is not None:
+                return old
+            current = self._version(db)
+            revision = current["revision"] if current else 0
+            self.check_revision(command, revision)
+            state = json.loads(self._blob(db, current["state_blob"])) if current else None
+            images = [{k: image[k] for k in ("id", "blob", "mime")} for image in json.loads(current["images"])] if current else []
+            state = start_state(state, today, timezone)
+            encoded_state = encoded(state).encode("utf-8")
+            digest = hashlib.sha256(encoded_state).hexdigest()
+            db.execute("INSERT OR IGNORE INTO work_blobs VALUES(?,?)", (digest, encoded_state))
+            descriptors = self._validate(db, digest, images)
+            db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (revision + 1, int(time.time()*1000),
+                       digest, encoded(descriptors)))
+            return self.remember(db, "work", command, self._read(db))
+
     def planning_operation(self, command):
         """Apply a typed planning edit under the existing Work CAS and receipt.
 
@@ -288,6 +340,10 @@ class WorkStore(SharedState):
             raise ValidationError("planning: нужны request_id, expected_revision, action, data")
         action, data = command["action"], command["data"]
         from .work_delete import delete_cube, recover, ensure_writable
+        from .work_manual import ACTIONS as MANUAL_ACTIONS, apply as apply_manual, preserve_manual_tasks, take_warnings
+        take_warnings()
+        if action == "manual_start":
+            return self.manual_start(command)
         if action == "cube_delete":
             return delete_cube(self, command)
         recover(self)
@@ -296,7 +352,7 @@ class WorkStore(SharedState):
                           "day_budget", "prep_set", "prep_progress", "day_cube_add", "day_cube_remove",
                           "day_cube_move", "day_cube_resize", "segment_create",
                           "segment_progress", "day_segment_add", "scope_exempt", "task_importance",
-                          "monthly_plan_approve"} | CONSTRUCTOR_ACTIONS:
+                          "monthly_plan_approve"} | CONSTRUCTOR_ACTIONS | MANUAL_ACTIONS:
             raise ValidationError("Неизвестное действие planning")
         if not isinstance(data, dict):
             raise ValidationError("planning.data: требуется объект")
@@ -312,6 +368,8 @@ class WorkStore(SharedState):
             state = json.loads(self._blob(db, row["state_blob"]))
             images = [{k: image[k] for k in ("id", "blob", "mime")} for image in json.loads(row["images"])]
         allocation_baseline = deepcopy(state.get("planning"))
+        transition_before = deepcopy(state)
+        before_state = deepcopy(state) if action in {"import", "recalculate", "scope_exempt"} else None
         if action == "import":
             if set(data) != {"planning"}:
                 raise ValidationError("import.data: требуется только planning")
@@ -340,6 +398,7 @@ class WorkStore(SharedState):
                     "planning_task_id": task["id"],
                 })
                 existing_items.add(item_id)
+            preserve_manual_tasks(planning, state.get("planning"))
             previous = state.get("planning")
             previous_deletions = (previous or {}).get("cube_deletions", {})
             previous_epochs = (previous or {}).get("remaining_epochs", {})
@@ -440,7 +499,22 @@ class WorkStore(SharedState):
                                    if note["id"] == candidate.get("source_ref")), None)
                     if source is None or source.get("kind") != "task" or source.get("status") != "active":
                         raise ValidationError("Brainalot: исходная активная задача не найдена")
-                planning = apply_action(planning, action, data)
+                if action in MANUAL_ACTIONS:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+                    today = datetime.now(ZoneInfo(planning["settings"]["timezone"])).date()
+                    planning = apply_manual(state, planning, action, data, today)
+                else:
+                    operation_data = data
+                    if (action == "day_outcome" and data.get("done") is False
+                            and isinstance(data.get("date"), str)
+                            and not planning["settings"]["start"] <= data["date"] <= planning["settings"]["end"]
+                            and data["date"] == state.get("period_planner", {}).get("goal_completed_on", {}).get(data.get("task_id"))):
+                        from .work_planning import latest_remaining_baseline
+                        baseline = latest_remaining_baseline(planning, data.get("task_id"))
+                        if baseline and baseline[2]:
+                            operation_data = {**data, "date": baseline[0]}
+                    planning = apply_action(planning, action, operation_data)
                 if action == "day_outcome" and ("done" in data or data.get("remaining_minutes") == 0):
                     task = next((item for item in planning["tasks"] if item["id"] == data.get("task_id")), None)
                     linked = next((item for item in state["items"]
@@ -451,32 +525,71 @@ class WorkStore(SharedState):
                             linked["status"] = "done"
                         elif data["done"] is False and linked.get("status") == "done":
                             linked["status"] = "todo"
-        if action not in {"cube_progress", "day_outcome", "segment_progress", "prep_progress",
+        from .work_manual import absorb_overflow
+        tombstone_only = (action == "manual_project_delete" or
+            action == "manual_task_delete" and state.get("period_planner", {}).get("deleted_tasks", {}).get(data.get("task_id")))
+        warnings = []
+        if not tombstone_only and action not in {"cube_progress", "day_outcome", "segment_progress", "prep_progress",
+                          "task_importance", "monthly_plan_approve", "import"}:
+            warnings = absorb_overflow(planning)
+        state["planning"] = planning
+        from .work_manual import sync_volume_by_cubes, filter_volume_warnings
+        if not tombstone_only:
+            sync_volume_by_cubes(state)
+        planning = state["planning"]
+        warnings = filter_volume_warnings(state, take_warnings() + warnings)
+        if not tombstone_only and action not in {"cube_progress", "day_outcome", "segment_progress", "prep_progress",
                           "task_importance", "monthly_plan_approve"}:
             _constructor_allocation(planning, allocation_baseline)
             _constructor_budget_guard(planning, allocation_baseline)
         from .work_planning import _refresh_constructor_result, update_constructor_awards
-        if action not in {"task_importance", "monthly_plan_approve"}:
+        if not tombstone_only and action not in {"task_importance", "monthly_plan_approve"}:
             update_constructor_awards(planning, allocation_baseline,
                                       backfill=action in {"constructor_day", "recalculate", "scope_exempt"},
                                       allow_new=action != "import")
             _refresh_constructor_result(planning)
         state["planning"] = planning
         self._guard_deletions(allocation_baseline, planning, allow_remaining_epoch=action in {"day_outcome", "import"})
+        from .work_period.model import record_goal_transitions
+        from .work_period.library_rules import LibraryReader
+        record_goal_transitions(transition_before, state, LibraryReader(self.root).notes(), imported=action == "import")
         encoded_state = encoded(state).encode("utf-8")
         digest = hashlib.sha256(encoded_state).hexdigest()
-        with self.db() as db:
+        if before_state is not None:
+            from .work_period.model import read_model
+            def executable_ids(document):
+                if not isinstance(document.get("planning"), dict):
+                    return set()
+                view = read_model({"state": document, "revision": 0})
+                return {cube["id"] for cube in view["cubes"]
+                    if cube.get("status") != "cancelled"
+                    and not cube.get("allocation_stale") and not cube.get("source_unavailable")
+                    and (cube.get("available") or cube.get("status") == "completed")}
+            removed_sources = executable_ids(before_state) - executable_ids(state)
+            from .work_delete import timer_source_lease
+            reservation = timer_source_lease(self.root)
+        else:
+            removed_sources = set()
+            reservation = nullcontext(None)
+        with reservation as active_task, self.db() as db:
             ensure_writable(db)
             old = self.receipt(db, "work", command)
             if old is not None:
                 return old
             current = self._version(db)
             self.check_revision(command, current["revision"])
+            if (active_task and active_task.get("source") == "work"
+                    and isinstance(active_task.get("id"), str) and active_task["id"].startswith("work-cube:")
+                    and active_task["id"][len("work-cube:"):] in removed_sources):
+                raise ConflictError("План изменит текущий кубик таймера; сначала остановите таймер и повторите")
             db.execute("INSERT OR IGNORE INTO work_blobs VALUES(?,?)", (digest, encoded_state))
             descriptors = self._validate(db, digest, images)
             db.execute("INSERT INTO work_versions VALUES(?,?,?,?)", (current["revision"] + 1, int(time.time()*1000),
                        digest, encoded(descriptors)))
-            return self.remember(db, "work", command, self._read(db))
+            result = self._read(db)
+            if warnings:
+                result["warnings"] = warnings
+            return self.remember(db, "work", command, result)
 
     def revisions(self):
         with self.db() as db:

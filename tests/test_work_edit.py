@@ -52,7 +52,13 @@ def test_text_place_return_and_goal_replay_share_native_store(tmp_path, monkeypa
 
 def test_text_duration_resizes_preparation_without_touching_original_volume(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(features, 'WORK_ENABLED', True)
-    planner = PeriodPlanner(synthetic_store(tmp_path, synthetic_state()))
+    from megamozg.work_period.model import cube_rows
+    document = synthetic_state()
+    source = next(c for c in cube_rows(document) if c['kind'] == 'prep')
+    # Generated suggestions are replaced by one repeatable card. An already
+    # selected prep remains available to the agent's duration command.
+    document['period_planner'] = {'placements': {source['id']: {'date': '2027-01-05', 'start': None}}}
+    planner = PeriodPlanner(synthetic_store(tmp_path, document))
     cube = next(c for c in planner.model()['cubes'] if c['kind'] == 'prep')
     before = deepcopy(planner.snapshot()['state']['planning'])
     status, changed = invoke(tmp_path, capsys, 'duration', '35', '--id', cube['id'], '--revision', '1', '--request-id', 'resize-prep')

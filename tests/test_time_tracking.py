@@ -42,6 +42,11 @@ def advance_active(timer, clock, milliseconds):
         timer.checkpoint()
 
 
+
+def unclassified_row(task, total):
+    return {"task": task, "total_ms": total, "work_ms": 0, "personal_ms": 0, "rest_ms": 0, "unclassified_ms": total}
+
+
 def test_stopwatch_plus_pomodoro_one_work_log(tmp_path):
     c = FakeClock()
     t = store(tmp_path, c)
@@ -52,7 +57,7 @@ def test_stopwatch_plus_pomodoro_one_work_log(tmp_path):
     assert t.state()["status"] == "finished"
     report = t.summary(day(c), "UTC")
     assert report["total_ms"] == 25 * 60_000
-    assert report["rows"] == [{"task": TASK, "total_ms": 25 * 60_000}]
+    assert report["rows"] == [unclassified_row(TASK, 25 * 60_000)]
 
 
 def test_two_clients_cas_replay_and_changed_id(tmp_path):
@@ -112,7 +117,7 @@ def test_switch_pause_break_and_snapshot_identity(tmp_path):
     assert s["status"] == "idle"
     assert s["elapsed_ms"] == 5_000
     # One identity, preserving the first title snapshot in the aggregate.
-    assert t.summary(day(c), "UTC")["rows"] == [{"task": TASK, "total_ms": 13_000}]
+    assert t.summary(day(c), "UTC")["rows"] == [unclassified_row(TASK, 13_000)]
 
 
 def test_midnight_and_dst_boundaries(tmp_path):
@@ -278,7 +283,7 @@ def test_lifetime_totals_midnight_rename_live_tail_and_break(tmp_path):
     advance_active(t, c, 20_000)
     c.advance(5_000)
     snapshot = t.totals()
-    assert snapshot["rows"] == [{"task": TASK, "total_ms": 25_000}]
+    assert snapshot["rows"] == [unclassified_row(TASK, 25_000)]
     assert t.totals() == snapshot
     assert t.summary("2026-10-18", "UTC")["total_ms"] == 10_000
     assert t.summary("2026-10-19", "UTC")["total_ms"] == 15_000
@@ -288,13 +293,13 @@ def test_lifetime_totals_midnight_rename_live_tail_and_break(tmp_path):
     s = t.state()
     s = cmd(t, "start", s["revision"], "life-break", task=renamed, mode="break", duration_ms=60_000)
     advance_active(t, c, 60_000)
-    assert t.totals()["rows"] == [{"task": renamed, "total_ms": 85_000}]
+    assert t.totals()["rows"] == [unclassified_row(renamed, 85_000)]
     s = t.state()
     c.advance(86_400_000)
     s = cmd(t, "start", s["revision"], "life-next-day", task=renamed)
     c.advance(6_000)
     stopped = cmd(t, "stop", s["revision"], "life-stop")
-    assert t.totals()["rows"] == [{"task": renamed, "total_ms": 91_000}]
+    assert t.totals()["rows"] == [unclassified_row(renamed, 91_000)]
     assert t.summary("2026-10-20", "UTC")["total_ms"] == 6_000
     assert stopped["status"] == "idle"
 
@@ -309,7 +314,7 @@ def test_totals_competing_requests_replay_and_source_identity(tmp_path):
     c.advance(7_000)
     with ThreadPoolExecutor(max_workers=2) as pool:
         snapshots = list(pool.map(lambda timer: timer.totals(), [a, b]))
-    assert snapshots[0]["rows"] == snapshots[1]["rows"] == [{"task": TASK, "total_ms": 7_000}]
+    assert snapshots[0]["rows"] == snapshots[1]["rows"] == [unclassified_row(TASK, 7_000)]
     other = {**TASK, "source": "calendar"}
     s = cmd(a, "start", answers[0]["revision"], "life-other", task=other)
     c.advance(3_000)
@@ -331,7 +336,7 @@ def test_time_save_failure_rolls_back_interval_and_receipt(tmp_path, monkeypatch
     monkeypatch.setattr(t, "_save", save)
     result = cmd(t, "stop", s["revision"], "life-rollback-stop")
     assert result["status"] == "idle"
-    assert t.totals()["rows"] == [{"task": TASK, "total_ms": 8_000}]
+    assert t.totals()["rows"] == [unclassified_row(TASK, 8_000)]
     assert cmd(t, "stop", s["revision"], "life-rollback-stop") == result
     assert t.totals()["rows"][0]["total_ms"] == 8_000
 
@@ -492,3 +497,109 @@ def test_backfill_is_limited_to_twelve_hours_and_rest_is_a_label(tmp_path):
     assert rows["rest"] == 12 * hour
     with pytest.raises(ValidationError):
         cmd(t, "switch_task", 1, "bad-label", task={"source": "label", "id": "nap", "title": "Сон"})
+
+
+def test_work_cube_full_duration_subminute_remaining_and_categories(tmp_path):
+    c = FakeClock()
+    timer = store(tmp_path, c)
+    task = {'source': 'work', 'id': 'work-cube:legacy-300', 'title': 'Cube', 'activity_kind': 'work'}
+    first = cmd(timer, 'start', 0, 'cube-300', mode='pomodoro', duration_ms=300 * 60_000, task=task)
+    assert first['duration_ms'] == 18_000_000
+    c.advance(12_000)
+    stopped = cmd(timer, 'stop', first['revision'], 'cube-stop')
+    snapshot = timer.totals()
+    row = next(r for r in snapshot['rows'] if r['task']['id'] == task['id'])
+    assert (row['total_ms'], row['work_ms'], row['personal_ms'], row['unclassified_ms']) == (12_000, 12_000, 0, 0)
+    # The remaining tail may be shorter than one minute and finishes exactly once.
+    short = cmd(timer, 'start', stopped['revision'], 'cube-short', mode='pomodoro', duration_ms=9_000, task=task)
+    c.advance(9_000)
+    assert timer.state()['status'] == 'finished'
+    assert timer.totals()['work_ms'] == 21_000
+    assert timer.totals()['total_ms'] == 21_000
+    with pytest.raises(ValidationError):
+        cmd(timer, 'start', timer.state()['revision'], 'short-non-cube', mode='pomodoro', duration_ms=9_000, task=TASK)
+
+
+def test_classification_snapshots_keep_legacy_unknown_and_rest_separate(tmp_path):
+    c = FakeClock()
+    timer = store(tmp_path, c)
+    base = {'source': 'work', 'id': 'work-cube:a', 'title': 'A'}
+    legacy = cmd(timer, 'start', 0, 'legacy', task=base)
+    c.advance(4_000)
+    work = cmd(timer, 'start', legacy['revision'], 'work', task={**base, 'activity_kind': 'work'})
+    c.advance(6_000)
+    personal = cmd(timer, 'start', work['revision'], 'personal', task={**base, 'activity_kind': 'personal'})
+    c.advance(3_000)
+    rest = cmd(timer, 'start', personal['revision'], 'rest', task={'source': 'label', 'id': 'rest', 'title': 'Rest'})
+    c.advance(2_000)
+    cmd(timer, 'stop', rest['revision'], 'finish')
+    totals = timer.totals()
+    assert (totals['total_ms'], totals['work_ms'], totals['personal_ms'], totals['rest_ms'], totals['unclassified_ms']) == (15_000, 6_000, 3_000, 2_000, 4_000)
+    row = next(item for item in totals['rows'] if item['task']['id'] == base['id'])
+    assert (row['total_ms'], row['work_ms'], row['personal_ms'], row['unclassified_ms']) == (13_000, 6_000, 3_000, 4_000)
+    daily = timer.summary(day(c), 'UTC')
+    assert (daily['total_ms'], daily['work_ms'], daily['personal_ms'], daily['rest_ms'], daily['unclassified_ms']) == (15_000, 6_000, 3_000, 2_000, 4_000)
+
+
+def test_standalone_library_timer_uses_same_note_identity_and_short_remaining(tmp_path):
+    from megamozg.work_period import PeriodPlanner
+    from megamozg.work_store import WorkStore
+    from megamozg.core import Store
+    planner = PeriodPlanner(WorkStore(tmp_path))
+    made = planner.command({'request_id': 'timer-note-create', 'expected_revision': 0, 'action': 'standalone_create',
+        'data': {'title': 'Canonical', 'date': '2027-01-05', 'minutes': 30, 'activity_kind': 'personal'}})
+    cube = next(row for row in made['cubes'] if row.get('standalone'))
+    note = next(row for row in Store(tmp_path).list_notes() if row['id'] == cube['source_ref'])
+    work_ref = {'source': 'library', 'id': cube['source_ref'], 'title': cube['title'], 'activity_kind': cube['activity_kind']}
+    library_ref = {'source': 'library', 'id': note['id'], 'title': note['title'], 'activity_kind': note['activity_kind']}
+    assert (work_ref['source'], work_ref['id']) == (library_ref['source'], library_ref['id'])
+    clock = FakeClock()
+    timer = store(tmp_path, clock)
+    first = cmd(timer, 'start', 0, 'note-subminute', mode='pomodoro', duration_ms=9_000, task=work_ref)
+    clock.advance(9_000)
+    finished = timer.state()
+    assert finished['status'] == 'finished'
+    second = cmd(timer, 'start', finished['revision'], 'library-panel', task=library_ref)
+    clock.advance(3_000)
+    cmd(timer, 'stop', second['revision'], 'library-panel-stop')
+    rows = timer.totals()['rows']
+    assert len(rows) == 1 and rows[0]['task']['id'] == note['id']
+    assert rows[0]['total_ms'] == rows[0]['personal_ms'] == 12_000
+    ordinary = Store(tmp_path).capture('Ordinary task', kind='task')
+    for target in ('unknown-legacy-id', ordinary['id']):
+        with pytest.raises(ValidationError, match='duration_ms'):
+            cmd(timer, 'start', timer.state()['revision'], 'bad-short-' + target,
+                task={'source': 'library', 'id': target, 'title': 'Other'}, mode='pomodoro', duration_ms=9_000)
+
+
+def test_standalone_library_timer_extended_limit_requires_confirmed_note(tmp_path):
+    from megamozg.work_period import PeriodPlanner
+    from megamozg.work_store import WorkStore
+    planner = PeriodPlanner(WorkStore(tmp_path))
+    made = planner.command({'request_id': 'limit-note-create', 'expected_revision': 0, 'action': 'standalone_create',
+        'data': {'title': 'Long', 'date': '2027-01-05', 'minutes': 30, 'activity_kind': 'work'}})
+    cube = next(row for row in made['cubes'] if row.get('standalone'))
+    clock = FakeClock()
+    timer = store(tmp_path, clock)
+    ref = {'source': 'library', 'id': cube['source_ref'], 'title': 'Long', 'activity_kind': 'work'}
+    started = cmd(timer, 'start', 0, 'note-300', mode='pomodoro', duration_ms=18_000_000, task=ref)
+    assert started['duration_ms'] == 18_000_000
+    stopped = cmd(timer, 'stop', started['revision'], 'note-300-stop')
+    with pytest.raises(ValidationError):
+        cmd(timer, 'start', stopped['revision'], 'note-too-long', mode='pomodoro', duration_ms=86_400_001, task=ref)
+    with pytest.raises(ValidationError):
+        cmd(timer, 'start', stopped['revision'], 'legacy-too-long', mode='pomodoro', duration_ms=18_000_000,
+            task={'source': 'library', 'id': 'legacy-unknown', 'title': 'Legacy'})
+
+
+def test_running_category_change_splits_interval_without_rewriting_history(tmp_path):
+    clock = FakeClock()
+    timer = store(tmp_path, clock)
+    ref = {'source': 'work', 'id': 'work-cube:class-toggle', 'title': 'Cube', 'activity_kind': 'personal'}
+    started = cmd(timer, 'start', 0, 'class-start', task=ref)
+    clock.advance(6_000)
+    changed = cmd(timer, 'switch_task', started['revision'], 'class-switch', task={**ref, 'activity_kind': 'work'})
+    clock.advance(7_000)
+    cmd(timer, 'stop', changed['revision'], 'class-stop')
+    row = timer.totals()['rows'][0]
+    assert (row['total_ms'], row['personal_ms'], row['work_ms']) == (13_000, 6_000, 7_000)

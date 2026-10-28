@@ -1,5 +1,0 @@
-.wta-art{display:block;width:84px;height:74px;max-width:100%;flex-shrink:0;overflow:visible}
-.wta-art--compact{display:inline-block;width:24px;height:24px;vertical-align:middle;max-width:none}
-.wta-muted .wta-art,.wta-art.wta-muted{filter:grayscale(.9);opacity:.62}
-.wta-art.wta-art--compact{filter:none}
-@media(prefers-reduced-motion:reduce){.wta-art{animation:none!important;transition:none!important}}

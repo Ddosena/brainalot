@@ -61,10 +61,10 @@ def test_constructor_cas_receipt_and_rejected_mutation_are_atomic(tmp_path):
         work.planning_operation({**command, "data": {**command["data"], "minutes": 30}})
     with pytest.raises(ConflictError):
         work.planning_operation({**command, "request_id": "stale"})
-    before = work.read()
-    with pytest.raises(ValidationError):
-        op(work, "over-allocation", "constructor_cube", {"cube_id": "too-big", "kind": "task", "task_id": "b", "minutes": 240, "title": "No"})
-    assert work.read() == before
+    # Owner decision 2026-10-28: over-allocation grows the task and warns, never refuses.
+    grown = op(work, "over-allocation", "constructor_cube", {"cube_id": "too-big", "kind": "task", "task_id": "b", "minutes": 240, "title": "Yes"})
+    assert "too-big" in grown["state"]["planning"]["constructor"]["cubes"]
+    assert any("вырос" in warning for warning in grown["warnings"])
 
 
 def test_started_return_hide_restore_preserves_fact_credit_and_id_once(tmp_path):
@@ -339,10 +339,11 @@ def test_snap_to_grid_after_arbitrary_calendar_boundary(tmp_path):
 def test_legacy_add_cannot_overallocate_constructor_proposals(tmp_path):
     work = setup(tmp_path)
     draft(work, "all-b", task_id="b", minutes=120)
-    before = work.read()
-    with pytest.raises(ValidationError, match="остаток"):
-        op(work, "legacy-overflow", "day_cube_add", {"date": NEXT, "task_id": "b", "minutes": 60})
-    assert work.read() == before
+    # Owner decision 2026-10-28: an extra hour is accepted; the task volume grows with a warning.
+    before = next(task for task in work.read()["state"]["planning"]["tasks"] if task["id"] == "b")["estimate_minutes"]["central"]
+    added = op(work, "legacy-overflow", "day_cube_add", {"date": NEXT, "task_id": "b", "minutes": 60})
+    after = next(task for task in added["state"]["planning"]["tasks"] if task["id"] == "b")["estimate_minutes"]["central"]
+    assert after > before and added.get("warnings")
 
 
 def test_optional_calendar_cannot_select_other_occurrence_date(tmp_path):

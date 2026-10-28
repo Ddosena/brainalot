@@ -226,6 +226,11 @@ def enrich(state, projects):
     aliases = state.get("period_planner", {}).get("course_task_titles", {})
     native_aliases = state.get("period_planner", {}).get("task_titles", {})
     auxiliary_ids = {r["id"] for r in source.get("auxiliary", [])}
+    ext = state.get("period_planner", {})
+    def included(record, pid):
+        tid = record.get("source_work_task_id")
+        return (not ext.get("deleted_tasks", {}).get(tid)
+                and ext.get("task_fields", {}).get(tid, {}).get("project_id", pid) == pid)
     for project in result:
         pid = project["id"]
         if pid not in source_projects:
@@ -233,11 +238,11 @@ def enrich(state, projects):
         original = project.get("tasks", [])
         native_display = {r["id"]: r for r in original}
         packages, tasks, events = {}, [], []
-        records = [r for r in source["packages"] + source["rows"] if r["project_id"] == pid]
+        records = [r for r in source["packages"] + source["rows"] if r["project_id"] == pid and included(r, pid)]
         represented = {value for r in records for value in
                        (r.get("id"), r.get("source_work_task_id"), r.get("catalog_id")) if value}
         for record in source["packages"]:
-            if record["project_id"] != pid:
+            if record["project_id"] != pid or not included(record, pid):
                 continue
             task = _display(record, native_display)
             task["kind"] = "package"
@@ -248,7 +253,7 @@ def enrich(state, projects):
                 events.extend((_entry(task, "start", task["window_start"]),
                                _entry(task, "deadline", task["window_end"])))
         for record in source["rows"]:
-            if record["project_id"] != pid:
+            if record["project_id"] != pid or not included(record, pid):
                 continue
             parent = packages.get(record.get("package_id"))
             task = _display(record, native_display, parent)

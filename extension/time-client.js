@@ -20,6 +20,29 @@ const localStorageAdapter = {
   async remove(key) { await globalThis.chrome?.storage?.local?.remove(key); },
 };
 export const taskKey = task => task ? JSON.stringify([task.source, task.id]) : "null";
+// Classify new UI commands without changing the identity or past intervals.
+export function classifiedTimeTask(task, kind = null) {
+  if(!task)return null;
+  const ref={source:task.source,id:task.id,title:task.title};
+  if(task.source==='label'&&task.id==='rest')return ref;
+  ref.activity_kind=kind==='work'||kind==='personal'?kind:task.activity_kind|| (task.source==='work'?'work':'personal');
+  return ref;
+}
+/** Stop only the task proven by a fresh revision; a peer's replacement is safe. */
+export async function stopMatchingTimeTask(client, tasks, {requestId=()=>crypto.randomUUID()}={}) {
+  const keys=new Set(tasks.map(taskKey));let stopped=false;
+  for(let attempt=0;attempt<2;attempt++){
+    await client.refresh();
+    const snapshot=client.state;
+    if(!snapshot||!['running','paused','finished'].includes(snapshot.status)||!keys.has(taskKey(snapshot.task)))return stopped;
+    if(client.pending)throw new Error(t('Ответ на прошлую команду не получен. Нажмите «Проверить повтор».'));
+    const receipt={request_id:requestId(),expected_revision:snapshot.revision,action:'stop'};
+    try{await client.commandWithReceipt(receipt);stopped=true;}
+    catch(error){if(error.status===409)continue;throw error;}
+  }
+  if(['running','paused','finished'].includes(client.state?.status)&&keys.has(taskKey(client.state.task)))throw new Error(t('Учёт изменился в другом окне. Повторите завершение кубика.'));
+  return stopped;
+}
 export function normalizeTimePreset(value) {
   const valid = n => Number.isInteger(n) && n >= 60000 && n <= 10800000;
   return {work_ms:valid(value?.work_ms) ? value.work_ms : 1500000,

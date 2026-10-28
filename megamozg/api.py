@@ -8,9 +8,10 @@ import os
 import math
 import re
 import threading
+import sqlite3
 from datetime import date, datetime, timedelta
 import time as _time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -37,6 +38,86 @@ from .time_tracking import TimeStore
 from .browser_bridge import BrowserBridge
 from .spotify import SpotifyController
 from . import paths, features
+from .shared_state import encoded
+from zoneinfo import ZoneInfo
+
+
+class WorkProjectionCache:
+    """Bounded per-app projections; validate every external input before reuse."""
+
+    def __init__(self, planner):
+        self.planner = planner
+        self.lock = threading.Lock()
+        self.snapshot = None
+        self.identity = None
+        self.key = None
+        self.responses = {}
+
+    @staticmethod
+    def today(timezone):
+        return datetime.now(ZoneInfo(timezone)).date().isoformat()
+
+    def response(self, request, endpoint):
+        from .work_delete import metadata, recover
+        with self.lock:
+            work = self.planner.store
+            # Keep read recovery semantics, without opening/parsing the state blob
+            # on each unchanged poll. A pending delete must be recovered first.
+            recovered = False
+            while True:
+                # Read transaction avoids taking the writer lock on every poll.
+                with closing(sqlite3.connect(work.path, timeout=30)) as db:
+                    db.row_factory = sqlite3.Row
+                    db.execute('BEGIN')
+                    pending = db.execute("SELECT 1 FROM work_cube_deletes WHERE status='pending' LIMIT 1").fetchone()
+                    if not pending or recovered:
+                        version = work._version(db)
+                        deletion = metadata(db)
+                        identity = (version['revision'], version['state_blob']) if version else (0, None)
+                        if identity != self.identity:
+                            self.snapshot = work._read(db, version)
+                            self.identity = identity
+                if not pending or recovered:
+                    break
+                recover(work)
+                recovered = True
+            snapshot = dict(self.snapshot)
+            if deletion is not None:
+                snapshot['deletion_state'] = deletion
+            notes = self.planner.library.notes()
+            state = snapshot.get('state') or {}
+            timezone = (state.get('planning') or {}).get('settings', {}).get('timezone', 'UTC')
+            # Entire immutable Work version covers settings, context, calendar,
+            # facts and overlays. Hash decoded notes, including versions/content;
+            # LibraryReader validates content even for same-size/mtime edits.
+            sources = encoded([notes, sorted(getattr(notes, 'deleted_work_note_ids', ()))])
+            key = (identity, encoded(deletion), hashlib.sha256(sources.encode()).hexdigest(), self.today(timezone))
+            if key != self.key:
+                self.responses.clear()
+                self.key = key
+            if endpoint not in self.responses:
+                model = self.planner._model(snapshot, notes)
+                if endpoint == 'day':
+                    ready = isinstance(state.get('planning'), dict)
+                    value = {'revision': snapshot['revision'], 'initialized': snapshot['initialized'],
+                        'enabled': bool(ready and (state.get('period_planner') or any(
+                            n.get('kind') == 'task' and n.get('status') == 'active' for n in notes))),
+                        'view_model': model}
+                    if deletion is not None:
+                        value['deletion_state'] = deletion
+                else:
+                    value = model
+                response = JSONResponse(value)
+                # Input key is part of the validator, even when an input change
+                # happens not to alter currently visible fields.
+                etag = '"' + hashlib.sha256(encoded(key).encode() + response.body).hexdigest() + '"'
+                self.responses[endpoint] = (response.body, etag)
+            body, etag = self.responses[endpoint]
+            headers = {'ETag': etag, 'Cache-Control': 'private, no-cache'}
+            supplied = request.headers.get('if-none-match', '')
+            if any(tag.strip().removeprefix('W/') == etag or tag.strip() == '*' for tag in supplied.split(',')):
+                return Response(status_code=304, headers=headers)
+            return Response(body, media_type='application/json', headers=headers)
 
 
 def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -> FastAPI:
@@ -51,6 +132,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     shared = SharedState(root)
     work = WorkStore(root) if features.WORK_ENABLED else None
     period = PeriodPlanner(work) if work is not None else None
+    work_projections = WorkProjectionCache(period) if period is not None else None
     timer = TimeStore(root)
     browser = BrowserBridge(root)
     spotify = spotify_controller if spotify_controller is not None else SpotifyController(
@@ -370,11 +452,11 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     # an unchanged plan answers 304 instead of resending and reparsing it.
     @app.get("/api/work/period/model")
     def work_period_model(request: Request):
-        return conditional_json(request, period.model())
+        return work_projections.response(request, 'model')
 
     @app.get("/api/work/period/day")
     def work_period_day(request: Request):
-        return conditional_json(request, period.day_model())
+        return work_projections.response(request, 'day')
 
     @app.get("/api/work/period/snapshot")
     def work_period_snapshot():
@@ -383,7 +465,8 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
     @app.get("/api/work/period/context")
     def work_period_context():
         current = period.model()
-        return {"context": current["context"], "revision": current["revision"], "provenance": current.get("provenance", {})}
+        return {"context": current["context"], "revision": current["revision"], "provenance": current.get("provenance", {}),
+                "planning_initialized": current.get("planning_initialized", True)}
 
     @app.post("/api/work/period/context")
     async def work_period_context_update(request: Request):
@@ -607,7 +690,7 @@ def create_app(root: str | Path, port: int = 8765, *, spotify_controller=None) -
 
     @app.post("/api/captures")
     async def capture(request: Request):
-        data = await payload(request, {"text", "kind", "title", "due", "media_type", "url", "tags", "source", "external_id", "source_capture_id", "context_id", "topic", "importance", "importance_score", "show_in_unscheduled", "planning_horizon", "attachments"})
+        data = await payload(request, {"text", "kind", "title", "due", "media_type", "url", "tags", "source", "external_id", "source_capture_id", "context_id", "topic", "importance", "importance_score", "show_in_unscheduled", "planning_horizon", "attachments", "activity_kind", "work_cube"})
         if "text" not in data:
             raise ValidationError("Требуется text")
         return await run_in_threadpool(lambda: store.capture(**data))

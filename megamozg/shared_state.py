@@ -156,13 +156,19 @@ class SharedState:
             self.check_revision(command, current["revision"])
             patch = command.get("patch")
             allowed = {"panel:calendar-importance", "panel:theme", "panel:design", "panel:locale",
-                       "panel:focus-overlay-color", "time:preset"}
+                       "panel:focus-overlay-color", "time:preset", "work:theme"}
             if not isinstance(patch, dict) or set(patch) - allowed or len(encoded(patch)) > 100000:
                 raise ValidationError("Недопустимые общие настройки интерфейса")
             if "panel:focus-overlay-color" in patch:
                 color = patch["panel:focus-overlay-color"]
                 if not isinstance(color, str) or color not in {"fire", "pink", "violet", "cyan", "lime", "amber"}:
                     raise ValidationError("Недопустимый цвет линии таймера")
+            if "work:theme" in patch:
+                theme = patch["work:theme"]
+                if (not isinstance(theme, dict) or set(theme) != {"theme", "mode"}
+                        or not isinstance(theme["theme"], str) or theme["theme"] not in {"graphite", "midnight", "contrast", "glamour"}
+                        or not isinstance(theme["mode"], str) or theme["mode"] not in {"dark", "light"}):
+                    raise ValidationError("Недопустимая тема Work")
             if "time:preset" in patch:
                 preset = patch["time:preset"]
                 if (not isinstance(preset, dict) or set(preset) != {"work_ms", "break_ms"}

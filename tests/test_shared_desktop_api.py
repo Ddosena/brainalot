@@ -248,7 +248,7 @@ def test_restore_cli_boundary_rejects_overwrite_and_paths(tmp_path):
     assert not (tmp_path / "escape").exists()
 
 
-def test_actual_browser_exporter_against_actual_api(tmp_path):
+def test_actual_work_ui_commands_preserve_legacy_bytes_against_actual_api(tmp_path):
     import subprocess
     import sys
     from pathlib import Path
@@ -257,7 +257,7 @@ def test_actual_browser_exporter_against_actual_api(tmp_path):
                             cwd=project, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert result.returncode == 0, result.stderr + result.stdout
     report = json.loads(result.stdout.strip())
-    assert report["verified"] and report["images"] == 3 and report["stateBytes"] > 262144
+    assert report["verified"] and report["typedCommands"] and report["images"] == 3 and report["stateBytes"] > 262144
 
 
 def test_cli_time_recall_and_restore_use_same_stores(tmp_path, capsys):
@@ -411,3 +411,15 @@ def test_external_receipt_concurrent_redelivery_does_not_repeat_side_effect(tmp_
             finish.set()
         assert first.result(timeout=2) == {"ok": True}
     assert calls == ["next"]
+
+
+def test_work_theme_preference_validates_all_fields(tmp_path):
+    shared = SharedState(tmp_path)
+    saved = shared.set_preferences({'request_id': 'theme', 'expected_revision': 0,
+        'patch': {'work:theme': {'theme': 'midnight', 'mode': 'dark'}}})
+    assert saved['values']['work:theme'] == {'theme': 'midnight', 'mode': 'dark'}
+    for invalid in ({'theme': 'unknown', 'mode': 'dark'}, {'theme': 'contrast'},
+                    {'theme': 'graphite', 'mode': 'light', 'extra': 1}, None):
+        with pytest.raises(ValidationError):
+            shared.set_preferences({'request_id': 'bad-theme', 'expected_revision': 1,
+                'patch': {'work:theme': invalid}})

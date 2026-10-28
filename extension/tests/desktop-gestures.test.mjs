@@ -1,8 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {installWindowGestures} from '../desktop-gestures.js';
+import {installWindowGestures,installRightButtonWindowDrag} from '../desktop-gestures.js';
 
 const flush = async () => { for (let i=0; i<16; i++) await Promise.resolve(); };
+function rightFixture(){
+  const handlers=new Map(),calls=[],captures=new Set(),target={setPointerCapture:id=>captures.add(id),hasPointerCapture:id=>captures.has(id),releasePointerCapture:id=>captures.delete(id)};
+  const surface={addEventListener:(name,fn)=>handlers.set(name,fn),removeEventListener:(name,fn)=>{if(handlers.get(name)===fn)handlers.delete(name);},defaultView:{addEventListener:(name,fn)=>handlers.set(name,fn),removeEventListener:name=>handlers.delete(name)}};
+  const native={window_action:async(action,value)=>{calls.push([action,value]);return action==='gesture_probe'?{origin:[120,-30]}:{ok:true};}};
+  const dispose=installRightButtonWindowDrag(native,{surface});
+  const emit=(type,extra={})=>{const event={button:2,pointerId:9,clientX:20,clientY:20,target,prevented:false,stopped:false,preventDefault(){this.prevented=true;},stopImmediatePropagation(){this.stopped=true;},...extra};handlers.get(type)?.(event);return event;};
+  return {calls,surface,native,dispose,emit,handlers};
+}
+test('right short click in a control preserves its context menu and never begins moving',async()=>{
+ const f=rightFixture();f.emit('pointerdown');f.emit('pointermove',{clientX:23});f.emit('pointerup',{clientX:23});await flush();
+ assert.deepEqual(f.calls.map(c=>c[0]),['gesture_probe']);assert.equal(f.emit('contextmenu').prevented,false);f.dispose();
+});
+test('right drag from any element uses physical down origin and consumes only its own context menu',async()=>{
+ const f=rightFixture();f.emit('pointerdown');f.emit('pointermove',{clientX:70});f.emit('pointerup',{clientX:70});await new Promise(r=>setImmediate(r));
+ assert.deepEqual(f.calls.map(c=>c[0]),['gesture_probe','gesture_begin','gesture_move','gesture_end']);
+ assert.deepEqual(f.calls[1][1],{edge:'',right_button:true,origin:[120,-30]});assert.equal(f.emit('contextmenu').stopped,true);assert.equal(f.emit('contextmenu').prevented,false);
+ f.emit('pointerdown');f.emit('pointerup');assert.equal(f.emit('contextmenu').prevented,false);f.dispose();
+});
+test('right cancellation and iframe disposal finish the native gesture once without swallowing left clicks',async()=>{
+ const f=rightFixture();f.emit('pointerdown',{button:0});f.emit('pointermove',{button:0,clientX:80});await flush();assert.deepEqual(f.calls,[]);
+ assert.equal(installRightButtonWindowDrag(f.native,{surface:f.surface}),f.dispose);
+ f.emit('pointerdown');f.emit('pointermove',{clientX:80});f.emit('pointercancel');f.dispose();await new Promise(r=>setImmediate(r));
+ assert.equal(f.calls.filter(c=>c[0]==='gesture_end').length,1);assert.equal(f.handlers.size,0);
+});
 function fixture(options={}) {
   const handlers = new Map(), calls = [], captures = new Set();
   const surface = {

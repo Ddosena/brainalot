@@ -78,7 +78,8 @@ def test_existing_day_endpoint_shares_period_schedule_and_keeps_raw_snapshot(tmp
         'action': 'cube_select', 'data': {'cube_id': 'geometry', 'date': '2027-01-06', 'start': '15:00'}})
     assert chosen.status_code == 200, chosen.text
     projected = api.get('/api/work/period/day', headers=auth).json()
-    cube = next(c for c in projected['planning']['result']['constructor']['cubes'] if c['id'] == 'geometry')
+    assert 'planning' not in projected
+    cube = next(c for c in projected['view_model']['cubes'] if c['id'] == 'geometry')
     assert cube['selected_date'] == '2027-01-06' and cube['start'] == '15:00'
     returned = api.post('/api/work/planning', headers=auth, json={
         'request_id': 'day-return', 'expected_revision': chosen.json()['revision'],

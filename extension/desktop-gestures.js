@@ -1,4 +1,51 @@
 // Pointer handling for our own native windows. This never emulates OS input.
+const rightDragSurfaces=new WeakMap();
+
+// Every native document, including child iframes, forwards a real right drag.
+// A short press is left to the document's own context menu.
+export function installRightButtonWindowDrag(native,{surface=globalThis.document,threshold=5}={}) {
+  if(!surface||typeof native?.window_action!=='function')return ()=>{};
+  if(rightDragSurfaces.has(surface))return rightDragSurfaces.get(surface);
+  const doc=surface.ownerDocument||surface,win=doc.defaultView||globalThis.window,listeners=[];
+  let drag=null,queue=Promise.resolve(),suppressContext=false,disposed=false;
+  const send=(action,value)=>queue=queue.catch(()=>{}).then(()=>native.window_action(action,value));
+  const listen=(target,type,callback)=>{if(!target?.addEventListener)return;target.addEventListener(type,callback,true);listeners.push(()=>target.removeEventListener(type,callback,true));};
+  function finish(event){
+    if(!drag||(event?.pointerId!=null&&event.pointerId!==drag.id))return;
+    const ended=drag;drag=null;
+    if(ended.target.hasPointerCapture?.(ended.id))ended.target.releasePointerCapture(ended.id);
+    if(ended.moved){suppressContext=true;void ended.begin.then(()=>send('gesture_end')).catch(()=>{});}
+  }
+  listen(surface,'pointerdown',event=>{
+    if(event.button!==2||disposed)return;
+    finish();suppressContext=false;
+    drag={id:event.pointerId,x:event.clientX,y:event.clientY,target:event.target,moved:false,sending:false,
+      probe:send('gesture_probe').then(value=>value?.origin,()=>null)};
+  });
+  listen(surface,'pointermove',event=>{
+    const current=drag;if(!current||current.id!==event.pointerId)return;
+    if(!current.moved&&Math.abs(event.clientX-current.x)+Math.abs(event.clientY-current.y)<threshold)return;
+    if(!current.moved){
+      current.moved=true;suppressContext=true;
+      current.begin=current.probe.then(origin=>send('gesture_begin',{edge:'',right_button:true,...(origin?{origin}:{})})).then(result=>{
+        if(result?.restored_work&&win?.top?.dispatchEvent&&win.CustomEvent)win.top.dispatchEvent(new win.CustomEvent('brainalot-work-restored'));
+        return result;
+      });
+      try{current.target.setPointerCapture?.(current.id);}catch{}
+    }
+    event.preventDefault();
+    if(!current.sending){current.sending=true;void current.begin.then(()=>send('gesture_move')).catch(()=>{}).finally(()=>{current.sending=false;});}
+  });
+  for(const type of['pointerup','pointercancel','lostpointercapture'])listen(surface,type,finish);
+  listen(win,'blur',()=>finish());
+  listen(surface,'contextmenu',event=>{
+    if(!suppressContext||event.button!==2)return;
+    suppressContext=false;event.preventDefault();event.stopImmediatePropagation();
+  });
+  const dispose=()=>{if(disposed)return;finish();disposed=true;listeners.forEach(fn=>fn());rightDragSurfaces.delete(surface);};
+  rightDragSurfaces.set(surface,dispose);return dispose;
+}
+
 export function installWindowGestures(native, {
   surface = document.body, tab = false, doubleClick = {}, freeDoubleClick = false,
   onDoubleClick = () => native.window_action(tab ? "card" : "bar"),

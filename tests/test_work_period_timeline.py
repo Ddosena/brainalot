@@ -17,7 +17,7 @@ def send(planner, action, data, request="resize-test", revision=None):
 def test_prep_resize_is_atomic_persistent_and_not_task_volume(tmp_path):
     planner = make(tmp_path)
     before = deepcopy(planner.store.read()["state"])
-    prep = next(row for row in planner.model()["cubes"] if row["kind"] == "prep")
+    prep = next(row for row in model.cube_rows(planner.snapshot()["state"]) if row["kind"] == "prep")
     send(planner, "cube_select", {"cube_id": prep["id"], "date": prep["planned_date"], "start": "17:00"}, "select")
     rev = planner.model()["revision"]
     data = {"cube_id": prep["id"], "date": prep["planned_date"], "start": "16:45", "minutes": 40}
@@ -40,12 +40,12 @@ def test_prep_resize_is_atomic_persistent_and_not_task_volume(tmp_path):
 def test_work_scope_and_facts_cannot_be_resized(tmp_path):
     planner = make(tmp_path)
     cube = next(row for row in planner.model()["cubes"] if row["id"] == "geometry")
-    assert not cube["can_resize"] and "Объём" in cube["resize_block_reason"]
+    assert cube["can_resize"]
     before = planner.store.read()
-    with pytest.raises(ValidationError, match="перераспределения"):
-        send(planner, "cube_resize", {"cube_id": cube["id"], "date": cube["planned_date"], "start": "15:00", "minutes": 120})
-    assert planner.store.read() == before
-    prep = next(row for row in planner.model()["cubes"] if row["kind"] == "prep")
+    resized = send(planner, "cube_resize", {"cube_id": cube["id"], "date": None, "start": None, "minutes": 120})
+    assert next(row for row in resized["cubes"] if row["id"] == cube["id"])["minutes"] == 120
+    assert planner.store.read()["state"]["planning"] == before["state"]["planning"]
+    prep = next(row for row in model.cube_rows(planner.snapshot()["state"]) if row["kind"] == "prep")
     copied = deepcopy(before["state"])
     copied["planning"].setdefault("prep_progress", {})[prep["id"]] = {"percent": 20, "actual_minutes": 5, "date": prep["planned_date"]}
     factual = model.read_model({"state": copied, "revision": 0})
@@ -60,14 +60,14 @@ def test_estimated_offer_can_resize_but_calendar_duration_cannot(color_planner):
     assert not sage["can_resize"] and sage["source_duration_unknown"]
     assert not gray["can_resize"] and "календаре" in gray["resize_block_reason"]
     send(p, "calendar_offer_estimate", {"cube_id": sage["id"], "minutes": 15}, "estimate")
-    send(p, "cube_select", {"cube_id": sage["id"], "date": "2027-02-05", "start": "10:00"}, "select-sage")
-    resized = send(p, "cube_resize", {"cube_id": sage["id"], "date": "2027-02-05", "start": "09:45", "minutes": 30})
+    send(p, "cube_select", {"cube_id": sage["id"], "date": sage["source_date"], "start": "10:00"}, "select-sage")
+    resized = send(p, "cube_resize", {"cube_id": sage["id"], "date": sage["source_date"], "start": "09:45", "minutes": 30})
     row = next(c for c in resized["cubes"] if c["id"] == sage["id"])
     assert row["minutes"] == 30 and row["end"] == "10:15" and row["can_resize"]
 
 
 def test_explicit_zero_prep_preserves_facts(tmp_path):
-    p = make(tmp_path); prep = next(c for c in p.model()["cubes"] if c["kind"] == "prep")
+    p = make(tmp_path); prep = next(c for c in model.cube_rows(p.snapshot()["state"]) if c["kind"] == "prep")
     send(p, "cube_select", {"cube_id": prep["id"], "date": prep["planned_date"], "start": "17:00"}, "select")
     result = send(p, "cube_resize", {"cube_id": prep["id"], "date": prep["planned_date"], "start": "17:00", "minutes": 0})
     row = next(c for c in result["cubes"] if c["id"] == prep["id"])
@@ -188,12 +188,11 @@ def test_period_shrink_keeps_placed_cube_and_returned_cube_can_be_chosen(tmp_pat
     send(p, "cube_select", {"cube_id": "geometry", "date": "2027-01-05", "start": "15:00"}, "select")
     send(p, "period_set", {"task_id": "a", "start": "2027-01-08", "end": "2027-01-10"}, "shrink")
     row = next(c for c in p.model()["cubes"] if c["id"] == "geometry")
-    assert row["selected_date"] == "2027-01-05" and row["start"] == "15:00"
-    send(p, "cube_time", {"cube_id": "geometry", "start": "16:00"}, "time")
-    send(p, "cube_return", {"cube_id": "geometry"}, "return")
+    assert row["selected_date"] is None and row["start"] is None
     assert next(c for c in p.model()["cubes"] if c["id"] == "geometry")["returned"] is True
     send(p, "cube_select", {"cube_id": "geometry", "date": "2027-01-05", "start": "17:00"}, "choose-returned")
     task = next(t for t in p.model()["tasks"] if t["id"] == "a")
     assert task["start"] == "2027-01-08" and task["end"] == "2027-01-10"
+    assert next(c for c in p.model()["cubes"] if c["id"] == "geometry")["independent"] is True
     after = deepcopy(p.store.read()["state"]);before.pop("period_planner", None);after.pop("period_planner", None)
     assert before == after

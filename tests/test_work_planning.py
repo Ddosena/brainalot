@@ -2,6 +2,8 @@
 import base64
 import hashlib
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 
 import pytest
@@ -276,7 +278,7 @@ def test_week_done_and_reopen_use_native_day_outcome_through_the_day_coordinator
     assert task["status"] != "completed" and task["completed_on"] is None
     planning_command("done", "day_outcome", {"task_id": "a", "date": "2027-01-05", "done": True})
     task = next(row for row in period.model()["tasks"] if row["id"] == "a")
-    assert (task["status"], task["completed_on"], task["effective_remaining_minutes"]) == ("completed", "2027-01-05", 0)
+    assert (task["status"], task["completed_on"], task["effective_remaining_minutes"]) == ("completed", datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat(), 0)
     planning_command("reopen", "day_outcome", {"task_id": "a", "date": task["completed_on"], "done": False})
     task = next(row for row in period.model()["tasks"] if row["id"] == "a")
     assert task["status"] != "completed" and task["completed_on"] is None and task["effective_remaining_minutes"] > 0

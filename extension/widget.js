@@ -1,13 +1,16 @@
+import {applyTheme, mountTheme} from "./theme.js";
 import { native } from "./desktop-platform.js";
-import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, getTimePreset, saveTimePreset, normalizeTimePreset, timerFields } from "./time-client.js";
-import { applyDocument, syncLocale, localeChange, t } from "./i18n.js";
+import { timeClient, sharedApi, elapsedAt, formatTime, formatTotal, getTimePreset, saveTimePreset, normalizeTimePreset, timerFields, classifiedTimeTask, stopMatchingTimeTask } from "./time-client.js";
+import { applyDocument, syncLocale, localeChange, locale, t } from "./i18n.js";
 import { calendarImportanceLevel } from "./importance-state.js";
 import { compactTasks, taskKey, resolveActiveTask, untrackedStep, eventKey, currentEvent, timerProgress } from "./widget-model.js";
 import { installWindowGestures } from "./desktop-gestures.js";
 import { FOCUS_OVERLAY_COLOR_KEY, NEON_COLORS, normalizeNeonColor } from "./focus-timer.js";
 import { mountSpotifyPlayer } from "./spotify-player.js";
+import { attachDictation } from "./voice-recorder.js";
 const $ = id => document.getElementById(id);
 const isFull = document.body.classList?.contains("desktop-shell") === true;
+if (!isFull) mountTheme({api:sharedApi}, {onChange:value => applyTheme(document.documentElement, value)});
 // Full and compact windows must not overwrite each other's uncertain note action.
 const OP_KEY = isFull ? "desktop:full-operation" : "desktop:widget-operation", SELECT_KEY = "desktop:selected-task", SELECT_REV_KEY = "desktop:selected-task-revision";
 applyDocument(); void syncLocale();
@@ -23,6 +26,11 @@ let catalogToday = null, currentPreset = normalizeTimePreset(null);
 let pendingNotice = false, pollNotice = false;
 let gap = null, asking = false, snoozeUntil = 0, activitySince = null;
 let popup = null, popupQueue = Promise.resolve();
+// One field at the top of the picker: it finds tasks, and after the pencil
+// (or dictation) the same text becomes a new task. Play without a task opens
+// the picker and starts the timer once a task is chosen.
+let adding = false, startAfterPick = false, visibleTasks = [], voice = null;
+const PEN_ICON = "M4 20h4L19 9l-4-4L4 16zm9.5-13.5 4 4", ADD_ICON = "m5 12 5 5 9-10";
 let mediaVisible = !isFull && (bootstrap.media_visible ?? saved["desktop:spotify-visible"] !== false);
 let spotifyPlayer = null;
 document.body.dataset.side = bootstrap.side || "right";
@@ -89,6 +97,9 @@ function syncPopup() {
 async function setPopup(next, {focus = false} = {}) {
   if (mode === "bar") next = null;
   if (next !== "media") spotifyPlayer?.closeSettings?.();
+  const picker = ["tasks", "activity"].includes(next), wasPicker = ["tasks", "activity"].includes(popup);
+  if (!picker) { startAfterPick = false; voice?.cancel(); }
+  if (picker && !wasPicker) resetFind();
   popup = next;
   $("widget-popup").hidden = !next;
   $("widget-picker").hidden = !["tasks", "activity"].includes(next);
@@ -121,7 +132,7 @@ function setMode(value) {
 async function action(command, fields = {}) {
   if (busy || operation) return false;
   busy = true; render();
-  try { await timeClient.command(command, fields); clearError(); return true; }
+  try {if(fields.task)fields={...fields,task:classifiedTimeTask(fields.task,fields.task.source==='library'?liveNotes.find(note=>note.id===fields.task.id)?.activity_kind:null)};if(command==='resume'&&timeClient.state?.task){const current=timeClient.state.task,next=classifiedTimeTask(current,current.source==='library'?liveNotes.find(note=>note.id===current.id)?.activity_kind:null);if(next.activity_kind!==current.activity_kind)await timeClient.command('switch_task',{task:next});}await timeClient.command(command, fields); clearError(); return true; }
   catch (err) { error(err); return false; }
   finally { busy = false; render(); }
 }
@@ -161,7 +172,6 @@ function render() {
   $("widget-mode-visible").disabled = busy || waiting;
   $("widget-task").disabled = busy || waiting;
   $("widget-new").disabled = busy || waiting;
-  $("widget-new-form").querySelector("button").disabled = busy || waiting;
   const modeKind = selectedMode || state?.mode || "pomodoro";
   const modeName = modeKind === "stopwatch" ? t("Секундомер") : modeKind === "break" ? t("Перерыв") : t("Помодоро");
   $("widget-mode").textContent = t("Сменить режим: {mode}", {mode: modeName});
@@ -192,7 +202,7 @@ function renderTasks() {
   const query = $("widget-search").value.trim().toLocaleLowerCase();
   const active = taskKey(currentTask());
   const activity = popup === "activity";
-  $("widget-picker-title").textContent = activity ? t("Чем занимаешься?") : t("Перейти к задаче");
+  $("widget-picker-title").textContent = activity ? t("Чем занимаешься?") : startAfterPick ? t("Выберите задачу, чтобы начать") : t("Перейти к задаче");
   const unique = new Map();
   const rest = {source: "label", id: "rest", title: t("Отдых")};
   if (activity) {
@@ -204,6 +214,7 @@ function renderTasks() {
   }
   const tasks = (activity ? [...unique.values()] : [rest, ...taskCatalog.filter(task => taskKey(task) !== taskKey(rest))])
     .filter(task => task.title.toLocaleLowerCase().includes(query));
+  visibleTasks = tasks;
   const nodes = tasks.map(task => {
     const row = document.createElement("button"); row.type = "button"; row.dataset.task = taskKey(task);
     row.dataset.active = String(active === taskKey(task)); row.disabled = busy || pending();
@@ -214,7 +225,7 @@ function renderTasks() {
     row.append(title, detail); row.onclick = () => void (activity ? answerActivity(task) : chooseTask(task));
     return row;
   });
-  if (!nodes.length) { const empty = document.createElement("p"); empty.textContent = t("Задач не найдено"); nodes.push(empty); }
+  if (!nodes.length) { const empty = document.createElement("p"); empty.textContent = adding ? t("Enter или галочка — добавить задачу") : query ? t("Не нашлось. Нажмите карандаш, чтобы добавить.") : t("Задач не найдено"); nodes.push(empty); }
   if (activity) {
     const later = document.createElement("button"); later.id = "widget-activity-later"; later.type = "button"; later.textContent = t("Спросить позже");
     later.onclick = () => { snoozeUntil = Date.now() + 30 * 60_000; asking = false; render(); void setPopup(null); }; nodes.push(later);
@@ -227,7 +238,20 @@ async function chooseTask(task) {
     if (!await action("switch_task", {task})) return;
   }
   await rememberSelection(task);
+  const launch = startAfterPick && !["running", "paused"].includes(timeClient.state?.status);
   render(); await setPopup(null); $("widget-task").focus();
+  if (launch) await startTimer(task);
+}
+function nextTimerMode() {
+  const state = timeClient.state;
+  return selectedMode || (["pomodoro", "stopwatch", "break"].includes(state?.mode) ? state.mode : "pomodoro");
+}
+async function startTimer(task) {
+  try {
+    if (await action("start", {...timerFields(nextTimerMode(), await getTimePreset()), task})) {
+      selectedMode = selectedPreview = null; render();
+    }
+  } catch (err) { error(err); }
 }
 $("widget-run").onclick = async () => {
   const state = timeClient.state;
@@ -239,11 +263,8 @@ $("widget-run").onclick = async () => {
       if (!await action("switch_task", {task})) return;
       return action("resume");
     }
-    if (!task) return setPopup("tasks", {focus: true});
-    const nextMode = selectedMode || (["pomodoro", "stopwatch", "break"].includes(state?.mode) ? state.mode : "pomodoro");
-    if (await action("start", {...timerFields(nextMode, await getTimePreset()), task})) {
-      selectedMode = selectedPreview = null; render();
-    }
+    if (!task) { startAfterPick = true; return setPopup("tasks", {focus: true}); }
+    await startTimer(task);
   } catch (err) { error(err); }
 };
 $("widget-stop").onclick = async () => {
@@ -292,11 +313,7 @@ async function saveOperation(value) {
   await chrome.storage.local.set({[OP_KEY]: value}); operation = value;
 }
 async function stopRelatedTask(task) {
-  await timeClient.refresh();
-  if (["running", "paused"].includes(timeClient.state?.status) && taskKey(timeClient.state.task) === taskKey(task)) {
-    await timeClient.command("stop");
-    await rememberSelection(task);
-  }
+  if(await stopMatchingTimeTask(timeClient,[task]))await rememberSelection(task);
 }
 async function finishOperation() {
   const op = operation;
@@ -308,7 +325,7 @@ async function finishOperation() {
     if (!op.note) await saveOperation({...op, stage: "select", note});
     taskCatalog = [...taskCatalog.filter(task => task.id !== note.id), {source: "library", id: note.id, title: note.title}];
     liveNotes = [...liveNotes.filter(item => item.id !== note.id), note];
-    const capturedTask = {source: "library", id: note.id, title: note.title};
+    const capturedTask = classifiedTimeTask({source: "library", id: note.id, title: note.title},note.activity_kind);
     if (op.activity) {
       if (operation.stage !== "activated") {
         await timeClient.refresh();
@@ -326,7 +343,7 @@ async function finishOperation() {
             // must not be regenerated or block the saved task behind endless Retry.
             await reloadSelectionIntent(); await saveOperation(null);
             gap = null; asking = false; activitySince = null;
-            $("widget-new-form").hidden = true; $("widget-new-title").value = "";
+            resetFind();
             throw Object.assign(new Error(`${t("Задача сохранена, но запуск отклонён. Проверьте текущий учёт и выберите действие заново.")} ${err.message}`), {status: err.status});
           }
           throw err;
@@ -344,6 +361,15 @@ async function finishOperation() {
         await timeClient.command("switch_task", {task: capturedTask});
       }
       await rememberSelection(capturedTask);
+      if (op.start) {
+        // Play without a task: the new task starts the timer it was created for.
+        // A retry sees the started timer and does not start a second one.
+        await timeClient.refresh();
+        if (!["running", "paused"].includes(timeClient.state?.status)) {
+          await timeClient.command("start", {...timerFields(nextTimerMode(), await getTimePreset()), task: capturedTask});
+          selectedMode = selectedPreview = null;
+        }
+      }
     }
   } else if (op.kind === "complete") {
     // Stop is not a permanent precondition: a peer may have resumed this task
@@ -366,7 +392,7 @@ async function finishOperation() {
   }
   await saveOperation(null); clearError();
   if (op.kind === "complete") { $("widget-search").value = ""; await setPopup("tasks", {focus: true}); }
-  else { $("widget-new-form").hidden = true; $("widget-new-title").value = ""; await setPopup(null); }
+  else { resetFind(); await setPopup(null); }
 }
 async function runOperation() {
   if (busy) return;
@@ -403,16 +429,32 @@ $("widget-done").onclick = async () => {
   if (prepared) await runOperation();
 };
 $("widget-complete").onclick = $("widget-done").onclick;
-$("widget-new-form").onsubmit = async event => {
+function setAdding(next, {focus = true} = {}) {
+  adding = next; $("widget-find").dataset.adding = String(adding);
+  $("widget-search").placeholder = adding ? t("Новая задача…") : t("Найти задачу…");
+  $("widget-search").setAttribute("aria-label", adding ? t("Название новой задачи") : t("Поиск задачи"));
+  const label = adding ? t("Добавить задачу") : t("Новая задача");
+  $("widget-new").title = label; $("widget-new").setAttribute("aria-label", label);
+  $("widget-new-icon").setAttribute("d", adding ? ADD_ICON : PEN_ICON);
+  if (focus) $("widget-search").focus();
+}
+function resetFind() { voice?.cancel(); $("widget-search").value = ""; setAdding(false, {focus: false}); }
+$("widget-find").onsubmit = async event => {
   event.preventDefault(); if (busy || pending()) return;
-  const title = $("widget-new-title").value.trim(); if (!title) return;
+  if (!adding) {
+    // Enter in search takes the first match, as a click on it would.
+    const first = visibleTasks[0];
+    if (first) await (popup === "activity" ? answerActivity(first) : chooseTask(first));
+    return;
+  }
+  const title = $("widget-search").value.trim(); if (!title) { $("widget-search").focus(); return; }
   let prepared = false; busy = true; render();
   try {
     const {today} = await sharedApi("/api/time/tasks");
     if (!/^\d{4}-\d{2}-\d{2}$/.test(today || "")) throw new Error(t("Сервис не сообщил сегодняшнюю дату. Обновите приложение."));
     catalogToday = today;
     await saveOperation({kind: "capture", payload: {text: title, title, kind: "task", due: catalogToday, source: "desktop-widget", external_id: `widget:${crypto.randomUUID()}`},
-      ...(popup === "activity" ? {activity: {backfill_from: Math.floor(activitySince ?? gap?.since ?? Date.now())}} : {})});
+      ...(popup === "activity" ? {activity: {backfill_from: Math.floor(activitySince ?? gap?.since ?? Date.now())}} : startAfterPick ? {start: true} : {})});
     prepared = true;
   } catch (err) { error(err); }
   finally { busy = false; render(); }
@@ -429,7 +471,31 @@ $("widget-task").onclick = () => void setPopup(popup === "tasks" ? null : "tasks
 $("widget-more").onclick = () => void setPopup(popup === "menu" ? null : "menu").catch(error);
 $("widget-close").onclick = () => void setPopup(null).then(() => $("widget-task").focus()).catch(error);
 $("widget-search").oninput = renderTasks;
-$("widget-new").onclick = () => { $("widget-new-form").hidden = !$("widget-new-form").hidden; if (!$("widget-new-form").hidden) $("widget-new-title").focus(); };
+$("widget-new").onclick = () => {
+  if (adding && $("widget-search").value.trim()) return $("widget-find").onsubmit({preventDefault() {}});
+  setAdding(!adding); renderTasks();
+};
+$("widget-search").onkeydown = event => {
+  // Escape leaves the new-task mode first; a second Escape closes the list.
+  if (event.key === "Escape" && adding) { event.preventDefault(); event.stopPropagation(); setAdding(false); renderTasks(); }
+};
+voice = attachDictation({button: $("widget-voice"), textarea: $("widget-search"), status: $("widget-voice-status"),
+  getToken: async () => (await chrome.storage.local.get("connection")).connection?.token,
+  language: locale() === "ru" ? "ru" : "auto",
+  beforeStart: async () => {
+    if (busy || pending()) return false;
+    try {
+      const current = await sharedApi("/api/voice/status");
+      if (current.state === "ready") { setAdding(true, {focus: false}); return true; }
+      if (current.state === "missing") { voice.report(t("Голосовой ввод не установлен: запустите Install-Voice.cmd в папке Brainalot и перезапустите сервис."), true); return false; }
+      if (current.state !== "preparing") await sharedApi("/api/voice/prepare", "POST");
+      voice.report(t("Подготавливаю голосовой ввод… Нажмите микрофон ещё раз через минуту."));
+      return false;
+    } catch (err) { voice.report(err.message, true); return false; }
+  },
+  // The recognised words stay editable; Enter or the check mark adds the task.
+  onResult: result => { if (result.text) setAdding(true); },
+});
 $("widget-open").onclick = () => void windowMode("full").catch(error);
 $("widget-switch").onclick = () => void windowMode("bar").catch(error);
 $("widget-tab").onkeydown = event => { if (["Enter", " "].includes(event.key)) { event.preventDefault(); void windowMode("card").catch(error); } };
@@ -444,7 +510,7 @@ document.addEventListener("pointerdown", event => {
   if (popup && !event.target.closest("#widget-popup,#widget-task,#widget-more,#widget-mode-visible,#widget-ask-choice,#widget-spotify")) void setPopup(null).catch(error);
 });
 async function answerActivity(task) {
-  task = {source: task.source, id: task.id, title: task.title};
+  task = classifiedTimeTask(task,task.source==='library'?liveNotes.find(note=>note.id===task.id)?.activity_kind:null);
   try {
     if (await action("start", {...timerFields("stopwatch", await getTimePreset()), task, backfill_from: Math.floor(activitySince ?? gap?.since ?? Date.now())})) {
       gap = null; asking = false; activitySince = null; selectedMode = selectedPreview = null; await rememberSelection(task); await setPopup(null);
@@ -474,8 +540,6 @@ chrome.storage.onChanged.addListener(changes => {
     render();
   }
   if (localeChange(changes)) void syncLocale().then(render);
-  if (changes["panel:theme"]) document.documentElement.dataset.theme = changes["panel:theme"].newValue;
-  if (changes["panel:design"]) document.documentElement.dataset.design = changes["panel:design"].newValue;
   if (changes[FOCUS_OVERLAY_COLOR_KEY]) applyProgressColor(changes[FOCUS_OVERLAY_COLOR_KEY].newValue);
   if (changes["panel:calendar-importance"]) void refresh();
 });
@@ -484,14 +548,13 @@ async function refresh(force = false) {
   refreshing = true;
   try {
     await timeClient.refresh();
-    const [notes, localPrefs, sharedPrefs, tasks, timeTotals] = await Promise.all([sharedApi("/api/notes"), chrome.storage.local.get(["panel:calendar-importance", "panel:theme", "panel:design", FOCUS_OVERLAY_COLOR_KEY]), sharedApi("/api/ui/preferences"), sharedApi("/api/time/tasks"), sharedApi("/api/time/totals")]);
+    const [notes, localPrefs, sharedPrefs, tasks, timeTotals] = await Promise.all([sharedApi("/api/notes"), chrome.storage.local.get(["panel:calendar-importance", FOCUS_OVERLAY_COLOR_KEY]), sharedApi("/api/ui/preferences"), sharedApi("/api/time/tasks"), sharedApi("/api/time/totals")]);
     // Read the common preferences directly. Calendar fire and color must update
     // even before a hidden full-window preference sync happens to poll.
     const prefs = {...localPrefs, ...sharedPrefs.values};
     liveNotes = notes.notes; taskCatalog = (tasks.tasks || []).filter(task => task.source !== "work"); totals = timeTotals.rows || [];
     catalogToday = /^\d{4}-\d{2}-\d{2}$/.test(tasks.today || "") ? tasks.today : null;
     currentPreset = normalizeTimePreset(sharedPrefs.values?.["time:preset"]);
-    document.documentElement.dataset.theme = prefs["panel:theme"] || "light"; document.documentElement.dataset.design = prefs["panel:design"] || "stream";
     applyProgressColor(prefs[FOCUS_OVERLAY_COLOR_KEY]);
     burning = liveNotes.filter(note => ["task", "purchase"].includes(note.kind) && note.importance === "critical" && !["done", "cancelled", "archived"].includes(note.status)).map(note => ({source: "library", id: note.id, title: note.title}));
     const now = new Date(), day = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;

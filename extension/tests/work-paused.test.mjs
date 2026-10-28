@@ -39,7 +39,7 @@ test("Work is available and the retained pause helpers still protect data", asyn
   assert.match(desktop, /data-view="work" hidden/);
   assert.match(await source("desktop.js"), /workEnabled: WORK_ENABLED/);
   assert.match(await source("desktop.js"), /\[data-view="work"\]'\)\.hidden = !WORK_ENABLED/);
-  assert.match(await source("time-ui.js"), /task\.source !== "work"/);
+  assert.match(await source("time-ui.js"), /task\.source\s*!==\s*["']work["']/);
 });
 
 test("an injected reader stops observing and sending after the pause command", async () => {

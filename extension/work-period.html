@@ -1,22 +1,3 @@
 <!doctype html>
-<html lang="ru" data-work-enabled="false">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0d202b">
-  <title>Brainalot · Work · Неделя</title>
-  <link rel="icon" href="icons/icon-32.png">
-  <link rel="stylesheet" href="work-period/styles.css">
-</head>
-<body>
-  <output id="sync-status" hidden aria-live="polite"></output>
-  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-  <main id="planner" aria-busy="true"><div class="loading-state" data-i18n="Загружаем план…">Загружаем план…</div></main>
-  <main id="work-paused" role="status">
-    <h1 data-i18n="Work временно отключён">Work временно отключён</h1>
-    <p data-i18n="Work временно отключён. Ваши задачи, доски и изображения сохранены.">Work временно отключён. Ваши задачи, доски и изображения сохранены.</p>
-  </main>
-  <noscript data-i18n="Для планирования нужен JavaScript.">Для планирования нужен JavaScript.</noscript>
-  <script type="module" src="work-period/entry.js"></script>
-</body>
-</html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brainalot · Work · Неделя</title><link rel="icon" href="icons/icon-32.png"><link rel="stylesheet" href="work-ui/styles.css?v=constructor-20261028-g"><link rel="stylesheet" href="theme-tokens.css"></head>
+<body class="midnight dark"><div id="stage"></div><div id="layer"></div><div class="toast" id="toast" role="status" aria-live="polite" hidden><span id="toastText"></span><button id="toastUndo" hidden data-i18n="Вернуть">Вернуть</button></div><script type="module" src="work-ui/app.js?v=constructor-20261028-g"></script></body></html>

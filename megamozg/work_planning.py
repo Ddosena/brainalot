@@ -1765,15 +1765,11 @@ def _refresh_manual_day(planning, key):
     ctor_cubes = planning.get("constructor", {}).get("cubes", {})
     unstarted_source = any(not _constructor_started(planning, ctor_cubes[cid])
                            for cid in ctor_day.get("selected_source_ids", []))
-    if not ctor_day and row["over_cap_minutes"] and (any(_lock_reservation(planning, lock) for lock in locks) or unstarted_source):
-        raise ValidationError("Бюджета недостаточно для не начатых кубиков: сначала верните или переставьте кубик")
     available_by_task = _remaining(planning)
     reserved_by_task = defaultdict(int)
     for lock in planning.get("locks", []):
         if lock.get("manual"):
             reserved_by_task[lock["task_id"]] += _lock_reservation(planning, lock)
-    if not ctor_day and any(reserved > available_by_task[tid] for tid, reserved in reserved_by_task.items()):
-        raise ValidationError("Выбранные ручные кубики превышают остаток задачи")
     segment_credits = _segment_effective_credits(planning)
     by_segment = {segment["id"]: segment for segment in planning.get("task_segments", [])}
     segment_reserved = defaultdict(int)
@@ -1783,9 +1779,6 @@ def _refresh_manual_day(planning, key):
             if segment_id not in by_segment or by_segment[segment_id]["task_id"] != lock["task_id"]:
                 raise ValidationError("Ручной кубик ссылается на чужой этап")
             segment_reserved[segment_id] += _lock_reservation(planning, lock)
-    if not ctor_day and any(reserved > by_segment[segment_id]["minutes"]-segment_credits.get(segment_id, 0)
-           for segment_id, reserved in segment_reserved.items()):
-        raise ValidationError("Выбранные кубики превышают остаток этапа")
 
 
 def apply_day_builder(planning, action, data):
@@ -2044,7 +2037,7 @@ def apply_segment_action(planning, action, data):
 
 CONSTRUCTOR_ACTIONS = frozenset({"constructor_day", "constructor_cube", "constructor_split",
     "constructor_select", "constructor_return", "constructor_hide", "constructor_timeline", "calendar_required", "constructor_goal", "constructor_goal_status"})
-CONSTRUCTOR_KINDS = frozenset({"task", "prep", "calendar", "weekly_review", "brainalot"})
+CONSTRUCTOR_KINDS = frozenset({"task", "prep", "calendar", "weekly_review", "brainalot", "repeatable"})
 
 
 def _event_identity(event):
@@ -2205,7 +2198,7 @@ def _validate_constructor(planning):
                 raise ValidationError("constructor source_ref: источник уже представлен")
             source_ids.add((kind, ref))
         minutes = _int(cube.get("minutes"), "constructor minutes", 0 if kind == "prep" else 1, 1440 if kind == "calendar" else 240)
-        if kind in {"task", "brainalot"} and (minutes < 5 or minutes % 5) and not deleted_cube(planning, cube_id):
+        if kind in {"task", "brainalot", "repeatable"} and (minutes < 5 or minutes % 5) and not deleted_cube(planning, cube_id):
             raise ValidationError("constructor minutes: 5..240 шаг5")
         if kind == "prep" and (minutes > 120 or minutes % 5) or kind == "weekly_review" and minutes != 60:
             raise ValidationError("constructor source minutes: неверная длительность")
@@ -2482,7 +2475,11 @@ def _constructor_allocation(planning, previous=None, *, check=True):
     overflow = {key: value for key, value in overflow.items() if value}
     baseline = _constructor_allocation(previous, check=False) if previous is not None else {}
     if check and any(value > baseline.get(key, 0) for key, value in overflow.items()):
-        raise ValidationError("Предложения превышают остаток задачи или этапа")
+        # Owner decision 2026-10-28: cubes are never refused for a task's volume;
+        # the volume grows to cover them and the owner is told.
+        from .work_manual import absorb_overflow, note_warnings
+        note_warnings(absorb_overflow(planning))
+        return _constructor_allocation(planning, check=False)
     return overflow
 
 
@@ -2500,7 +2497,8 @@ def _constructor_budget_guard(planning, previous=None):
         unstarted = any(_lock_reservation(planning, lock) for lock in _manual_locks(planning, key))
         unstarted |= any(not _constructor_started(planning, cubes[cid]) for cid in meta.get("selected_source_ids", []))
         if unstarted:
-            raise ValidationError("Бюджета недостаточно: сначала верните или переставьте не начатый кубик")
+            # Owner decision 2026-10-28: the day's load is set by the cubes chosen; no cap refuses them.
+            continue
 
 
 def _constructor_return(planning, cube):

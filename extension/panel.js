@@ -1,10 +1,11 @@
 import "./desktop-platform.js";
 import { mountTimeUI, taskTimeButton } from "./time-ui.js";
-import { getTimePreset, saveTimePreset, subscribeTimePreset, normalizeTimePreset } from "./time-client.js";
+import { sharedApi, timeClient, stopMatchingTimeTask, getTimePreset, saveTimePreset, subscribeTimePreset, normalizeTimePreset } from "./time-client.js";
 import { mountRecallControls } from "./recall-controls.js";
 import { BRIDGE_MANIFEST, bridgeScript } from "./calendar-bridge/script.js";
-import {addDays, assignmentPatch, calendarEventPhase, calendarEventTime, calendarEventsForDate, chooseResurface, compareCalendarEvents, createRefreshGate, currentWeekDueOptions, dayTasks, editableNoteText, editNotePatch, imageFit, isVisibleTask, mixPose, normalizeTheme, overdueTasks, posterHue, reorderedIds, RESURFACE_HOLD_MS, resurfaceCandidates, stackDragCommits, stackEase, stackPose, stepResurface, thoughtRecords, visibleWeekTasks, weekDates, weekStart} from "./panel-state.js";
-import { isOutdatedWorker, normalizeDesign } from "./capture-window.js";
+import {addDays, assignmentPatch, calendarEventPhase, calendarEventTime, calendarEventsForDate, chooseResurface, compareCalendarEvents, createRefreshGate, currentWeekDueOptions, dayTasks, editableNoteText, editNotePatch, imageFit, isVisibleTask, mixPose, overdueTasks, posterHue, reorderedIds, RESURFACE_HOLD_MS, resurfaceCandidates, stackDragCommits, stackEase, stackPose, stepResurface, thoughtRecords, visibleWeekTasks, weekDates, weekStart} from "./panel-state.js";
+import { isOutdatedWorker } from "./capture-window.js";
+import {applyTheme as applyUnifiedTheme, mountTheme} from "./theme.js";
 import { FOCUS_KEY, FOCUS_OVERLAY_COLOR_KEY, FOCUS_OVERLAY_KEY, NEON_COLORS, normalizeNeonColor, normalizeTimer, timerView } from "./focus-timer.js";
 import { cachedImageColor, checkAttachmentLimit, paintImageBackdrop, previewUrl, rasterKey, renderAttachmentList, renderRasterGallery, safeRaster, storeAttachment, stripManagedAttachments } from "./attachments.js";
 import { DOSSIER_SECTIONS, LIBRARY_CATEGORIES, dossierCounts, groupLibraryNotes, libraryCategoryCounts, linkedProjectNotes, resolveLibraryRoute, selectLibraryNotes } from "./library-view.js";
@@ -91,8 +92,6 @@ let focusOverlayVisible = true;
 let focusOverlayColor = NEON_COLORS[0].id;
 let selectedFocusMinutes = "25";
 let focusPending = false;
-const THEME_KEY = "panel:theme";
-const DESIGN_KEY = "panel:design";
 const BACKLOG_VIEW_KEY = "panel:backlog-view";
 const IMPORTANCE_CONTROL_KEY = "panel:show-importance-control";
 const IGNITION_SOUND_KEY = "panel:ignition-sound";
@@ -105,11 +104,12 @@ const importancePending = new Set();
 const fireLayers = {today:createFireLayer($("today-card")), calendar:createFireLayer($("calendar-section")), backlog:createFireLayer($("unscheduled-card"))};
 const noteFireKey = note => "note:" + note.id;
 const calendarFireKey = event => "event:" + calendarImportanceKey(event);
-function applyDesign(value) {
-  const design = normalizeDesign(value);
-  document.documentElement.dataset.design = design;
-  if ($("design-select")) $("design-select").value = design;
+function showAppearance(value) {
+  const next = applyUnifiedTheme(document.documentElement, value);
+  if ($("design-select")) $("design-select").value = next.theme;
+  if ($("theme-select")) $("theme-select").value = next.mode;
 }
+const themeStore = mountTheme({api:sharedApi}, {onChange:showAppearance});
 
 function send(type, extra = {}) {
   return chrome.runtime.sendMessage({type, ...extra}).then(reply => {
@@ -134,13 +134,6 @@ function notice(message, error = false, source = "action") {
   el.dataset.source = source;
   el.hidden = false;
   if (!error && source === "action") noticeTimer = setTimeout(() => { el.hidden = true; }, 2200);
-}
-function applyTheme(value) {
-  const theme = normalizeTheme(value);
-  document.documentElement.toggleAttribute("data-theme", theme !== "system");
-  if (theme === "system") delete document.documentElement.dataset.theme;
-  else document.documentElement.dataset.theme = theme;
-  if ($("theme-select")) $("theme-select").value = theme;
 }
 function focusTime(ms, remaining = false) {
   const seconds = remaining ? Math.ceil(ms / 1000) : Math.floor(ms / 1000);
@@ -351,7 +344,7 @@ function renderNote(note, {task = false, movable = false, compact = movable, lib
     done.addEventListener("click", () => mutate(note, {status:"done"}, el));
     heading.append(done);
   }
-  if (["task", "purchase"].includes(note.kind) || note.show_in_unscheduled) heading.append(taskTimeButton({source:"library", id:note.id, title:note.title}));
+  if (["task", "purchase"].includes(note.kind) || note.show_in_unscheduled) heading.append(taskTimeButton({source:"library", id:note.id, title:note.title, activity_kind:note.activity_kind||"personal"}));
   const title = node("strong", "note-title", note.title);
   let taskDisclosureTimer = null;
   if (["task", "purchase"].includes(note.kind)) bindTaskRename(title, note, {
@@ -581,7 +574,7 @@ function renderRecallNote(note, {passive = false} = {}) {
     if (images.length > 1) gallery.append(node("span", "stack-image-count", `+${images.length - 1}`));
   }
   const heading = node("div", "note-heading");
-  if (!passive && (["task","purchase"].includes(note.kind) || note.show_in_unscheduled)) heading.append(taskTimeButton({source:"library",id:note.id,title:note.title}));
+  if (!passive && (["task","purchase"].includes(note.kind) || note.show_in_unscheduled)) heading.append(taskTimeButton({source:"library",id:note.id,title:note.title,activity_kind:note.activity_kind||"personal"}));
   const disclosure = node(passive ? "div" : "button", "carousel-disclosure");
   if (!passive) disclosure.type = "button";
   disclosure.append(node("div", "note-meta", kinds[note.kind] || note.kind), node("strong", "note-title", note.title));
@@ -677,6 +670,7 @@ async function changeNote(note, type, extra, card) {
     return;
   }
   try {
+    if(type==='update'&&extra.patch?.status==='done')await stopMatchingTimeTask(timeClient,[{source:'library',id:note.id}]);
     await send(type, {id:note.id, version:note.version, ...extra});
     await refresh();
     if (type === "delete") notice(t("Запись удалена из панели и Obsidian."));
@@ -949,7 +943,7 @@ function renderCalendarRows() {
       eventClick.stopPropagation();
       if (!check.disabled) mutateCalendarOccurrence(event, "delete");
     });
-    row.append(check, node("span", "calendar-event-time", calendarEventTime(event)), description, taskTimeButton({source:"calendar",id:`${event.calendar_id}:${event.occurrence_id || event.id}`,title:event.title || t("Событие без названия")}));
+    row.append(check, node("span", "calendar-event-time", calendarEventTime(event)), description, taskTimeButton({source:"calendar",id:`${event.calendar_id}:${event.occurrence_id || event.id}`,title:event.title || t("Событие без названия"),activity_kind:event.activity_kind||"personal"}));
     const importanceToggle = node("button", "importance-toggle");
     importanceToggle.type = "button";
     importanceToggle.hidden = !showImportanceControl;
@@ -2053,14 +2047,11 @@ $("service-refresh").addEventListener("click", () => void serviceButton($("servi
 $("service-start").addEventListener("click", () => void serviceButton($("service-start"), "start", t("Запускаем сервис…"), t("Сервис запущен.")));
 $("service-restart").addEventListener("click", () => void serviceButton($("service-restart"), "restart", t("Перезапускаем сервис…"), t("Сервис перезапущен.")));
 $("settings-form").addEventListener("submit",async event=>{event.preventDefault();try{await send("configure",{token:$("token").value});$("token").value="";await refresh();}catch(error){notice(error.message,true);}});
-$("theme-select").addEventListener("change", async event => {
-  const theme = normalizeTheme(event.target.value);
-  applyTheme(theme);
-  await chrome.storage.local.set({[THEME_KEY]:theme});
+$("theme-select").addEventListener("change", event => {
+  void themeStore.set({mode:event.target.value}).catch(error => notice(error.message, true));
 });
-$("design-select").addEventListener("change", async event => {
-  applyDesign(event.target.value);
-  await chrome.storage.local.set({[DESIGN_KEY]:document.documentElement.dataset.design});
+$("design-select").addEventListener("change", event => {
+  void themeStore.set({theme:event.target.value}).catch(error => notice(error.message, true));
 });
 $("importance-control-visible").addEventListener("change", async event => {
   const previous = showImportanceControl;
@@ -2695,8 +2686,6 @@ chrome.storage.onChanged.addListener((changes, area)=>{
   if (area !== "local") return;
   if (localeChange(changes)) { location.reload(); return; }
   if (changes[LIBRARY_SNAPSHOT_KEY]) applyLibrarySnapshot(changes[LIBRARY_SNAPSHOT_KEY].newValue);
-  if (changes[THEME_KEY]) applyTheme(changes[THEME_KEY].newValue);
-  if (changes[DESIGN_KEY]) applyDesign(changes[DESIGN_KEY].newValue);
   if (changes[IMPORTANCE_CONTROL_KEY]) {
     showImportanceControl = changes[IMPORTANCE_CONTROL_KEY].newValue !== false;
     $("importance-control-visible").checked = showImportanceControl;
@@ -2730,11 +2719,7 @@ chrome.storage.onChanged.addListener((changes, area)=>{
 applyPlannerSize();
 updateLocaleToggle();
 void syncLocale();
-applyTheme("system");
-applyDesign("stream");
 renderFocus(true);
-void chrome.storage.local.get(THEME_KEY).then(saved => applyTheme(saved[THEME_KEY]));
-void chrome.storage.local.get(DESIGN_KEY).then(saved => applyDesign(saved[DESIGN_KEY]));
 void chrome.storage.local.get(TIMER_CHIME_KEY).then(saved => {
   timerChime = normalizeTimerChime(saved[TIMER_CHIME_KEY]);
   $("focus-chime").checked = timerChime;
@@ -2772,12 +2757,12 @@ void initializeLibraryView().catch(error => showLibraryWindowError(error.message
 void refresh();
 
 // Width determines type density; height only adds a small bounded correction.
-// The 88% floor keeps narrow desktop/Chrome panels readable and scrollable.
+// Apply the common density at 70%; browser zoom remains independent.
 function applyPanelScale() {
   const widthScale = Math.pow(window.innerWidth / 440, .24);
   const heightScale = Math.max(.97, Math.min(1.03, Math.pow(window.innerHeight / 800, .04)));
   const scale = Math.max(.88, Math.min(1.18, widthScale * heightScale));
-  document.documentElement.style.setProperty("--panel-scale", scale.toFixed(4));
+  document.documentElement.style.setProperty("--panel-scale", (scale * .70).toFixed(4));
   document.body.classList.add("adaptive-panel");
 }
 applyPanelScale();

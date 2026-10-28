@@ -136,23 +136,140 @@ def timer_reservation(root, cube_id, blueprint_ref=None):
         yield
 
 
-def guard_timer_target(root, task):
-    """Called with TimeStore's writer lock held; no timer target can enter a deletion."""
-    if not task or task.get("source") != "work" or not task.get("id", "").startswith("work-cube:"):
-        return
-    path = Path(root) / "state" / "shared.sqlite3"
-    if not path.exists():
-        return
-    from .work_planning import deleted_cube
-    cid = task["id"][len("work-cube:"):]
+
+@contextmanager
+def timer_reservation_many(root, cube_ids):
+    """Hold the shared timer writer lock before Work while deleting overlay cubes."""
+    with sqlite3.connect(Path(root) / "state" / "time.sqlite3", timeout=30) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT status,task FROM timer WHERE id=1").fetchone() if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='timer'").fetchone() else None
+        aliases = set(cube_ids)
+        note_ids = {cid[len("brainalot-"):] for cid in aliases
+                    if re.fullmatch(r"brainalot-[a-f0-9]{32}", cid)}
+        path = Path(root) / "state" / "shared.sqlite3"
+        if path.exists():
+            with sqlite3.connect(path) as work_db:
+                if work_db.execute("SELECT 1 FROM sqlite_master WHERE name='work_versions'").fetchone():
+                    current = work_db.execute("SELECT b.body FROM work_versions v JOIN work_blobs b ON b.hash=v.state_blob ORDER BY v.revision DESC LIMIT 1").fetchone()
+                    if current:
+                        state = json.loads(current[0])
+                        cubes = (state.get("planning") or {}).get("constructor", {}).get("cubes", {})
+                        note_ids.update(cubes[cid].get("source_ref") for cid in list(aliases)
+                                        if cid in cubes and cubes[cid].get("kind") == "brainalot" and cubes[cid].get("source_ref"))
+                        aliases.update(cid for cid, cube in cubes.items()
+                                       if cube.get("kind") == "brainalot" and cube.get("source_ref") in note_ids)
+        aliases.update("brainalot-" + note_id for note_id in note_ids)
+        if row and row[0] in {"running", "paused"} and row[1]:
+            active = json.loads(row[1])
+            if active.get("source") == "library" and active.get("id") in note_ids:
+                raise ActiveCubeTimerError("Перед удалением остановите таймер этой записи и сохраните фактическое время")
+        for cid in aliases:
+            blueprint = cid[len("planned-"):] if cid.startswith("planned-") else None
+            _guard_timer_row(row, cid, blueprint)
+        yield
+
+
+
+@contextmanager
+def timer_source_lease(root):
+    """Freeze the active timer identity without settling or modifying its ledger."""
+    with sqlite3.connect(Path(root) / "state" / "time.sqlite3", timeout=30) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT status,task FROM timer WHERE id=1").fetchone() if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='timer'").fetchone() else None
+        task = json.loads(row[1]) if row and row[0] in {"running", "paused"} and row[1] else None
+        yield task
+
+def tracked_work_cube_ids(root, cube_ids):
+    """Read the existing ledger only; no timer initialization, settlement or writes."""
+    ids = {cid for cid in cube_ids if isinstance(cid, str) and cid}
+    path = Path(root) / "state" / "time.sqlite3"
+    if not ids or not path.exists():
+        return set()
+    result = set()
     with sqlite3.connect(path) as db:
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='work_versions'").fetchone():
-            return
-        blobs = db.execute("SELECT b.body FROM work_versions v JOIN work_blobs b ON b.hash=v.state_blob ORDER BY v.revision DESC LIMIT 1").fetchall()
-        if db.execute("SELECT 1 FROM sqlite_master WHERE name='work_cube_deletes'").fetchone():
-            blobs += db.execute("SELECT b.body FROM work_cube_deletes d JOIN work_blobs b ON b.hash=d.state_blob WHERE d.status='pending'").fetchall()
-        if any(deleted_cube(json.loads(row[0]).get("planning", {}), cid) for row in blobs):
-            raise ConflictError("Кубик удаляется или уже удалён; его таймер нельзя запустить")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='intervals'").fetchone():
+            return result
+        rows = db.execute("SELECT DISTINCT task FROM intervals WHERE task IS NOT NULL AND end_ms>start_ms AND mode!='break'")
+        for item in rows:
+            try:
+                ref = json.loads(item[0])
+            except (TypeError, ValueError):
+                continue
+            target = ref.get("id") if isinstance(ref, dict) and ref.get("source") == "work" else None
+            if isinstance(target, str) and target.startswith("work-cube:"):
+                cid = target[len("work-cube:"):]
+                if cid in ids:
+                    result.add(cid)
+    return result
+
+def guard_timer_target(root, task):
+    """Reject pending/deleted exact sources while holding the timer writer lock."""
+    if not task:
+        return
+    source, target = task.get("source"), task.get("id", "")
+    work_cube = source == "work" and isinstance(target, str) and target.startswith("work-cube:")
+    if not work_cube and source != "library":
+        return
+    cid = target[len("work-cube:"):] if work_cube else None
+    note_id = (cid[len("brainalot-"):] if cid and re.fullmatch(r"brainalot-[a-f0-9]{32}", cid)
+               else target if source == "library" and isinstance(target, str) else None)
+    linked_note = bool(work_cube and note_id)
+    path = Path(root) / "state" / "shared.sqlite3"
+    if path.exists():
+        from .work_planning import deleted_cube
+        with sqlite3.connect(path) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='work_versions'").fetchone():
+                blobs = db.execute("SELECT b.body FROM work_versions v JOIN work_blobs b ON b.hash=v.state_blob ORDER BY v.revision DESC LIMIT 1").fetchall()
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='work_cube_deletes'").fetchone():
+                    if note_id and db.execute("SELECT 1 FROM work_cube_deletes WHERE note_id=? LIMIT 1", (note_id,)).fetchone():
+                        linked_note = True
+                    if note_id and db.execute("SELECT 1 FROM work_cube_deletes WHERE note_id=? AND status='pending' LIMIT 1", (note_id,)).fetchone():
+                        raise ConflictError("Связанная запись удаляется; её таймер нельзя запустить")
+                    blobs += db.execute("SELECT b.body FROM work_cube_deletes d JOIN work_blobs b ON b.hash=d.state_blob WHERE d.status='pending'").fetchall()
+                if work_cube:
+                    for blob in blobs:
+                        state = json.loads(blob[0])
+                        planning = state.get("planning") or {}
+                        cancellations = state.get("period_planner", {}).get("cancellations", {})
+                        legacy_group = cid.rsplit("-day-", 1)[0] if cid.startswith("calendar-offer-series-") and "-day-" in cid else None
+                        if deleted_cube(planning, cid) or cid in cancellations or legacy_group in cancellations:
+                            raise ConflictError("Кубик удаляется или уже удалён; его таймер нельзя запустить")
+                        native_cubes = planning.get("constructor", {}).get("cubes", {})
+                        native = native_cubes.get(cid, {})
+                        ext = state.get("period_planner", {})
+                        absorbed = {source for merge in ext.get("merges", {}).values() for source in merge.get("source_ids", [])}
+                        if cid in absorbed:
+                            raise ConflictError("Кубик объединён; его прежний таймер нельзя запустить")
+                        if cid.startswith(("repeat-instance-", "manual-cube-", "merged-", "planned-")):
+                            forecast = (cid.startswith("planned-") and any(row.get("id") == cid[len("planned-"):]
+                                and not row.get("manual") and not row.get("locked") and not row.get("allocation_stale")
+                                for row in planning.get("result", {}).get("cubes", [])))
+                            exists = (cid in native_cubes or cid in ext.get("merged_cubes", {})
+                                      or cid in ext.get("retained_cubes", {}) or forecast)
+                            if not exists:
+                                raise ConflictError("Кубик больше недоступен; его таймер нельзя запустить")
+                        if native.get("kind") == "brainalot" and native.get("source_ref"):
+                            note_id, linked_note = native["source_ref"], True
+                if note_id and db.execute("SELECT 1 FROM sqlite_master WHERE name='work_cube_deletes'").fetchone():
+                    if db.execute("SELECT 1 FROM work_cube_deletes WHERE note_id=? AND status='pending' LIMIT 1", (note_id,)).fetchone():
+                        raise ConflictError("Связанная запись удаляется; её таймер нельзя запустить")
+    journal = Path(root) / "state" / "journal.sqlite3"
+    if note_id and journal.exists():
+        with sqlite3.connect(journal) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='operations'").fetchone():
+                if db.execute("SELECT 1 FROM operations WHERE note_id=? AND status='pending' LIMIT 1", (note_id,)).fetchone():
+                    raise ConflictError("Связанная запись изменяется или удаляется; её таймер нельзя запустить")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='work_note_requests'").fetchone():
+                linked_note = linked_note or bool(db.execute("SELECT 1 FROM work_note_requests WHERE note_id=? LIMIT 1", (note_id,)).fetchone())
+    # Unknown legacy library TaskRefs remain valid; proven linked Note sources
+    # must still exist. Work/Note reads are closed before acquiring the note lock.
+    if note_id and linked_note:
+        from .work_period.library_rules import LibraryReader
+        note = next((row for row in LibraryReader(root).notes() if row.get("id") == note_id), None)
+        if not note or note.get("kind") != "task" or note.get("status") not in {"active", "done"}:
+            raise ConflictError("Связанная задача Brainalot недоступна; её таймер нельзя запустить")
 
 
 def guard_note_undo(root, operation_id):
@@ -362,7 +479,7 @@ def delete_cube(work, command):
             state = json.loads(work._blob(db, current["state_blob"]))
             images = [{key: image[key] for key in ("id", "blob", "mime")} for image in json.loads(current["images"])]
         store = Store(work.root)
-        with store.lock:
+        with timer_reservation_many(work.root, [cid]), store.lock:
             cube = resolve_cube(state.get("planning", {}), cid, store)
             guard_active_timer(work.root, cid, cube.get("blueprint_ref"))
             note_id = cube.get("source_ref") if cube["kind"] == "brainalot" else None
@@ -380,7 +497,7 @@ def delete_cube(work, command):
             raw = encoded(state).encode()
             digest = hashlib.sha256(raw).hexdigest()
             operation_id = hashlib.sha256(("work-cube-delete:"+command["request_id"]).encode()).hexdigest()[:32] if note_id else None
-            with timer_reservation(work.root, cid, cube.get("blueprint_ref")), work.db() as db:
+            with work.db() as db:
                 ensure_writable(db)
                 work.check_revision(command, work._version(db)["revision"])
                 db.execute("INSERT OR IGNORE INTO work_blobs VALUES(?,?)", (digest, raw))

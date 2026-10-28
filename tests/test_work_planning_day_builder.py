@@ -86,10 +86,10 @@ def test_budget_rejects_unstarted_but_preserves_accepted_actual_and_allows_next_
     selected = op(work, "add-90", "day_cube_add",
                   {"date": "2027-01-05", "task_id": "a", "minutes": 90})
     first = cubes(selected, "2027-01-05")[0]
-    before = work.read()
-    with pytest.raises(ValidationError, match="верните"):
-        op(work, "too-low", "day_budget", {"date": "2027-01-05", "minutes": 0})
-    assert work.read() == before
+    # A budget below the chosen cubes is only a reading (decision 2026-10-28).
+    op(work, "too-low", "day_budget", {"date": "2027-01-05", "minutes": 0})
+    assert cubes(work.read(), "2027-01-05")[0]["id"] == first["id"]
+    op(work, "restore-budget", "day_budget", {"date": "2027-01-05", "minutes": 150})
     op(work, "half", "cube_progress",
        {"cube_id": first["id"], "percent": 50, "actual_minutes": 40})
     immediate = work.read()["state"]["planning"]["result"]

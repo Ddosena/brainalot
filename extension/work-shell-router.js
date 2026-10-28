@@ -31,10 +31,10 @@ export function createWorkShellRouter({frame,api,parentWindow,origin,baseUrl=ori
   }
   async function start(){
     publish({busy:true,error:''});
-    try{const saved=await api('/api/work/period/context');if(disposed)return;mount(current.mode,current.date||(validWorkDate(saved.context?.date)?saved.context.date:null));return true;}
+    try{const saved=await api('/api/work/period/context');if(disposed)return;mount(current.mode,current.date||(saved.planning_initialized!==false&&validWorkDate(saved.context?.date)?saved.context.date:null));return true;}
     catch(error){publish({busy:false,error:error.message});return false;}
   }
-  async function navigate(value){
+  async function navigate(value,requestedDate){
     const mode=workMode(value);
     if(disposed || current.busy || !current.ready || mode===current.mode)return false;
     publish({busy:true,error:''});
@@ -47,10 +47,11 @@ export function createWorkShellRouter({frame,api,parentWindow,origin,baseUrl=ori
       });
       if(disposed)return false;
       if(answer.ok!==true)throw new Error(answer.error||t('Сохраните изменения перед переходом.'));
-      const date=validWorkDate(answer.date)?answer.date:current.date;
+      const date=validWorkDate(requestedDate)?requestedDate:validWorkDate(answer.date)?answer.date:current.date;
       const saved=await api('/api/work/period/context');
       const patch={...(validWorkDate(date)?{date,week_start:monday(date),window_start:monday(date)}:{}),mode:'week'};
-      await api('/api/work/period/context','POST',{request_id:requestId(),expected_revision:saved.revision,patch});
+      // An empty Work has no plan to remember a view in; its start screen needs none.
+      if(saved.planning_initialized!==false)await api('/api/work/period/context','POST',{request_id:requestId(),expected_revision:saved.revision,patch});
       if(disposed)return false;
       mount(mode,date);return true;
     }catch(error){if(!disposed)publish({busy:false,error:error.message||String(error)});return false;}

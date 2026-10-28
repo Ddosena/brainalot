@@ -78,6 +78,62 @@ def command(planner, action, data, request_id=None, revision=None):
         "action": action, "data": data})
 
 
+def test_native_all_day_offer_preserves_identity_estimate_and_cancellation(planner):
+    offer = next(c for c in planner.model()['cubes'] if c.get('source_event_id') == 'all-day')
+    assert offer['duration_unknown'] and offer['source_date'] == '2027-01-06'
+    assert offer['all_day'] and offer['source_end_date'] == '2027-01-07'
+    command(planner, 'calendar_offer_estimate', {'cube_id': offer['id'], 'minutes': 45})
+    command(planner, 'cube_select', {'cube_id': offer['id'], 'date': '2027-01-06'})
+    selected = next(c for c in planner.model()['cubes'] if c['id'] == offer['id'])
+    assert selected['selected_date'] == '2027-01-06' and selected['minutes'] == 45
+    command(planner, 'cube_return', {'cube_id': offer['id']})
+    command(planner, 'cube_select', {'cube_id': offer['id'], 'date': '2027-01-05'})
+    assert next(c for c in planner.model()['cubes'] if c['id'] == offer['id'])['selected_date'] == '2027-01-05'
+    command(planner, 'cube_return', {'cube_id': offer['id']})
+    command(planner, 'cube_cancel', {'cube_id': offer['id'], 'reason': 'test'})
+    assert next(c for c in planner.model()['cubes'] if c['id'] == offer['id'])['status'] == 'cancelled'
+
+
+def test_batch_creates_project_goal_and_placed_cube_atomically(planner):
+    steps = [
+        {'route': 'planning', 'action': 'manual_project', 'data': {'name': 'New QA project', 'color': '#f6bf26'}},
+        {'route': 'planning', 'action': 'manual_task', 'data': {'project_id': '$created_project', 'title': 'QA goal', 'minutes': 30,
+            'start': '2027-01-06', 'end': '2027-01-06', 'volume_by_cubes': True}},
+        {'route': 'planning', 'action': 'manual_cube', 'data': {'task_id': '$created_task', 'title': 'QA cube', 'minutes': 30, 'date': '2027-01-06'}},
+        {'route': 'period', 'action': 'cube_drop', 'data': {'cube_id': '$created_cube', 'date': '2027-01-06', 'start': None}},
+    ]
+    result = command(planner, 'ui_batch', {'commands': steps})
+    project = next(p for p in result['projects'] if p['title'] == 'New QA project')
+    goal = next(t for t in result['tasks'] if t['title'] == 'QA goal')
+    cube = next(c for c in result['cubes'] if c['title'] == 'QA cube')
+    assert goal['project_id'] == project['id'] and cube['task_id'] == goal['id'] and cube['selected_date'] == '2027-01-06'
+
+
+def test_create_batch_rolls_back_all_rows_when_last_step_fails(planner):
+    before = deepcopy(planner.store.read())
+    steps = [
+        {'route': 'planning', 'action': 'manual_project', 'data': {'name': 'Rollback QA', 'color': '#f6bf26'}},
+        {'route': 'planning', 'action': 'manual_task', 'data': {'project_id': '$created_project', 'title': 'QA goal', 'minutes': 30}},
+        {'route': 'planning', 'action': 'manual_cube', 'data': {'task_id': '$created_task', 'title': 'QA cube', 'minutes': 30}},
+        {'route': 'period', 'action': 'cube_drop', 'data': {'cube_id': '$created_cube', 'date': 'invalid', 'start': None}},
+    ]
+    with pytest.raises(ValidationError): command(planner, 'ui_batch', {'commands': steps})
+    assert planner.store.read() == before
+
+
+def test_imported_offer_does_not_revive_cancelled_native_occurrence():
+    state, source, _ = color_source_state()
+    calendar_rules.apply_import(state, source)
+    before = model.read_model({'state': state, 'revision': 1})
+    offer = next(c for c in before['cubes'] if c.get('calendar_role') == 'optional_day')
+    record = state['period_planner']['calendar_source']['events'][offer['source_event_id']]
+    native = next(e for e in state['planning']['calendar']['events'] if e['id'] == record['native_event_id'])
+    native['status'] = 'cancelled'
+    after = model.read_model({'state': state, 'revision': 1})
+    row = next(c for c in after['cubes'] if c['id'] == offer['id'])
+    assert row['status'] == 'cancelled' and not row['available']
+
+
 
 
 def test_period_metadata_only_and_outside_selection_preserved(planner):
@@ -88,11 +144,11 @@ def test_period_metadata_only_and_outside_selection_preserved(planner):
     command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-05"})
     before = planner.store.read()
     command(planner, "period_set", {"task_id": "a", "start": "2027-01-06", "end": "2027-01-10"})
-    assert next(c for c in planner.model()["cubes"] if c["id"] == "geometry")["selected_date"] == "2027-01-05"
+    assert next(c for c in planner.model()["cubes"] if c["id"] == "geometry")["selected_date"] is None
     assert planner.store.read()["state"]["planning"] == before["state"]["planning"]
     command(planner, "period_clear", {"task_id": "a"})
     assert not next(t for t in planner.model()["tasks"] if t["id"] == "a")["period_explicit"]
-    assert next(c for c in planner.model()["cubes"] if c["id"] == "geometry")["selected_date"] == "2027-01-05"
+    assert next(c for c in planner.model()["cubes"] if c["id"] == "geometry")["selected_date"] is None
 
 
 def test_durable_cas_replay_collision_and_reopen(planner):
@@ -260,9 +316,9 @@ def test_conflict_time_and_daily_budget_are_atomic(planner):
     with pytest.raises(ValidationError, match="пересекается"):
         command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-07", "start": "19:00"})
     assert planner.store.read() == before
-    with pytest.raises(ValidationError, match="рабочее окно"):
-        command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-05", "start": "10:00"})
-    assert planner.store.read() == before
+    # Any hour is allowed now; only the overlap above is refused.
+    command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-05", "start": "10:00"})
+    assert next(cube for cube in planner.model()["cubes"] if cube["id"] == "geometry")["start"] == "10:00"
 
 
 
@@ -329,8 +385,9 @@ def test_calendar_source_exact_identity_roles_and_idempotent_import(color_planne
     assert replay == result and planner.store.read()["revision"] == saved["revision"]
     rows = result["cubes"]
     sage = [cube for cube in rows if cube.get("calendar_role") == "evergreen"]
-    assert len(sage) == 1 and len(sage[0]["source_occurrences"]) == 2
-    assert len([cube for cube in rows if cube.get("calendar_role") == "optional_day"]) == 2
+    assert len(sage) == 2 and {c["source_date"] for c in sage} == {"2027-01-11", "2027-01-18"}
+    assert all(len(c["source_occurrences"]) == 1 for c in sage)
+    assert len([cube for cube in rows if cube.get("calendar_role") == "optional_day"]) == 3  # includes native all-day event
     assert not {ids["gray"], ids["gray-all-day"], ids["sage-series_20270111"]} & {event["id"] for event in result["events"]}
     assert len([event for event in result["events"] if event["id"] in {"calendar-webinar", "live-webinar"}]) == 1
     assert next(event for event in result["events"] if event["id"] == "calendar-webinar")["conflict"]
@@ -361,11 +418,12 @@ def test_optional_unknown_duration_any_day_gray_date_and_single_busy_copy(color_
     command(planner, "calendar_source_import", {"source": source})
     sage = next(cube for cube in planner.model()["cubes"] if cube.get("calendar_role") == "evergreen")
     gray = next(cube for cube in planner.model()["cubes"] if cube.get("source_event_id") == ids["gray"])
-    assert sage["duration_unknown"] and sage["minutes"] == 0 and sage["available"] and sage["availability"] == "any_day"
+    assert sage["duration_unknown"] and sage["minutes"] == 0 and sage["available"] and sage["availability"] == "day"
     with pytest.raises(ValidationError, match="длительность"):
-        command(planner, "cube_select", {"cube_id": sage["id"], "date": "2027-02-05"})
+        command(planner, "cube_select", {"cube_id": sage["id"], "date": sage["source_date"]})
     command(planner, "calendar_offer_estimate", {"cube_id": sage["id"], "minutes": 90})
-    command(planner, "cube_select", {"cube_id": sage["id"], "date": "2027-02-05", "start": "23:00"})
+    command(planner, "cube_select", {"cube_id": sage["id"], "date": sage["source_date"], "start": "23:00"})
+    command(planner, "cube_move", {"cube_id": sage["id"], "date": "2027-02-05", "start": "23:00"})
     selected = next(cube for cube in planner.model()["cubes"] if cube["id"] == sage["id"])
     assert selected["end"] == "00:30" and selected["end_date"] == "2027-02-06"
     assert not any(event["id"] == sage["source_event_id"] for event in planner.model()["events"])
@@ -391,14 +449,14 @@ def test_calendar_move_and_optional_choice_obey_budget_conflicts(color_planner):
     sage = next(cube for cube in planner.model()["cubes"] if cube.get("calendar_role") == "evergreen")
     command(planner, "calendar_offer_estimate", {"cube_id": sage["id"], "minutes": 300})
     before = planner.store.read()
-    with pytest.raises(ValidationError, match="Дневной лимит"):
-        command(planner, "cube_select", {"cube_id": sage["id"], "date": "2027-01-05"})
-    assert planner.store.read() == before
+    # A full day is the owner's choice: the offer is placed, not refused.
+    command(planner, "cube_select", {"cube_id": sage["id"], "date": sage["source_date"]})
+    assert next(cube for cube in planner.model()["cubes"] if cube["id"] == sage["id"])["selected_date"] == sage["source_date"]
     # Calendar-only freedom does not loosen ordinary Work task placement.
     with pytest.raises(ValidationError, match="горизонта"):
         command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-02-05"})
-    with pytest.raises(ValidationError, match="рабочее окно"):
-        command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-09", "start": "22:15"})
+    # A late hour is allowed (decision 2026-10-28).
+    command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-09", "start": "22:15"})
 
 
 def test_calendar_event_context_persists_and_rejects_unknown_ids(color_planner):
@@ -421,7 +479,8 @@ def test_flex_move_derives_unstarted_prep_but_keeps_selected_and_factual_dates(c
     planner, source, ids = color_planner
     command(planner, "calendar_source_import", {"source": source})
     command(planner, "calendar_event_move", {"event_id": ids["flex"], "date": "2027-02-02", "start": "22:15"})
-    row = next(cube for cube in planner.model()["cubes"] if cube["id"] == "linked-prep")
+    assert all(cube["id"] != "linked-prep" for cube in planner.model()["cubes"])
+    row = next(cube for cube in model.read_model({"state": planner.store.read()["state"], "revision": 0, "_include_hidden_prep": True})["cubes"] if cube["id"] == "linked-prep")
     assert row["planned_date"] == "2027-02-02" and row["calendar_event_id"] == ids["flex"]
     command(planner, "cube_select", {"cube_id": row["id"], "date": "2027-02-02", "start": "18:00"})
     command(planner, "calendar_event_move", {"event_id": ids["flex"], "date": "2027-02-03", "start": "22:15"})
@@ -440,13 +499,14 @@ def test_missing_provider_rows_keep_prior_offers_and_known_provider_can_become_f
     command(planner, "calendar_source_import", {"source": source})
     saga = next(cube for cube in planner.model()["cubes"] if cube.get("calendar_role") == "evergreen")
     command(planner, "calendar_offer_estimate", {"cube_id": saga["id"], "minutes": 45})
-    command(planner, "cube_select", {"cube_id": saga["id"], "date": "2027-02-02"})
+    command(planner, "cube_select", {"cube_id": saga["id"], "date": saga["source_date"]})
+    command(planner, "cube_move", {"cube_id": saga["id"], "date": "2027-02-02"})
     set_context(planner, {"cube_id": saga["id"]})
     missing = deepcopy(source)
     missing["events"] = [event for event in missing["events"] if not event["id"].startswith("sage-series")]
     command(planner, "calendar_source_import", {"source": missing})
     preserved = next(cube for cube in planner.model()["cubes"] if cube["id"] == saga["id"])
-    assert preserved["selected_date"] == "2027-02-02" and len(preserved["source_occurrences"]) == 2
+    assert preserved["selected_date"] == "2027-02-02" and len(preserved["source_occurrences"]) == 1
     assert planner.model()["context"]["cube_id"] == saga["id"]
     assert any("прежние данные и выбор сохранены" in warning for warning in planner.model()["warnings"])
     fixed = deepcopy(source)
@@ -593,11 +653,13 @@ def test_native_facts_after_overlay_merge_are_authoritative_and_protect_composit
     assert current['historical_facts'][0]['cube_id'] == 'geometry'
     assert current['status'] == 'started' and not current['can_delete']
     for action, data in [('cube_delete', {'cube_id': merged['id']}),
-                         ('cube_return', {'cube_id': merged['id']}),
                          ('cube_merge', {'cube_ids': [merged['id'], 'other'], 'title': 'Unsafe'})]:
         with pytest.raises(ValidationError, match='факты'):
             command(planner, action, data)
     assert planner.snapshot() == native
+    returned = command(planner, 'cube_return', {'cube_id': merged['id']})
+    assert next(c for c in returned['cubes'] if c['id'] == merged['id'])['selected_date'] is None
+    assert planner.snapshot()['state']['planning'] == native['state']['planning']
 
 
 def test_native_delete_after_overlay_merge_does_not_resurrect_source(planner):
@@ -607,7 +669,7 @@ def test_native_delete_after_overlay_merge_does_not_resurrect_source(planner):
         'action': 'cube_delete', 'data': {'cube_id': 'geometry'}})
     effective = planner.model()
     current = next(cube for cube in effective['cubes'] if cube['id'] == merged['id'])
-    assert current['allocation_stale'] and not current['available'] and not current['can_delete']
+    assert current['allocation_stale'] and not current['available'] and current['can_delete']
     assert current['changed_source_ids'] == ['geometry']
     assert any('Состав исходных этапов' in warning for warning in effective['warnings'])
     before = planner.snapshot()
@@ -746,10 +808,9 @@ def test_native_day_specific_budgets_override_default_and_project_without_mutati
     assert projected['settings']['daily_limit_minutes'] == 300
     assert projected['settings']['daily_limit_minutes_by_date']['2027-01-05'] == 450
     calendar_rules.validate_slot(projected, '2027-01-05', 420, None)
-    with pytest.raises(ValidationError, match='450'):
-        calendar_rules.validate_slot(projected, '2027-01-05', 451, None)
-    with pytest.raises(ValidationError, match='300'):
-        calendar_rules.validate_slot(projected, '2027-01-06', 301, None)
+    # Limits are shown, never enforced (decision 2026-10-28).
+    calendar_rules.validate_slot(projected, '2027-01-05', 451, None)
+    calendar_rules.validate_slot(projected, '2027-01-06', 301, None)
     assert state == before
 
 
@@ -810,8 +871,8 @@ def test_effective_parent_scope_prevents_overselecting_superseded_forecasts():
     large = deepcopy(state['planning']['constructor']['cubes']['other'])
     large.update(id='large-retained', minutes=550)
     state['period_planner']['retained_cubes'] = {'large-retained': large}
-    with pytest.raises(ValidationError, match='действующий остаток'):
-        model.apply_command(state, 'cube_select', {'cube_id': 'large-retained', 'date': '2027-01-05'})
+    placed = model.apply_command(state, 'cube_select', {'cube_id': 'large-retained', 'date': '2027-01-05'})
+    assert placed['period_planner']['placements']['large-retained']['date'] == '2027-01-05'
 
 
 def test_moving_existing_selection_does_not_add_parent_allocation_after_drift():
@@ -849,3 +910,416 @@ def test_native_completion_after_overlay_cancellation_keeps_facts_and_only_unfin
     assert task['effective_remaining_minutes'] == 540
     assert cube['actual_minutes'] == 12 and cube['progress_percent'] == 25
     assert cube['status'] == 'cancelled' and not cube['can_delete']
+
+
+def test_shift_moves_cubes_deadline_and_undo_preserves_unrelated_edit(planner):
+    command(planner, "period_set", {"task_id": "a", "start": "2027-01-05", "end": "2027-01-07"})
+    command(planner, "cube_select", {"cube_id": "geometry", "date": "2027-01-05", "start": "15:00"})
+    shifted = command(planner, "period_shift", {"task_id": "a", "start": "2027-01-06", "end": "2027-01-08"})
+    row = next(c for c in shifted['cubes'] if c['id'] == 'geometry')
+    assert (row['selected_date'], row['start']) == ('2027-01-06', '15:00')
+    assert next(t for t in shifted['tasks'] if t['id'] == 'a')['deadline'] == '2027-01-18'
+    command(planner, 'task_rename', {'task_id': 'b', 'title': 'Independent'})
+    result = command(planner, 'undo', {'revision': shifted['revision']})
+    assert next(t for t in result['tasks'] if t['id'] == 'b')['title'] == 'Independent'
+    assert next(c for c in result['cubes'] if c['id'] == 'geometry')['selected_date'] == '2027-01-05'
+
+
+def test_undo_refuses_changed_entity(planner):
+    changed = command(planner, 'task_rename', {'task_id': 'a', 'title': 'First'})
+    command(planner, 'task_rename', {'task_id': 'a', 'title': 'Second'})
+    before = planner.store.read()
+    with pytest.raises(ConflictError):
+        command(planner, 'undo', {'revision': changed['revision']})
+    assert planner.store.read() == before
+
+
+def test_completion_uses_real_cube_average_and_reopens(planner):
+    snapshot = planner.store.read()
+    state = deepcopy(snapshot['state'])
+    state['planning']['completed_cubes']['geometry'] = {'task_id': 'a', 'date': '2027-01-05', 'planned_minutes': 60, 'percent': 100, 'actual_minutes': 0}
+    view = model.read_model({'state': state, 'revision': 1})
+    task = next(t for t in view['tasks'] if t['id'] == 'a')
+    assert task['progress_percent'] == 33
+    assert task['status'] == 'started' and task['completed_on'] is None
+
+
+def test_cube_sources_validate_and_preserve_notes():
+    from megamozg.work_period.cube_ops import validate_details
+    row = {'kind': 'task', 'links': [], 'groups': []}
+    sources = [{'id': 'a', 'url': '', 'text': 'note'}, {'id': 'b', 'url': 'https://example.com', 'text': ''}]
+    assert validate_details(row, {'sources': sources}, {})['sources'] == sources
+    with pytest.raises(ValidationError):
+        validate_details(row, {'sources': [{'id': 'x', 'url': 'javascript:alert(1)', 'text': 'bad'}]}, {})
+
+
+def test_color_match_and_legacy_assignments_both_make_points():
+    from megamozg.work_period import color_rules
+    state = {'period_planner': {'calendar_colors': {'#d50000': 'legacy'}}}
+    projects = [{'id': 'legacy', 'color': '#123456'}, {'id': 'owner', 'color': '#d50000'}]
+    events = [{'id': 'event', 'kind': 'calendar', 'color': '#d50000', 'date': '2027-01-05',
+               'title': 'Webinar', 'start': '12:00', 'end': '13:00'}]
+    result = color_rules.enrich(state, projects, events, events)
+    assert all(p['calendar_points'][0]['calendar_event_id'] == 'event' for p in result)
+
+
+def test_agent_goal_owner_override_and_tombstone_leave_facts(planner):
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05'})
+    revision = planner.store.read()['revision']
+    planner.day_command({'request_id': 'fact', 'expected_revision': revision, 'action': 'cube_progress',
+                         'data': {'cube_id': 'geometry', 'percent': 40}})
+    facts = deepcopy(planner.store.read()['state']['planning']['completed_cubes'])
+    revision = planner.store.read()['revision']
+    planner.day_command({'request_id': 'owner-fields', 'expected_revision': revision, 'action': 'manual_task',
+        'data': {'task_id': 'a', 'project_id': 'sculpt', 'title': 'Owner', 'minutes': 90,
+                 'start': '2027-01-05', 'end': '2027-01-06', 'deadline': '2027-01-08'}})
+    view = planner.model()
+    task = next(t for t in view['tasks'] if t['id'] == 'a')
+    assert (task['project_id'], task['minutes'], task['deadline']) == ('sculpt', 90, '2027-01-08')
+    assert next(c for c in view['cubes'] if c['id'] == 'geometry')['project_id'] == 'sculpt'
+    assert planner.store.read()['state']['planning']['completed_cubes'] == facts
+    revision = planner.store.read()['revision']
+    planner.day_command({'request_id': 'delete-goal', 'expected_revision': revision, 'action': 'manual_task_delete', 'data': {'task_id': 'a'}})
+    view = planner.model()
+    assert all(t['id'] != 'a' for t in view['tasks'])
+    assert all(c.get('task_id') != 'a' for c in view['cubes'])
+    assert planner.store.read()['state']['planning']['completed_cubes'] == facts
+
+
+def test_undo_created_map_preserves_later_unrelated_entry(planner):
+    first = command(planner, 'project_visibility', {'project_id': 'print', 'visible': False})
+    command(planner, 'project_visibility', {'project_id': 'sculpt', 'visible': False})
+    view = command(planner, 'undo', {'revision': first['revision']})
+    projects = {p['id']: p for p in view['projects']}
+    assert projects['print']['visible'] is True
+    assert projects['sculpt']['visible'] is False
+
+
+def test_project_delete_hides_agent_goals_and_facts_without_erasing_and_undo(planner):
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05'})
+    planner.day_command({'request_id': 'project-fact', 'expected_revision': planner.store.read()['revision'],
+        'action': 'cube_progress', 'data': {'cube_id': 'geometry', 'percent': 40}})
+    before = deepcopy(planner.store.read()['state'])
+    deleted = planner.day_command({'request_id': 'project-delete', 'expected_revision': planner.store.read()['revision'],
+        'action': 'manual_project_delete', 'data': {'project_id': 'print'}})
+    view = planner.model()
+    assert all(p['id'] != 'print' for p in view['projects'])
+    assert all(t['project_id'] != 'print' for t in view['tasks'])
+    assert all(c.get('project_id') != 'print' for c in view['cubes'])
+    assert deleted['state']['planning'] == before['planning']
+    assert deleted['state']['projects'] == before['projects']
+    assert planner.day_model()['view_model']['projects'] == view['projects']
+    command(planner, 'undo', {'revision': deleted['revision']})
+    restored = planner.store.read()['state']
+    assert restored['planning'] == before['planning'] and restored['projects'] == before['projects']
+    assert any(c['id'] == 'geometry' and c['progress_percent'] == 40 for c in planner.model()['cubes'])
+
+
+def test_agent_deadline_edit_after_shift_and_undo_keeps_shifted_cube(planner):
+    command(planner, 'period_set', {'task_id': 'a', 'start': '2027-01-04', 'end': '2027-01-10'})
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05', 'start': '15:00'})
+    shifted = command(planner, 'period_shift', {'task_id': 'a', 'start': '2027-01-05', 'end': '2027-01-11'})
+    assert next(t for t in shifted['tasks'] if t['id'] == 'a')['deadline'] == '2027-01-18'
+    edited = planner.day_command({'request_id': 'agent-owner-deadline', 'expected_revision': shifted['revision'],
+        'action': 'manual_task', 'data': {'task_id': 'a', 'project_id': 'print', 'title': 'Edited', 'minutes': 600,
+            'start': '2027-01-05', 'end': '2027-01-11', 'deadline': '2027-01-15'}})
+    assert next(t for t in planner.model()['tasks'] if t['id'] == 'a')['deadline'] == '2027-01-15'
+    view = command(planner, 'undo', {'revision': edited['revision']})
+    assert next(t for t in view['tasks'] if t['id'] == 'a')['deadline'] == '2027-01-18'
+    cube = next(c for c in view['cubes'] if c['id'] == 'geometry')
+    assert (cube['selected_date'], cube['start']) == ('2027-01-06', '15:00')
+
+
+def test_unknown_calendar_offer_accepts_exact_drop_estimate(color_planner):
+    planner, source, _ = color_planner
+    command(planner, 'calendar_source_import', {'source': source})
+    offer = next(c for c in planner.model()['cubes'] if c.get('calendar_role') == 'evergreen')
+    result = command(planner, 'cube_drop', {'cube_id': offer['id'], 'date': offer['source_date'],
+        'start': '10:00', 'minutes': 45})
+    row = next(c for c in result['cubes'] if c['id'] == offer['id'])
+    assert (row['minutes'], row['start'], row['end']) == (45, '10:00', '10:45')
+    assert row['source_duration_minutes'] is None
+
+
+def test_prep_cleanup_preserves_selected_factual_and_original_sources(tmp_path):
+    state = synthetic_state()
+    planning = state['planning']
+    row = next(day for day in planning['result']['days'] if day['date'] == '2027-01-05')
+    specs = [('prep-clean', 25), ('prep-selected', 30), ('prep-factual', 35), ('prep-custom', 40)]
+    for ref, minutes in specs:
+        row.setdefault('prep_cubes', []).append({'id': ref, 'date': '2027-01-05', 'minutes': minutes})
+        wp._constructor_cube_update(planning, {'cube_id': 'constructor:' + ref, 'kind': 'prep', 'source_ref': ref,
+            'title': 'Подготовка к уроку ', 'minutes': minutes})
+    planning['constructor']['cubes']['constructor:prep-custom']['title'] = 'Owner renamed'
+    planning.setdefault('prep_progress', {})['prep-factual'] = {'date': '2027-01-05', 'percent': 20, 'actual_minutes': 4}
+    state.setdefault('period_planner', {}).setdefault('placements', {})['constructor:prep-selected'] = {'date': '2027-01-05', 'start': None}
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    view = planner.model()
+    assert all(c['id'] != 'constructor:prep-clean' for c in view['cubes'])
+    assert {'constructor:prep-selected', 'constructor:prep-factual', 'constructor:prep-custom'} <= {c['id'] for c in view['cubes']}
+    custom = next(c for c in view['cubes'] if c['id'] == 'constructor:prep-custom')
+    assert custom['retained_preparation'] and custom['repeatable_instance'] and custom['repeatable_id'] == 'prep-universal'
+    assert custom['activity_kind'] == 'work'
+    assert view['prep_cleanup_preview']['native_removable'] == 1
+    assert view['prep_cleanup_preview']['native_minutes_counts'] == [{'minutes': 25, 'count': 1}]
+    before = deepcopy(planner.snapshot()['state'])
+    cleaned = command(planner, 'prep_repeatable_cleanup', {})
+    after = planner.snapshot()['state']
+    cubes = after['planning']['constructor']['cubes']
+    assert 'constructor:prep-clean' not in cubes
+    assert {'constructor:prep-selected', 'constructor:prep-factual', 'constructor:prep-custom'} <= set(cubes)
+    assert after['planning']['calendar'] == before['planning']['calendar']
+    assert after['planning']['tasks'] == before['planning']['tasks']
+    assert after['planning']['prep_progress'] == before['planning']['prep_progress']
+    assert any(item['id'] == 'prep-universal' for item in cleaned['repeatables'])
+    command(planner, 'undo', {'revision': cleaned['revision']})
+    assert planner.snapshot()['state']['planning']['constructor']['cubes']['constructor:prep-clean'] == before['planning']['constructor']['cubes']['constructor:prep-clean']
+
+
+def test_optional_calendar_activity_defaults_to_personal(color_planner):
+    planner, source, _ = color_planner
+    result = command(planner, 'calendar_source_import', {'source': source})
+    assert all(c['activity_kind'] == 'personal' for c in result['cubes'] if c['kind'] == 'calendar_optional')
+    assert all(c['activity_kind'] == 'work' for c in result['cubes'] if c['kind'] == 'task')
+
+
+def test_agent_goal_early_cube_is_independent_through_shift_and_shrink(planner):
+    command(planner, 'period_set', {'task_id': 'a', 'start': '2027-01-08', 'end': '2027-01-10'})
+    native_before = deepcopy(planner.snapshot()['state']['planning'])
+    placed = command(planner, 'cube_drop', {'cube_id': 'geometry', 'date': '2027-01-05', 'start': '15:00'})
+    goal = next(t for t in placed['tasks'] if t['id'] == 'a')
+    cube = next(c for c in placed['cubes'] if c['id'] == 'geometry')
+    assert (goal['start'], goal['end']) == ('2027-01-08', '2027-01-10')
+    assert (cube['selected_date'], cube['independent']) == ('2027-01-05', True)
+    shifted = command(planner, 'period_shift', {'task_id': 'a', 'start': '2027-01-09', 'end': '2027-01-11'})
+    assert next(c for c in shifted['cubes'] if c['id'] == 'geometry')['selected_date'] == '2027-01-05'
+    narrowed = command(planner, 'period_set', {'task_id': 'a', 'start': '2027-01-10', 'end': '2027-01-11'})
+    assert next(c for c in narrowed['cubes'] if c['id'] == 'geometry')['selected_date'] == '2027-01-05'
+    assert planner.snapshot()['state']['planning'] == native_before
+
+
+def test_calendar_series_projects_each_proven_day_and_selection_is_independent(color_planner):
+    planner, source, _ = color_planner
+    imported = command(planner, 'calendar_source_import', {'source': source})
+    rows = [c for c in imported['cubes'] if c.get('calendar_role') == 'evergreen']
+    assert {c['source_date'] for c in rows} == {'2027-01-11', '2027-01-18'}
+    assert len({c['id'] for c in rows}) == 2
+    assert all(c['availability'] == 'day' and len(c['source_occurrences']) == 1 for c in rows)
+    first = next(c for c in rows if c['source_date'] == '2027-01-11')
+    second = next(c for c in rows if c['source_date'] == '2027-01-18')
+    selected = command(planner, 'cube_drop', {'cube_id': first['id'], 'date': first['source_date'], 'start': '12:00', 'minutes': 30})
+    assert next(c for c in selected['cubes'] if c['id'] == first['id'])['selected_date'] == first['source_date']
+    other = next(c for c in selected['cubes'] if c['id'] == second['id'])
+    assert other['available'] and other['selected_date'] is None
+    before = planner.snapshot()
+    with pytest.raises(ValidationError, match='предложенный'):
+        command(planner, 'cube_drop', {'cube_id': second['id'], 'date': first['source_date'], 'start': '13:00', 'minutes': 30})
+    assert planner.snapshot() == before
+    moved = command(planner, 'cube_move', {'cube_id': first['id'], 'date': '2027-01-12', 'start': '12:00'})
+    assert next(c for c in moved['cubes'] if c['id'] == first['id'])['selected_date'] == '2027-01-12'
+    assert next(c for c in moved['cubes'] if c['id'] == second['id'])['available']
+
+
+def test_calendar_old_grouped_choice_is_preserved_without_migration(color_planner):
+    planner, source, _ = color_planner
+    command(planner, 'calendar_source_import', {'source': source})
+    state = deepcopy(planner.snapshot()['state'])
+    record = next(r for r in state['period_planner']['calendar_source']['events'].values() if r['calendar_role'] == 'evergreen')
+    old_id = calendar_rules.offer_id(record)
+    state['period_planner'].setdefault('placements', {})[old_id] = {'date': '2027-01-11', 'start': '12:00'}
+    state['period_planner'].setdefault('calendar_offer_estimates', {})[old_id] = 30
+    before = deepcopy(state)
+    view = model.read_model({'state': state, 'revision': 8})
+    legacy = next(c for c in view['cubes'] if c['id'] == old_id)
+    other = next(c for c in view['cubes'] if c.get('calendar_role') == 'evergreen' and c['id'] != old_id)
+    assert legacy['selected_date'] == '2027-01-11' and legacy['source_date'] == '2027-01-11'
+    assert len(legacy['source_occurrences']) == 1 and other['source_date'] == '2027-01-18' and other['available']
+    assert state == before
+
+
+def test_legacy_group_cancellation_does_not_resurrect_daily_offers(color_planner):
+    planner, source, _ = color_planner
+    command(planner, 'calendar_source_import', {'source': source})
+    state = deepcopy(planner.snapshot()['state'])
+    record = next(r for r in state['period_planner']['calendar_source']['events'].values() if r['calendar_role'] == 'evergreen')
+    old_id = calendar_rules.offer_id(record)
+    state['period_planner'].setdefault('cancellations', {})[old_id] = {
+        'reason': 'Owner removed', 'minutes': 0, 'source_ids': [], 'source': {'kind': 'calendar_optional'}}
+    before = deepcopy(state)
+    view = model.read_model({'state': state, 'revision': 1})
+    rows = [c for c in view['cubes'] if c.get('calendar_role') == 'evergreen']
+    assert len(rows) == 2 and all(c['status'] == 'cancelled' and not c['available'] for c in rows)
+    assert state == before
+
+
+def test_legacy_returned_series_keeps_factual_occurrence_identity(color_planner):
+    planner, source, _ = color_planner
+    command(planner, 'calendar_source_import', {'source': source})
+    state = deepcopy(planner.snapshot()['state'])
+    records = [r for r in state['period_planner']['calendar_source']['events'].values() if r['calendar_role'] == 'evergreen']
+    later = next(r for r in records if r['source_date'] == '2027-01-18')
+    old_id = calendar_rules.offer_id(later)
+    state['period_planner'].setdefault('placements', {})[old_id] = {'date': None, 'start': None}
+    native = state['planning'].setdefault('constructor', {}).setdefault('cubes', {})
+    native['old-calendar-fact'] = {'id': 'old-calendar-fact', 'kind': 'calendar', 'source_ref': later['id'],
+        'title': 'Prior', 'minutes': 30, 'output': '', 'steps': [], 'comment': '', 'links': [], 'groups': []}
+    state['planning']['constructor'].setdefault('source_reports', {})['old-calendar-fact'] = {
+        'date': '2027-01-18', 'percent': 20, 'actual_minutes': 4}
+    before = deepcopy(state)
+    view = model.read_model({'state': state, 'revision': 1})
+    row = next(c for c in view['cubes'] if c['id'] == old_id)
+    assert row['source_date'] == '2027-01-18' and row['progress_percent'] == 20
+    assert row['source_occurrences'][0]['event_id'] == later['id']
+    assert state == before
+
+
+def test_prep_cleanup_blocks_unselected_source_with_active_timer(tmp_path):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    state = synthetic_state()
+    prep = next(item for day in state['planning']['result']['days'] for item in day.get('prep_cubes', []))
+    cid = 'constructor:' + prep['id']
+    wp._constructor_cube_update(state['planning'], {'cube_id': cid, 'kind': 'prep', 'source_ref': prep['id'],
+        'title': 'Подготовка к уроку ' + (prep.get('lesson_start') or ''), 'minutes': prep['minutes']})
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    assert cid in model._safe_prep_ids(planner.snapshot()['state'])
+    clock = FakeClock()
+    timer = TimeStore(tmp_path, lambda: clock.wall, lambda: clock.mono)
+    running = cmd(timer, 'start', 0, 'prep-active', task={'source': 'work', 'id': 'work-cube:' + cid, 'title': 'Prep'})
+    before = planner.snapshot()
+    with pytest.raises(ConflictError):
+        command(planner, 'prep_repeatable_cleanup', {})
+    assert planner.snapshot() == before
+    cmd(timer, 'stop', running['revision'], 'prep-stop')
+    command(planner, 'prep_repeatable_cleanup', {})
+    assert cid not in planner.snapshot()['state']['planning']['constructor']['cubes']
+
+
+def test_prep_cleanup_never_restores_explicitly_deleted_builtin(tmp_path):
+    state = synthetic_state()
+    planning = state['planning']
+    day = next(row for row in planning['result']['days'] if row['date'] == '2027-01-05')
+    for source, minutes in (('prep-clean', 25), ('prep-selected', 30)):
+        day.setdefault('prep_cubes', []).append({'id': source, 'date': '2027-01-05', 'minutes': minutes})
+        wp._constructor_cube_update(planning, {'cube_id': 'constructor:' + source, 'kind': 'prep',
+            'source_ref': source, 'title': 'Подготовка к уроку ', 'minutes': minutes})
+    state.setdefault('period_planner', {}).setdefault('placements', {})['constructor:prep-selected'] = {
+        'date': '2027-01-05', 'start': None}
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    command(planner, 'repeatable_delete', {'repeatable_id': 'prep-universal'})
+    assert not any(row['id'] == 'prep-universal' for row in planner.model()['repeatables'])
+    cleaned = command(planner, 'prep_repeatable_cleanup', {})
+    assert not any(row['id'] == 'prep-universal' for row in cleaned['repeatables'])
+    native = planner.snapshot()['state']['planning']['constructor']['cubes']
+    assert 'constructor:prep-clean' not in native and 'constructor:prep-selected' in native
+    restored = command(planner, 'undo', {'revision': cleaned['revision']})
+    assert not any(row['id'] == 'prep-universal' for row in restored['repeatables'])
+    assert 'constructor:prep-clean' in planner.snapshot()['state']['planning']['constructor']['cubes']
+
+
+def test_prep_cleanup_keeps_unselected_prep_with_stopped_time(tmp_path):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd, advance_active
+    state = synthetic_state()
+    prep = next(item for day in state['planning']['result']['days'] for item in day.get('prep_cubes', []))
+    cid = 'constructor:' + prep['id']
+    wp._constructor_cube_update(state['planning'], {'cube_id': cid, 'kind': 'prep', 'source_ref': prep['id'],
+        'title': 'Подготовка к уроку ' + (prep.get('lesson_start') or ''), 'minutes': prep['minutes']})
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    assert cid in model._safe_prep_ids(planner.snapshot()['state'])
+    clock = FakeClock()
+    timer = TimeStore(tmp_path, lambda: clock.wall, lambda: clock.mono)
+    running = cmd(timer, 'start', 0, 'prep-timed', task={'source': 'work', 'id': 'work-cube:' + cid, 'title': 'Prep'})
+    advance_active(timer, clock, 120_000)
+    cmd(timer, 'stop', running['revision'], 'prep-timed-stop')
+    before_native = deepcopy(planner.snapshot()['state']['planning'])
+    cleaned = command(planner, 'prep_repeatable_cleanup', {})
+    assert planner.snapshot()['state']['planning'] == before_native
+    row = next(c for c in cleaned['cubes'] if c['id'] == cid)
+    assert row['time_retained'] and row['retained_preparation'] and row['repeatable_instance']
+    assert row['progress_percent'] == 0 and row['actual_minutes'] == 0
+    assert planner.snapshot()['state']['period_planner']['time_retained'][cid] is True
+
+
+def _active_agent_forecast(planner, timer, *, pause=False):
+    from test_time_tracking import cmd
+    candidate = next(c for c in planner.model()['cubes'] if c.get('task_id') == 'b' and c.get('candidate'))
+    command(planner, 'cube_select', {'cube_id': candidate['id'], 'date': '2027-01-06'})
+    running = cmd(timer, 'start', 0, 'agent-plan-active', task={
+        'source': 'work', 'id': 'work-cube:' + candidate['id'], 'title': candidate['title'], 'activity_kind': 'work'})
+    if pause:
+        running = cmd(timer, 'pause', running['revision'], 'agent-plan-paused')
+    return candidate, running
+
+
+@pytest.mark.parametrize('paused', [False, True])
+def test_agent_import_cannot_remove_forecast_with_live_timer(planner, paused):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    forecast, running = _active_agent_forecast(planner, timer, pause=paused)
+    incoming = deepcopy(planner.snapshot()['state']['planning'])
+    incoming['tasks'] = [task for task in incoming['tasks'] if task['id'] != 'b']
+    incoming['course_catalog']['items'] = [item for item in incoming['course_catalog']['items'] if item.get('work_task_id') != 'b']
+    incoming['result'] = {}
+    before, before_timer = planner.snapshot(), timer.state()
+    payload = {'request_id': 'remove-active-agent', 'expected_revision': before['revision'], 'action': 'import', 'data': {'planning': incoming}}
+    with pytest.raises(ConflictError, match='таймера'):
+        planner.store.planning_operation(payload)
+    assert planner.snapshot() == before and timer.state() == before_timer
+    stopped = cmd(timer, 'stop', running['revision'], 'agent-plan-stop')
+    result = planner.store.planning_operation(payload)
+    assert all(task['id'] != 'b' for task in result['state']['planning']['tasks'])
+    with pytest.raises(ConflictError):
+        cmd(timer, 'start', stopped['revision'], 'agent-plan-stale-start', task={
+            'source': 'work', 'id': 'work-cube:' + forecast['id'], 'title': forecast['title']})
+
+
+def test_agent_import_keeps_unrelated_live_forecast(planner):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    forecast, running = _active_agent_forecast(planner, timer)
+    incoming = deepcopy(planner.snapshot()['state']['planning'])
+    next(task for task in incoming['tasks'] if task['id'] == 'a')['title'] = 'Changed unrelated task'
+    before_timer = timer.state()
+    result = planner.store.planning_operation({'request_id': 'unrelated-agent-update',
+        'expected_revision': planner.snapshot()['revision'], 'action': 'import', 'data': {'planning': incoming}})
+    assert next(task for task in result['state']['planning']['tasks'] if task['id'] == 'a')['title'] == 'Changed unrelated task'
+    assert any(c['id'] == forecast['id'] for c in planner.model()['cubes'])
+    assert timer.state() == before_timer and timer.state()['revision'] == running['revision']
+
+
+def test_scope_exemption_cannot_disable_forecast_with_live_timer(planner):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    _active_agent_forecast(planner, timer)
+    before, before_timer = planner.snapshot(), timer.state()
+    with pytest.raises(ConflictError, match='таймера'):
+        planner.store.planning_operation({'request_id': 'remove-scope-active', 'expected_revision': before['revision'],
+            'action': 'scope_exempt', 'data': {'task_ids': ['b'], 'exempt': True, 'reason': 'Owner decision',
+                'from_date': '2027-01-05', 'release_unstarted': True}})
+    assert planner.snapshot() == before and timer.state() == before_timer
+
+
+def test_recalculate_cannot_invalidate_live_forecast(planner, monkeypatch):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    forecast, _ = _active_agent_forecast(planner, timer)
+    original_calculate = wp.calculate
+    def recalculate_without_source(*args, **kwargs):
+        result = original_calculate(*args, **kwargs)
+        result['result']['cubes'] = [cube for cube in result['result']['cubes'] if cube['id'] != forecast['blueprint_ref']]
+        return result
+    monkeypatch.setattr(wp, 'calculate', recalculate_without_source)
+    before, before_timer = planner.snapshot(), timer.state()
+    with pytest.raises(ConflictError, match='таймера'):
+        planner.store.planning_operation({'request_id': 'recalculate-active', 'expected_revision': before['revision'],
+            'action': 'recalculate', 'data': {'from_date': '2027-01-08'}})
+    assert planner.snapshot() == before and timer.state() == before_timer

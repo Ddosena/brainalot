@@ -355,6 +355,54 @@ def test_drag_threshold_and_side_snap_do_not_command_time(tmp_path, monkeypatch)
     host.destroy()
 
 
+def test_deferred_right_drag_uses_native_press_origin_and_probe_does_not_begin(tmp_path, monkeypatch):
+    host = desktop.DesktopHost(tmp_path,8780,"test",lambda: True)
+    monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1080)])
+    host.create_windows(Webview());host.window_action("full")
+    cursor=[(100,100)]
+    monkeypatch.setattr(desktop,"cursor_position",lambda:cursor[0])
+    try:
+        origin=host.window_action("gesture_probe")["origin"]
+        assert origin==[100,100] and host._drag is None
+        before=desktop.native_rect(host.full)
+        cursor[0]=(150,130)
+        host.window_action("gesture_begin",{"edge":"","origin":origin})
+        result=host.window_action("gesture_end")
+        assert result["dragged"]
+        after=desktop.native_rect(host.full)
+        assert (after['x']-before['x'],after['y']-before['y'])==(50,30)
+    finally:host.destroy()
+
+
+def test_compact_right_drag_over_control_finishes_without_activating_it():
+    calls=[]
+    host=SimpleNamespace(widget=object(),window_action=lambda *args:calls.append(args))
+    surface=desktop.CompactSurface(host)
+    surface._schedule=lambda *_:None
+    surface._activate_control=lambda ident:calls.append(('activate',ident))
+    item={'id':'widget-play','button':2,'point':(20,30),'native_drag':True,'moved':True}
+    for action in ('begin','move','up'):surface._input.put((action,item))
+    surface._input.put(('close',None));surface._inputs()
+    assert calls==[('gesture_begin',{'origin':[20,30],'right_button':True}),('gesture_move',),('gesture_end',)]
+
+
+def test_right_drag_restores_expanded_work_before_moving(tmp_path, monkeypatch):
+    host=desktop.DesktopHost(tmp_path,8780,"test",lambda:True)
+    monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1040)])
+    host.create_windows(Webview());host.window_action("full")
+    host.full.move(200,100);host.full.resize(1000,700)
+    host.window_action("work_expand",True)
+    cursor=[(840,530)]
+    monkeypatch.setattr(desktop,"cursor_position",lambda:cursor[0])
+    try:
+        result=host.window_action("gesture_begin",{"right_button":True,"origin":[800,500]})
+        assert result["restored_work"] and host._expanded_full_geometry is None
+        assert host.window_action("gesture_end")["dragged"]
+        assert (host.full.width,host.full.height)==(1000,700)
+        assert (host.full.x,host.full.y)!=(0,0)
+    finally:host.destroy()
+
+
 @pytest.mark.parametrize("side,position", [("left", (0, 300)), ("right", (916, 300)),
                                          ("top", (420, 0)), ("bottom", (420, 752))])
 def test_four_edge_snap_and_inward_card_preserve_position(tmp_path, monkeypatch, side, position):
@@ -482,8 +530,8 @@ def test_full_geometry_migrates_once_then_preserves_manual_resize(tmp_path,monke
     host=desktop.DesktopHost(tmp_path,8780,'test',lambda:True)
     monkeypatch.setattr(host,'_areas',lambda:[area])
     migrated,_=host._rect('full')
-    assert migrated['width']==round(484*area.dpi/96)
-    assert migrated['height']==min(area.height,round(900*area.dpi/96))
+    assert migrated['width']==round(410*area.dpi/96)
+    assert migrated['height']==min(area.height,round(800*area.dpi/96))
     assert area.y<=migrated['y']<=area.y+area.height-migrated['height']
     assert desktop.DesktopState(tmp_path).data['full_geometry_layout']==desktop.FULL_GEOMETRY_LAYOUT
     manual={**migrated,'width':620,'height':650,'units':'physical','dpi':area.dpi}

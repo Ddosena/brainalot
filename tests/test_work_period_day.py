@@ -1,6 +1,9 @@
 """One effective period authority shared by the accepted Day view and new Plan."""
 from copy import deepcopy
 import pytest
+import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from megamozg.core import ConflictError, ValidationError
 from megamozg.work_period import model
 from megamozg import work_planning as wp
@@ -121,8 +124,24 @@ def test_exact_current_forecast_materializes_only_when_facts_are_committed(plann
     assert native['constructor']['cubes'][candidate['id']]['blueprint_ref'] == candidate['blueprint_ref']
     assert native['completed_cubes'][candidate['id']]['date'] == '2027-01-06'
     assert wp._constructor_selected_date(native, candidate['id']) is None
+    view = planner.model()
+    actual = [cube for cube in view['cubes'] if cube.get('task_id') == 'a' and cube.get('kind') == 'task'
+        and cube.get('status') != 'cancelled' and not cube.get('candidate')
+        and (not cube['id'].startswith('planned-') or cube['id'] in native['constructor']['cubes'])]
+    assert candidate['id'] in {cube['id'] for cube in actual}
+    assert set(next(task for task in view['tasks'] if task['id'] == 'a')['readiness_cube_ids']) == {cube['id'] for cube in actual}
+    assert next(task for task in view['tasks'] if task['id'] == 'a')['progress_percent'] == math.floor(sum(cube['progress_percent'] for cube in actual) / len(actual) + .5)
     assert sum(cube['id'] == candidate['id'] for cube in planner.model()['cubes']) == 1
     assert sum(cube['id'] == candidate['id'] for cube in planner.day_model()['planning']['result']['constructor']['cubes']) == 1
+    # All materialized cubes complete the goal even while other forecasts remain virtual.
+    complete = deepcopy(saved['state'])
+    for cube in actual:
+        complete['planning'].setdefault('completed_cubes', {})[cube['id']] = {
+            'task_id': 'a', 'date': '2027-01-06', 'planned_minutes': cube['minutes'],
+            'percent': 100, 'actual_minutes': 0}
+    closed = model.read_model({'state': complete, 'revision': saved['revision']})
+    assert any(c.get('candidate') and c.get('task_id') == 'a' for c in closed['cubes'])
+    assert next(task for task in closed['tasks'] if task['id'] == 'a')['status'] == 'completed'
 
 
 def test_composite_exact_forecast_leaves_progress_atomically_and_prorata(planner):
@@ -232,3 +251,295 @@ def test_surviving_composite_does_not_inherit_absorbed_deletion_aliases(tmp_path
     assert 'blueprint_ref' not in projection['constructor']['cubes'][merged_id]
     # Sanitization belongs only to the Day projection, never to persisted state.
     assert planner.snapshot()['state']['period_planner']['merged_cubes'][merged_id]['blueprint_ref'] == candidates[0]['blueprint_ref']
+
+
+def test_moved_started_cube_keeps_original_facts_and_report_date(planner):
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': 'geometry', 'percent': 20, 'actual_minutes': 12})
+    facts = deepcopy(planner.snapshot()['state']['planning']['completed_cubes'])
+    moved = command(planner, 'cube_drop', {'cube_id': 'geometry', 'date': '2027-01-06', 'start': '15:00'})
+    cube = next(c for c in moved['cubes'] if c['id'] == 'geometry')
+    assert (cube['selected_date'], cube['progress_percent'], cube['actual_minutes']) == ('2027-01-06', 20, 12)
+    assert planner.snapshot()['state']['planning']['completed_cubes'] == facts
+    command(planner, 'cube_return', {'cube_id': 'geometry'})
+    assert row(planner, 'geometry')['report_date'] == '2027-01-05'
+    assert planner.snapshot()['state']['planning']['completed_cubes'] == facts
+
+
+def test_completed_merged_goal_uses_leaf_report_dates(planner):
+    result = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides', 'other'], 'title': 'Combined'})
+    cube = next(c for c in result['cubes'] if c['id'].startswith('merged-'))
+    command(planner, 'cube_drop', {'cube_id': cube['id'], 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': cube['id'], 'percent': 100, 'actual_minutes': 30})
+    view = planner.model()
+    goal = next(t for t in view['tasks'] if t['id'] == 'a')
+    assert goal['status'] == 'completed' and goal['completed_on'] == datetime.now(ZoneInfo('Europe/Moscow')).date().isoformat()
+    assert goal['readiness_cube_ids'] == [cube['id']]
+
+
+def test_resize_started_agent_cube_keeps_native_facts_on_next_progress(planner):
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': 'geometry', 'percent': 20, 'actual_minutes': 12})
+    before = deepcopy(planner.snapshot()['state']['planning'])
+    changed = command(planner, 'cube_resize', {'cube_id': 'geometry', 'date': '2027-01-05',
+        'start': '14:45', 'minutes': 75})
+    row = next(c for c in changed['cubes'] if c['id'] == 'geometry')
+    assert (row['start'], row['minutes'], row['progress_percent'], row['actual_minutes']) == ('14:45', 75, 20, 12)
+    assert planner.snapshot()['state']['planning'] == before
+    command(planner, 'cube_return', {'cube_id': 'geometry'})
+    assert planner.snapshot()['state']['planning'] == before
+    send(planner, 'cube_progress', {'cube_id': 'geometry', 'percent': 40, 'actual_minutes': 16})
+    report = planner.snapshot()['state']['planning']['completed_cubes']['geometry']
+    assert (report['date'], report['percent'], report['actual_minutes'], report['planned_minutes']) == ('2027-01-05', 40, 16, 60)
+    assert planner.snapshot()['state']['planning']['constructor']['cubes']['geometry']['minutes'] == 60
+
+
+def test_resize_started_merged_cube_preserves_leaf_facts(planner):
+    result = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Combined'})
+    cube = next(c for c in result['cubes'] if c['id'].startswith('merged-'))
+    command(planner, 'cube_drop', {'cube_id': cube['id'], 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': cube['id'], 'percent': 20, 'actual_minutes': 12})
+    facts = deepcopy(planner.snapshot()['state']['planning'])
+    resized = command(planner, 'cube_resize', {'cube_id': cube['id'], 'date': '2027-01-05', 'start': '14:45', 'minutes': 120})
+    assert next(c for c in resized['cubes'] if c['id'] == cube['id'])['minutes'] == 120
+    assert planner.snapshot()['state']['planning'] == facts
+    send(planner, 'cube_progress', {'cube_id': cube['id'], 'percent': 40, 'actual_minutes': 16})
+    reports = planner.snapshot()['state']['planning']['completed_cubes']
+    assert reports['geometry']['planned_minutes'] == 60 and reports['slides']['planned_minutes'] == 45
+    assert reports['geometry']['percent'] == 40 and reports['slides']['percent'] == 40
+
+
+def test_reassign_partial_agent_cube_preserves_native_identity_and_next_fact(planner):
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': 'geometry', 'percent': 20, 'actual_minutes': 12})
+    before = deepcopy(planner.snapshot()['state']['planning'])
+    result = command(planner, 'cube_reassign', {'cube_id': 'geometry', 'task_id': 'b'})
+    cube = next(c for c in result['cubes'] if c['id'] == 'geometry')
+    goal = next(t for t in result['tasks'] if t['id'] == 'b')
+    assert (cube['task_id'], cube['source_task_id'], cube['progress_percent']) == ('b', 'a', 20)
+    assert goal['progress_percent'] == 20 and 'geometry' in goal['readiness_cube_ids']
+    assert planner.snapshot()['state']['planning'] == before
+    send(planner, 'cube_progress', {'cube_id': 'geometry', 'percent': 40, 'actual_minutes': 16})
+    native = planner.snapshot()['state']['planning']
+    assert native['constructor']['cubes']['geometry']['task_id'] == 'a'
+    report = native['completed_cubes']['geometry']
+    assert (report['task_id'], report['percent'], report['actual_minutes'], report['planned_minutes']) == ('a', 40, 16, 60)
+    assert next(t for t in planner.model()['tasks'] if t['id'] == 'b')['progress_percent'] == 40
+
+
+def test_reassign_partial_merged_cube_keeps_leaf_facts_and_undo(planner):
+    merged = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Combined'})
+    cube = next(c for c in merged['cubes'] if c['id'].startswith('merged-'))
+    command(planner, 'cube_drop', {'cube_id': cube['id'], 'date': '2027-01-05', 'start': '15:00'})
+    send(planner, 'cube_progress', {'cube_id': cube['id'], 'percent': 20, 'actual_minutes': 12})
+    original = deepcopy(planner.snapshot()['state']['planning'])
+    moved = command(planner, 'cube_reassign', {'cube_id': cube['id'], 'task_id': 'b'})
+    goal = next(t for t in moved['tasks'] if t['id'] == 'b')
+    assert goal['progress_percent'] == 20 and cube['id'] in goal['readiness_cube_ids']
+    assert planner.snapshot()['state']['planning'] == original
+    send(planner, 'cube_progress', {'cube_id': cube['id'], 'percent': 40, 'actual_minutes': 16})
+    facts = planner.snapshot()['state']['planning']['completed_cubes']
+    assert all(facts[cid]['task_id'] == 'a' and facts[cid]['percent'] == 40 for cid in ('geometry', 'slides'))
+    restored = command(planner, 'undo', {'revision': moved['revision']})
+    assert next(c for c in restored['cubes'] if c['id'] == cube['id'])['task_id'] == 'a'
+    assert planner.snapshot()['state']['planning']['completed_cubes'] == facts
+
+
+def test_day_view_model_reports_legacy_initialized_without_plan():
+    from megamozg.work_period.day import day_model
+    snapshot = {'revision': 1, 'initialized': True,
+        'state': {'version': 1, 'projects': [], 'items': [], 'boards': [{'id': 'general', 'items': []}]}}
+    view = day_model(snapshot)
+    assert view['initialized'] is True
+    assert view['view_model']['initialized'] is True
+    assert view['view_model']['planning_initialized'] is False
+
+
+def _nested_merge_with_missing_forecasts(tmp_path, shape='pairs'):
+    state = synthetic_state()
+    candidates = [c for c in model.read_model({'state': state, 'revision': 0})['cubes'] if c.get('task_id') == 'b' and c.get('candidate')][:4]
+    assert [c['minutes'] for c in candidates] == [90, 60, 60, 90]
+    for cube in candidates[:2]:
+        wp._constructor_cube_update(state['planning'], {'cube_id': cube['id'], 'kind': 'task', 'task_id': 'b',
+            'title': cube['title'], 'minutes': cube['minutes'], 'blueprint_ref': cube['blueprint_ref'], 'planned_date': cube['planned_date']})
+    planner = model.PeriodPlanner(synthetic_store(tmp_path / 'before-recalc', state))
+    if shape == 'one_plus_three':
+        first = command(planner, 'cube_merge', {'cube_ids': [c['id'] for c in candidates[1:]], 'title': 'First'})
+        first_id = next(c['id'] for c in first['cubes'] if c.get('title') == 'First')
+        final = command(planner, 'cube_merge', {'cube_ids': [candidates[0]['id'], first_id], 'title': 'All'})
+    else:
+        first = command(planner, 'cube_merge', {'cube_ids': [c['id'] for c in candidates[:2]], 'title': 'First'})
+        first_id = next(c['id'] for c in first['cubes'] if c.get('title') == 'First')
+        second = command(planner, 'cube_merge', {'cube_ids': [c['id'] for c in candidates[2:]], 'title': 'Second'})
+        second_id = next(c['id'] for c in second['cubes'] if c.get('title') == 'Second')
+        final = command(planner, 'cube_merge', {'cube_ids': [first_id, second_id], 'title': 'All'})
+    final_id = next(c['id'] for c in final['cubes'] if c.get('title') == 'All')
+    recalculated = deepcopy(planner.snapshot()['state'])
+    missing_refs = {c['blueprint_ref'] for c in candidates[2:]}
+    recalculated['planning']['result']['cubes'] = [c for c in recalculated['planning']['result']['cubes'] if c['id'] not in missing_refs]
+    return model.PeriodPlanner(synthetic_store(tmp_path / 'after-recalc', recalculated)), final_id, candidates
+
+
+def test_nested_merge_recovers_exact_lost_forecasts_only_when_progress_recorded(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path)
+    before = planner.snapshot()
+    row = next(c for c in planner.model()['cubes'] if c['id'] == merged_id)
+    assert row['minutes'] == 300 and row['available'] and not row.get('allocation_stale')
+    assert planner.snapshot() == before
+    command(planner, 'cube_drop', {'cube_id': merged_id, 'date': '2027-01-05', 'start': '12:00'})
+    saved = send(planner, 'cube_progress', {'cube_id': merged_id, 'percent': 100, 'actual_minutes': 60})
+    native = saved['state']['planning']
+    assert all(c['id'] in native['constructor']['cubes'] for c in candidates)
+    assert all(native['completed_cubes'][c['id']]['percent'] == 100 for c in candidates)
+    assert sum(native['completed_cubes'][c['id']]['planned_minutes'] for c in candidates) == 300
+    assert wp._remaining_before_deletions(native)['b'] == 0
+    goal = next(t for t in planner.model()['tasks'] if t['id'] == 'b')
+    assert goal['status'] == 'completed' and goal['completed_on'] == datetime.now(ZoneInfo('Europe/Moscow')).date().isoformat()
+
+
+def test_unproven_merge_snapshot_does_not_resurrect_or_record_facts(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path)
+    broken = deepcopy(planner.snapshot()['state'])
+    records = broken['period_planner']['merges']
+    nested = next(r for r in records.values() if candidates[2]['id'] in r['source_ids'])
+    nested['sources'][0]['minutes'] += 5
+    view = model.read_model({'state': broken, 'revision': 0})
+    row = next(c for c in view['cubes'] if c['id'] == merged_id)
+    assert row['allocation_stale'] and not row['available']
+
+
+def test_delete_unstarted_unresolved_nested_merge_preserves_native_and_undo(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path)
+    broken = deepcopy(planner.snapshot()['state'])
+    records = broken['period_planner']['merges']
+    nested = next(r for r in records.values() if candidates[2]['id'] in r['source_ids'])
+    nested['sources'][0]['minutes'] += 5
+    planner = model.PeriodPlanner(synthetic_store(tmp_path / 'broken', broken))
+    stale = next(c for c in planner.model()['cubes'] if c['id'] == merged_id)
+    assert stale['allocation_stale'] and stale['can_delete']
+    before = deepcopy(planner.snapshot()['state']['planning'])
+    deleted = command(planner, 'cube_delete', {'cube_id': merged_id})
+    assert next(c for c in deleted['cubes'] if c['id'] == merged_id)['status'] == 'cancelled'
+    assert planner.snapshot()['state']['planning'] == before
+    restored = command(planner, 'undo', {'revision': deleted['revision']})
+    assert next(c for c in restored['cubes'] if c['id'] == merged_id)['allocation_stale']
+    assert planner.snapshot()['state']['planning'] == before
+
+
+def test_unresolved_merge_with_hidden_alias_fact_cannot_be_deleted(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path)
+    state = deepcopy(planner.snapshot()['state'])
+    alias = candidates[2]['blueprint_ref']
+    state['planning'].setdefault('completed_cubes', {})[alias] = {
+        'task_id': 'b', 'date': '2027-01-05', 'planned_minutes': candidates[2]['minutes'],
+        'percent': 20, 'actual_minutes': 4}
+    view = model.read_model({'state': state, 'revision': 0})
+    row = next(c for c in view['cubes'] if c['id'] == merged_id)
+    assert row['allocation_stale'] and not row['can_delete']
+    with pytest.raises(ValidationError):
+        model.apply_command(state, 'cube_delete', {'cube_id': merged_id})
+
+
+def test_delete_resolved_legacy_merged_cube_and_undo_preserves_sources(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path)
+    native_before = deepcopy(planner.snapshot()['state']['planning'])
+    deleted = command(planner, 'cube_delete', {'cube_id': merged_id})
+    assert next(c for c in deleted['cubes'] if c['id'] == merged_id)['status'] == 'cancelled'
+    assert planner.snapshot()['state']['planning'] == native_before
+    restored = command(planner, 'undo', {'revision': deleted['revision']})
+    row = next(c for c in restored['cubes'] if c['id'] == merged_id)
+    assert row['available'] and row['minutes'] == 300
+    assert planner.snapshot()['state']['planning'] == native_before
+
+
+def test_delete_resized_merge_keeps_original_allocations_and_native_sources(planner):
+    result = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Combined'})
+    merged = next(c for c in result['cubes'] if c['id'].startswith('merged-'))
+    before = deepcopy(planner.snapshot()['state']['planning'])
+    command(planner, 'cube_resize', {'cube_id': merged['id'], 'date': None, 'start': None, 'minutes': 120})
+    deleted = command(planner, 'cube_delete', {'cube_id': merged['id']})
+    assert next(c for c in deleted['cubes'] if c['id'] == merged['id'])['status'] == 'cancelled'
+    record = planner.snapshot()['state']['period_planner']['cancellations'][merged['id']]
+    assert sum(part['minutes'] for part in record['source_task_allocations']) == 105
+    assert planner.snapshot()['state']['planning'] == before
+
+
+def test_actual_shape_one_native_plus_nested_three_with_two_missing(tmp_path):
+    planner, merged_id, candidates = _nested_merge_with_missing_forecasts(tmp_path, shape='one_plus_three')
+    before = planner.snapshot()
+    row = next(c for c in planner.model()['cubes'] if c['id'] == merged_id)
+    assert row['available'] and row['minutes'] == 300 and not row.get('allocation_stale')
+    assert planner.snapshot() == before
+    command(planner, 'cube_drop', {'cube_id': merged_id, 'date': '2027-01-05', 'start': '12:00'})
+    saved = send(planner, 'cube_progress', {'cube_id': merged_id, 'percent': 100, 'actual_minutes': 60})
+    assert all(saved['state']['planning']['completed_cubes'][cube['id']]['percent'] == 100 for cube in candidates)
+    assert next(task for task in planner.model()['tasks'] if task['id'] == 'b')['status'] == 'completed'
+
+
+def test_selected_and_returned_forecast_counts_as_owner_stage_without_timer_facts(tmp_path):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    state = synthetic_state()
+    for cid, minutes in [('geometry', 60), ('slides', 45), ('other', 30)]:
+        state['planning'].setdefault('completed_cubes', {})[cid] = {
+            'task_id': 'a', 'date': '2027-01-05', 'planned_minutes': minutes,
+            'percent': 100, 'actual_minutes': 0}
+    planner = model.PeriodPlanner(synthetic_store(tmp_path, state))
+    before = planner.model()
+    assert next(t for t in before['tasks'] if t['id'] == 'a')['progress_percent'] == 100
+    forecasts = [c for c in before['cubes'] if c.get('task_id') == 'a' and c.get('candidate')]
+    assert len(forecasts) > 1
+    chosen = forecasts[0]
+    selected = command(planner, 'cube_select', {'cube_id': chosen['id'], 'date': '2027-01-06'})
+    task = next(t for t in selected['tasks'] if t['id'] == 'a')
+    assert task['progress_percent'] == 75 and task['status'] == 'started'
+    assert set(task['readiness_cube_ids']) == {'geometry', 'slides', 'other', chosen['id']}
+    assert all(c['id'] not in task['readiness_cube_ids'] for c in forecasts[1:])
+    assert chosen['id'] not in planner.snapshot()['state']['planning']['constructor']['cubes']
+    clock = FakeClock()
+    timer = TimeStore(tmp_path, lambda: clock.wall, lambda: clock.mono)
+    running = cmd(timer, 'start', 0, 'forecast-timer', task={
+        'source': 'work', 'id': 'work-cube:' + chosen['id'], 'title': 'Forecast', 'activity_kind': 'work'})
+    clock.advance(5_000)
+    assert next(t for t in planner.model()['tasks'] if t['id'] == 'a')['progress_percent'] == 75
+    cmd(timer, 'stop', running['revision'], 'forecast-stop')
+    returned = command(planner, 'cube_return', {'cube_id': chosen['id']})
+    task = next(t for t in returned['tasks'] if t['id'] == 'a')
+    assert task['progress_percent'] == 75 and chosen['id'] in task['readiness_cube_ids']
+    assert next(c for c in returned['cubes'] if c['id'] == chosen['id'])['selected_date'] is None
+
+
+def test_merge_rejects_active_source_timer_without_changing_state(planner):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    command(planner, 'cube_select', {'cube_id': 'geometry', 'date': '2027-01-05'})
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    running = cmd(timer, 'start', 0, 'merge-guard-start', task={'source': 'work', 'id': 'work-cube:geometry', 'title': 'Geometry'})
+    before, before_timer = planner.snapshot(), timer.state()
+    with pytest.raises(ConflictError):
+        command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Combined'})
+    assert planner.snapshot() == before and timer.state() == before_timer
+    stopped = cmd(timer, 'stop', running['revision'], 'merge-guard-stop')
+    result = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Combined'})
+    assert any(c['id'].startswith('merged-') for c in result['cubes'])
+    with pytest.raises(ConflictError):
+        cmd(timer, 'start', stopped['revision'], 'merge-guard-stale-start',
+            task={'source': 'work', 'id': 'work-cube:geometry', 'title': 'Geometry'})
+
+
+def test_undo_forecast_materialization_keeps_same_timed_source(planner):
+    from megamozg.time_tracking import TimeStore
+    from test_time_tracking import FakeClock, cmd
+    forecast = next(c for c in planner.model()['cubes'] if c.get('candidate') and c.get('task_id') == 'a')
+    command(planner, 'cube_select', {'cube_id': forecast['id'], 'date': '2027-01-06'})
+    fact = send(planner, 'cube_progress', {'cube_id': forecast['id'], 'percent': 20, 'actual_minutes': 5})
+    clock = FakeClock()
+    timer = TimeStore(planner.store.root, lambda: clock.wall, lambda: clock.mono)
+    running = cmd(timer, 'start', 0, 'forecast-guard-start', task={'source': 'work', 'id': 'work-cube:' + forecast['id'], 'title': forecast['title']})
+    before_timer = timer.state()
+    undone = command(planner, 'undo', {'revision': fact['revision']})
+    row = next(c for c in undone['cubes'] if c['id'] == forecast['id'])
+    assert row['selected_date'] == '2027-01-06' and row['progress_percent'] == 0
+    assert forecast['id'] not in planner.snapshot()['state']['planning']['constructor']['cubes']
+    assert timer.state() == before_timer and timer.state()['revision'] == running['revision']

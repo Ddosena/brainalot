@@ -64,7 +64,9 @@ def _json(value):
 def _task(value):
     if value is None:
         return None
-    if (not isinstance(value, dict) or set(value) != {"source", "id", "title"}
+    if (not isinstance(value, dict) or not {"source", "id", "title"} <= set(value)
+            or set(value) - {"source", "id", "title", "activity_kind"}
+            or "activity_kind" in value and value["activity_kind"] not in ("work", "personal")
             or not isinstance(value.get("source"), str) or value["source"] not in SOURCES
             or any(not isinstance(value.get(key), str) or not value[key].strip()
                    or len(value[key]) > limit or any(c in value[key] for c in "\r\n\x00")
@@ -72,7 +74,23 @@ def _task(value):
         raise ValidationError("task must be null or a TaskRef with source, id and title")
     if value["source"] == "label" and value["id"] not in LABELS:
         raise ValidationError("Неизвестная метка времени")
-    return {key: value[key] for key in ("source", "id", "title")}
+    return {key: value[key] for key in ("source", "id", "title", "activity_kind") if key in value}
+
+
+def _activity(ref):
+    if isinstance(ref, dict) and ref.get("source") == "label" and ref.get("id") == "rest":
+        return "rest"
+    kind = ref.get("activity_kind") if isinstance(ref, dict) else None
+    return kind if kind in ("work", "personal") else "unclassified"
+
+
+def _time_entry(ref):
+    return {"task": ref, "total_ms": 0, "work_ms": 0, "personal_ms": 0, "rest_ms": 0, "unclassified_ms": 0}
+
+
+def _add_time(entry, ref, amount):
+    entry["total_ms"] += amount
+    entry[_activity(ref) + "_ms"] += amount
 
 
 def _free(segment, busy):
@@ -271,16 +289,30 @@ class TimeStore:
                 self._settle(db, row, wall, mono, force=True)
             return self._state(row, wall, mono)
 
-    @staticmethod
-    def _duration(mode, value):
+    def _duration(self, mode, value, task=None):
         if mode == "stopwatch":
             if value is not None:
                 raise ValidationError("stopwatch has no duration_ms")
             return 0
         if value is None:
             return POMODORO_MS if mode == "pomodoro" else 0
-        if isinstance(value, bool) or not isinstance(value, int) or not 60_000 <= value <= 14_400_000:
-            raise ValidationError("duration_ms must be between 60000 and 14400000")
+        cube = (mode == "pomodoro" and isinstance(task, dict) and task.get("source") == "work"
+                and isinstance(task.get("id"), str) and task["id"].startswith("work-cube:"))
+        if (not cube and mode == "pomodoro" and isinstance(task, dict) and task.get("source") == "library"
+                and isinstance(task.get("id"), str) and type(value) is int and not 60_000 <= value <= 14_400_000):
+            from .work_period.library_rules import LibraryReader
+            from .work_activity import validate_note_activity
+            note = next((row for row in LibraryReader(self.db_path.parent.parent).notes() if row.get("id") == task["id"]), None)
+            if note and note.get("kind") == "task" and note.get("status") in {"active", "done"} and isinstance(note.get("work_cube"), dict):
+                try:
+                    validate_note_activity(note, ValidationError)
+                except ValidationError:
+                    pass
+                else:
+                    cube = True
+        minimum, maximum = (1, 86_400_000) if cube else (60_000, 14_400_000)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ValidationError(f"duration_ms must be between {minimum} and {maximum}")
         return value
 
     def command(self, body: dict):
@@ -348,7 +380,7 @@ class TimeStore:
                 mode = body.get("mode", "stopwatch")
                 row.update(status="running", mode=mode,
                            task=_json(_task(body.get("task"))) if body.get("task") is not None else None,
-                           elapsed_ms=0, duration_ms=self._duration(mode, body.get("duration_ms")),
+                           elapsed_ms=0, duration_ms=self._duration(mode, body.get("duration_ms"), task),
                            started_at=wall, anchor_at=wall, anchor_mono=mono, interruption=None)
             elif action == "pause":
                 if row["status"] != "running":
@@ -373,7 +405,7 @@ class TimeStore:
                     raise ValidationError("set_mode requires mode")
                 mode = body["mode"]
                 row.update(mode=mode, elapsed_ms=0,
-                           duration_ms=self._duration(mode, body.get("duration_ms")),
+                           duration_ms=self._duration(mode, body.get("duration_ms"), task),
                            interruption=None)
                 if row["status"] == "running":
                     row.update(started_at=wall, anchor_at=wall, anchor_mono=mono)
@@ -426,15 +458,16 @@ class TimeStore:
                 ref = json.loads(task) if task else None
                 key = (ref["source"], ref["id"]) if ref else None
                 if key not in totals:
-                    totals[key] = {"task": ref, "total_ms": 0, "calendar_ms": 0}
-                totals[key]["total_ms"] += amount
+                    totals[key] = {**_time_entry(ref), "calendar_ms": 0}
+                _add_time(totals[key], ref, amount)
                 if mode == CALENDAR_MODE:
                     totals[key]["calendar_ms"] += amount
         # calendar_ms only where part of the row came from the calendar.
         rows = sorted(({k: v for k, v in item.items() if k != "calendar_ms" or v} for item in totals.values()),
                       key=lambda item: -item["total_ms"])
         return {"day": day, "timezone": timezone,
-                "total_ms": sum(item["total_ms"] for item in rows), "rows": rows}
+                **{key: sum(item[key] for item in rows) for key in ("total_ms", "work_ms", "personal_ms", "rest_ms", "unclassified_ms")},
+                "rows": rows}
 
     def sync_calendar(self, days, events):
         """Record the past part of timed calendar events for whole local ``days``.
@@ -515,16 +548,17 @@ class TimeStore:
             for item in intervals:
                 ref = json.loads(item["task"]) if item["task"] else None
                 key = (ref["source"], ref["id"]) if ref else None
-                entry = totals.setdefault(key, {"task": ref, "total_ms": 0})
+                entry = totals.setdefault(key, _time_entry(ref))
                 entry["task"] = ref  # Most recently recorded name for this id.
-                entry["total_ms"] += item["amount"]
+                _add_time(entry, ref, item["amount"])
             if row["status"] == "running" and row["mode"] != "break":
                 ref = json.loads(row["task"]) if row["task"] else None
                 key = (ref["source"], ref["id"]) if ref else None
-                entry = totals.setdefault(key, {"task": ref, "total_ms": 0})
+                entry = totals.setdefault(key, _time_entry(ref))
                 entry["task"] = ref
-                entry["total_ms"] += self._tail(row, wall, mono)
+                _add_time(entry, ref, self._tail(row, wall, mono))
             return {"rows": sorted(totals.values(), key=lambda item: -item["total_ms"]),
+                    **{key: sum(item[key] for item in totals.values()) for key in ("total_ms", "work_ms", "personal_ms", "rest_ms", "unclassified_ms")},
                     "server_now": wall, "state": self._state(row, wall, mono)}
 
     def checkpoint(self):

@@ -2,12 +2,30 @@
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
+import sqlite3
 from filelock import FileLock
 
 from .. import paths
 from ..core import Store, LEGACY_IMPORTANCE_SCORES
 
 DEFAULT_MINUTES = 60
+
+
+class LibraryNotes(list):
+    """Read-only identities of deleted canonical sources accompany live Notes."""
+    deleted_work_note_ids = frozenset()
+
+
+def deleted_work_note_ids(state):
+    journal = Path(state) / 'journal.sqlite3'
+    if not journal.exists():
+        return frozenset()
+    with sqlite3.connect(journal) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='work_note_requests'").fetchone():
+            return frozenset()
+        return frozenset(row[0] for row in db.execute("""SELECT r.note_id FROM work_note_requests r
+            JOIN operations o ON o.id=r.operation_id WHERE o.kind='delete' AND o.status='applied'
+            AND NOT EXISTS (SELECT 1 FROM operations u WHERE u.reverses=o.id AND u.status='applied')"""))
 
 
 class LibraryReader(Store):
@@ -23,10 +41,13 @@ class LibraryReader(Store):
         if not self.vault.is_dir():
             return []
         with self.lock:
-            rows, _ = self._scan()
+            rows, _ = self._scan(validate_cached=True)
+            deleted = deleted_work_note_ids(self.state)
         counts = Counter(row['id'] for row in rows)
         # Ambiguous duplicate IDs never authorize execution or a new placement.
-        return [row for row in rows if counts[row['id']] == 1]
+        result = LibraryNotes(row for row in rows if counts[row['id']] == 1)
+        result.deleted_work_note_ids = frozenset(deleted)
+        return result
 
 
 def _source(note, key):
@@ -34,13 +55,24 @@ def _source(note, key):
     score = note.get('importance_score')
     if type(score) is not int or not 0 <= score <= 5:
         score = LEGACY_IMPORTANCE_SCORES.get(note.get('importance'), 2)
-    return {'id': key, 'kind': 'brainalot', 'source_ref': note['id'], 'title': note['title'],
+    row = {'id': key, 'kind': 'brainalot', 'source_ref': note['id'], 'title': note['title'],
         'source_title': note['title'], 'minutes': DEFAULT_MINUTES, 'planned_date': note.get('due'),
         'source_due': note.get('due'), 'source_horizon': horizon, 'library_source': True,
         'library_note_version': note.get('version'), 'source_active': True,
         'library_importance_score': score, 'library_importance': note.get('importance', 'normal'),
         'progress_percent': 0, 'actual_minutes': 0, 'output': '', 'steps': [],
         'comment': '', 'links': [], 'groups': [], 'candidate': False}
+    if note.get('activity_kind') is not None:
+        row['activity_kind'] = note['activity_kind']
+    if note.get('work_cube') is not None:
+        cube = note['work_cube']
+        percent = 100 if note['status'] == 'done' else cube['progress_percent']
+        row.update(standalone=True, minutes=cube['minutes'], selected_date=note.get('due'),
+                   start=cube['start'], progress_percent=percent,
+                   report_date=note.get('due') if percent else None,
+                   sources=deepcopy(cube.get('sources', [])),
+                   activity_kind=note.get('activity_kind') or 'personal')
+    return row
 
 
 def catalog(state, native, notes=None):
@@ -50,7 +82,8 @@ def catalog(state, native, notes=None):
     native_by_ref = {row['source_ref']: key for key, row in rows.items()
         if row.get('kind') == 'brainalot' and row.get('source_ref')}
     current = {note['id']: note for note in notes or []}
-    eligible = {key: note for key, note in current.items() if note.get('kind') == 'task' and note.get('status') == 'active'}
+    eligible = {key: note for key, note in current.items() if note.get('kind') == 'task' and
+                (note.get('status') == 'active' or note.get('work_cube') and note.get('status') == 'done')}
     for key, saved in cached.items():
         ref = saved.get('source_ref')
         if ref and ref not in native_by_ref:
@@ -64,6 +97,12 @@ def catalog(state, native, notes=None):
         else:
             metadata = _source(note, key)
             row = rows[key]
+            if metadata.get('standalone'):
+                # Identity/factual elapsed time remain native; source-owned editable
+                # fields have one owner, the Note, even after a native time report.
+                for field in ('title', 'minutes', 'planned_date', 'selected_date', 'start',
+                              'progress_percent', 'report_date', 'activity_kind', 'standalone', 'sources'):
+                    row[field] = deepcopy(metadata[field])
             # A native Work name/duration/report is its own durable owner choice.
             if key not in native:
                 row['title'] = note['title']
@@ -71,12 +110,17 @@ def catalog(state, native, notes=None):
             for field in ('source_title', 'source_due', 'source_horizon', 'library_source', 'library_note_version',
                           'library_importance_score', 'library_importance', 'source_active'):
                 row[field] = metadata[field]
+            if 'activity_kind' in metadata and not metadata.get('standalone'):
+                row['activity_kind'] = metadata['activity_kind']
     if notes is not None:
         for row in rows.values():
             if row.get('kind') == 'brainalot':
                 row['library_source'] = True
                 row['source_active'] = row.get('source_ref') in eligible
                 if not row['source_active']:
+                    row.pop('standalone', None)
+                    if row.get('source_ref') in getattr(notes, 'deleted_work_note_ids', ()):
+                        row['standalone_deleted'] = True
                     row['source_unavailable'] = True
                     row['availability_block_reason'] = 'Исходная задача Brainalot завершена, удалена или неоднозначна'
     return rows
@@ -84,7 +128,7 @@ def catalog(state, native, notes=None):
 
 def retain(state, row):
     """Persist only an explicitly edited/chosen real Library source."""
-    if row.get('kind') != 'brainalot' or not row.get('library_source'):
+    if row.get('kind') != 'brainalot' or not row.get('library_source') or row.get('standalone'):
         return
     state.setdefault('period_planner', {}).setdefault('brainalot_sources', {})[row['id']] = {
         key: deepcopy(row[key]) for key in ('id', 'kind', 'source_ref', 'title', 'source_title', 'minutes',

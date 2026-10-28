@@ -197,11 +197,19 @@ def offer_id(record):
     return "calendar-offer-" + record["id"]
 
 
+def daily_offer_id(record):
+    legacy = offer_id(record)
+    if record["calendar_role"] == "evergreen" and record.get("provider_series_id"):
+        return legacy + "-day-" + record["source_date"]
+    return legacy
+
+
 def apply_import(state, source):
     incoming = prepare_import(state, source)
     ext = state.setdefault("period_planner", {})
     previous = ext.get("calendar_source", {}).get("events", {})
-    incoming_offer_ids = {offer_id(record) for record in incoming["events"].values() if record["calendar_role"] in OPTIONAL}
+    incoming_offer_ids = {key for record in incoming["events"].values() if record["calendar_role"] in OPTIONAL
+                          for key in (offer_id(record), daily_offer_id(record))}
     transition_warnings = []
     for event_id, record in incoming["events"].items():
         old = previous.get(event_id)
@@ -210,13 +218,13 @@ def apply_import(state, source):
         if not old:
             continue
         if old["calendar_role"] in OPTIONAL and record["calendar_role"] not in OPTIONAL:
-            alias = ext.get("cube_titles", {}).get(offer_id(old))
+            alias = ext.get("cube_titles", {}).get(daily_offer_id(old), ext.get("cube_titles", {}).get(offer_id(old)))
             if alias is not None:
                 ext.setdefault("calendar_event_titles", {})[event_id] = alias
         elif old["calendar_role"] not in OPTIONAL and record["calendar_role"] in OPTIONAL:
             alias = ext.get("calendar_event_titles", {}).get(event_id)
             if alias is not None:
-                ext.setdefault("cube_titles", {})[offer_id(record)] = alias
+                ext.setdefault("cube_titles", {})[daily_offer_id(record)] = alias
         if old["calendar_role"] == "flexible" and record["calendar_role"] != "flexible":
             placement = ext.get("calendar_event_placements", {}).pop(event_id, None)
             if placement:
@@ -224,15 +232,17 @@ def apply_import(state, source):
                     "reason": "source_role_changed", "previous_role": old["calendar_role"], "new_role": record["calendar_role"],
                     "captured_at": source["captured_at"]})
                 transition_warnings.append("Цвет события изменился в Calendar: локальный перенос сохранён в истории; используется дата и время источника.")
-        if old["calendar_role"] in OPTIONAL and (record["calendar_role"] not in OPTIONAL or offer_id(old) != offer_id(record)):
-            cube_id = offer_id(old)
-            if cube_id not in incoming_offer_ids and ext.get("context", {}).get("cube_id") == cube_id:
-                ext["context"]["cube_id"] = None
-            placement = ext.get("placements", {}).pop(cube_id, None)
-            if placement:
-                ext.setdefault("calendar_placement_archive", []).append({"event_id": event_id, "cube_id": cube_id,
-                    "placement": placement, "reason": "optional_became_mandatory", "captured_at": source["captured_at"]})
-                transition_warnings.append("Роль предложения изменилась в Calendar; прежний выбор сохранён в истории, используется новая роль источника.")
+        if old["calendar_role"] in OPTIONAL and (record["calendar_role"] not in OPTIONAL or daily_offer_id(old) != daily_offer_id(record)):
+            for cube_id in {offer_id(old), daily_offer_id(old)}:
+                if cube_id in incoming_offer_ids:
+                    continue
+                if ext.get("context", {}).get("cube_id") == cube_id:
+                    ext["context"]["cube_id"] = None
+                placement = ext.get("placements", {}).pop(cube_id, None)
+                if placement:
+                    ext.setdefault("calendar_placement_archive", []).append({"event_id": event_id, "cube_id": cube_id,
+                        "placement": placement, "reason": "optional_became_mandatory", "captured_at": source["captured_at"]})
+                    transition_warnings.append("Роль предложения изменилась в Calendar; прежний выбор сохранён в истории, используется новая роль источника.")
     incoming["warnings"] = list(dict.fromkeys(incoming["warnings"] + transition_warnings))
     ext["calendar_source"] = incoming
     return state
@@ -256,6 +266,13 @@ def enrich(state, events, cubes):
     ext, planning = state.get("period_planner", {}), state["planning"]
     source = ext.get("calendar_source", {})
     metadata = deepcopy(source.get("events", {}))
+    # A previously imported provider record can outlive a cancelled native
+    # occurrence. Keep its identity/history, but never offer it again.
+    cancelled_native = {row.get("id") for row in planning.get("calendar", {}).get("events", [])
+        if row.get("id") and row.get("status") in {"cancelled", "canceled"}}
+    for record in metadata.values():
+        if record.get("native_event_id") in cancelled_native:
+            record["source_cancelled"] = True
     projected, warnings = [], list(source.get("warnings", []))
     if events and not source:
         warnings.append("Цветовые метаданные Calendar ещё не импортированы; сохранённые события доступны только для чтения.")
@@ -312,13 +329,64 @@ def enrich(state, events, cubes):
             for alternative in row["alternatives"]:
                 if alternative["kind"] == "calendar":
                     alternative.update(date=row["date"], start=row["start"], end=row["end"], end_date=row.get("end_date"))
+        # An untimed native occurrence cannot appear on the time scale. Give it
+        # the same durable offer identity and commands as other Calendar offers.
+        if row.get("kind") == "calendar" and (row.get("all_day") or not row.get("start") or not row.get("duration_minutes")):
+            metadata[row["id"]] = {**(record or {}), "id": row["id"], "calendar_role": "optional_day",
+                "source_title": row["source_title"], "source_date": row["date"],
+                "source_start": row.get("start"), "source_end": row.get("end"),
+                "source_end_date": row.get("end_date"), "all_day": bool(row.get("all_day")),
+                "duration_minutes": None, "source_color": row.get("source_color"),
+                "provider_id": row.get("provider_id"), "native_event_id": row.get("native_event_id"),
+                "source_occurrence_id": row.get("source_occurrence_id"),
+                "identity_match": (record or {}).get("identity_match")}
         projected.append(row)
     groups = {}
     for record in metadata.values():
         if record["calendar_role"] in OPTIONAL:
             groups.setdefault(offer_id(record), []).append(record)
     native_cubes = planning.get("constructor", {}).get("cubes", {})
-    for cube_id, records in sorted(groups.items()):
+    dated_groups = []
+    for legacy_id, records in sorted(groups.items()):
+        records = sorted(records, key=lambda r: (r["source_date"], r["id"]))
+        if not (records[0]["calendar_role"] == "evergreen" and records[0].get("provider_series_id")):
+            dated_groups.append((legacy_id, legacy_id, records, False))
+            continue
+        by_day = {}
+        for record in records:
+            by_day.setdefault(record["source_date"], []).append(record)
+        legacy_placement = ext.get("placements", {}).get(legacy_id)
+        legacy_cancelled = legacy_id in ext.get("cancellations", {})
+        legacy_date = legacy_placement.get("date") if legacy_placement else None
+        legacy_present = (legacy_placement is not None or legacy_cancelled
+            or any(legacy_id in ext.get(field, {}) for field in ("cube_titles", "cube_details", "cube_durations",
+                "calendar_offer_estimates", "cube_activity", "cube_pins", "repeatable_origins"))
+            or ext.get("context", {}).get("cube_id") == legacy_id)
+        # A previously selected/factual native occurrence with no daily overlay
+        # belongs to the old group identity; do not duplicate or rewrite it.
+        if not legacy_present or legacy_date not in by_day:
+            found_legacy_native = False
+            for day_key, daily_records in sorted(by_day.items()):
+                daily_id = daily_offer_id(daily_records[0])
+                if any(daily_id in ext.get(field, {}) for field in ("placements", "calendar_offer_estimates", "cancellations")):
+                    continue
+                refs = {value for r in daily_records for value in (r["id"], r.get("source_occurrence_id"), r.get("provider_id"), r.get("native_event_id")) if value}
+                for native in native_cubes.values():
+                    if native.get("kind") == "calendar" and native.get("source_ref") in refs:
+                        selected_date = wp._constructor_selected_date(planning, native["id"])
+                        report = wp._constructor_report(planning, native)
+                        if selected_date or report.get("percent") or report.get("actual_minutes"):
+                            legacy_present = True
+                            found_legacy_native = True
+                            legacy_date = selected_date if selected_date in by_day else report.get("date") if report.get("date") in by_day else day_key
+                            break
+                if found_legacy_native:
+                    break
+        owner_day = legacy_date if legacy_date in by_day else next(iter(by_day))
+        for day_key, daily_records in sorted(by_day.items()):
+            key = legacy_id if legacy_present and day_key == owner_day else daily_offer_id(daily_records[0])
+            dated_groups.append((key, legacy_id, daily_records, legacy_cancelled))
+    for cube_id, legacy_id, records, legacy_cancelled in dated_groups:
         records = sorted(records, key=lambda r: (r["source_date"], r["id"]))
         record = records[0]
         source_ids = list(dict.fromkeys(value for r in records for value in (r["id"], r["provider_id"], r.get("source_occurrence_id")) if value))
@@ -332,14 +400,14 @@ def enrich(state, events, cubes):
         original_start = planning.get("constructor", {}).get("days", {}).get(original_selected, {}).get("source_slots", {}).get(chosen["id"]) if chosen else None
         placement = ext.get("placements", {}).get(cube_id, {"date": original_selected, "start": original_start})
         estimates = ext.get("calendar_offer_estimates", {})
-        minutes = estimates.get(cube_id, record["duration_minutes"])
+        minutes = estimates.get(cube_id, estimates.get(legacy_id, record["duration_minutes"]))
         if minutes is None and chosen and (report.get("percent") or report.get("actual_minutes")):
             minutes = chosen["minutes"]  # durable historical planned volume, not a new estimate
         unknown = minutes is None
-        cancelled = cube_id in ext.get("cancellations", {})
-        row = {"id": cube_id, "task_id": None, "project_id": None, "title": ext.get("cube_titles", {}).get(cube_id, ext.get("calendar_event_titles", {}).get(record["id"], record["source_title"])),
+        cancelled = cube_id in ext.get("cancellations", {}) or legacy_cancelled or all(r.get("source_cancelled") for r in records)
+        row = {"id": cube_id, "task_id": None, "project_id": None, "title": ext.get("cube_titles", {}).get(cube_id, ext.get("cube_titles", {}).get(legacy_id, ext.get("calendar_event_titles", {}).get(record["id"], record["source_title"]))),
             "minutes": minutes or 0, "kind": "calendar_optional", "calendar_role": record["calendar_role"], "source_title": record["source_title"],
-            "availability": "any_day" if record["calendar_role"] == "evergreen" else "day",
+            "availability": "day",
             "planned_date": record["source_date"], "source_date": record["source_date"],
             "selected_date": placement.get("date"), "start": placement.get("start"), "candidate": False,
             "source_start": record["source_start"], "source_end": record["source_end"], "source_color": record["source_color"],
@@ -347,6 +415,7 @@ def enrich(state, events, cubes):
             "source_occurrences": [{"event_id": r["id"], "provider_id": r["provider_id"], "date": r["source_date"], "identity_match": r["identity_match"]} for r in records],
             "historical_facts": [{"cube_id": cube["id"], "minutes": cube["minutes"], **deepcopy(wp._constructor_report(planning, cube))} for cube in factual],
             "duration_unknown": unknown, "requires_estimate": unknown, "all_day": record["all_day"],
+            "source_end_date": record.get("source_end_date"),
             "duration_provisional": not unknown and record["duration_minutes"] is None,
             "duration_basis": "local_estimate" if not unknown and record["duration_minutes"] is None else "calendar" if not unknown else "unknown",
             "returned": cube_id in ext.get("placements", {}) and placement.get("date") is None,
@@ -411,7 +480,7 @@ def validate_slot(model, target, minutes, start, *, exclude_cube=None, exclude_e
     first = datetime.fromisoformat(target + "T" + start) if start is not None and _minutes(start) >= 0 else None
     last = first + timedelta(minutes=minutes) if first else None
     if work_window and first and (_minutes(start) < _minutes(model["settings"]["day_start"]) or _minutes(start)+minutes > _minutes(model["settings"]["day_end"])):
-        raise ValidationError(f"Кубик выходит за рабочее окно {model['settings']['day_start']}–{model['settings']['day_end']}")
+        pass  # Any hour of the day is allowed (owner decision 2026-10-28).
     if minutes == 0:
         return {"date": target, "start": start, "end": start, "end_date": target if start else None}
     targets = [target]
@@ -433,8 +502,7 @@ def validate_slot(model, target, minutes, start, *, exclude_cube=None, exclude_e
         addition = sum(b-a for a, b in pieces) if first else minutes
         load = sum(b-a for a, b in union + timed) + floating_load + addition
         limit = model["settings"].get("daily_limit_minutes_by_date", {}).get(key, model["settings"]["daily_limit_minutes"])
-        if load > limit:
-            raise ValidationError(f"Дневной лимит {limit} минут превышен: {load} минут с событиями")
+        # The day's load is the owner's choice (2026-10-28); only overlaps are refused.
         if any(a < end and begin < b for a, b in pieces for begin, end in union + timed):
             raise ValidationError("Это время пересекается с событием или другим кубиком")
     return {"date": target, "start": start, "end": last.strftime("%H:%M") if last else None, "end_date": last.date().isoformat() if last else None}

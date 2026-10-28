@@ -46,17 +46,8 @@ body.capture-page{min-width:0;max-width:none;padding:0;min-height:100vh;backgrou
 .capture-page .primary{font-weight:700}
 .capture-page #capture-submit{margin-left:auto}
 .shortcut{font-weight:400;font-size:10px;opacity:.84;margin-left:5px}
+.shortcut{opacity:1}
 .capture-error{margin:9px 0 0}
-[data-design="cabinet"] .capture-shell{border-left:1px solid var(--line);border-right:1px solid var(--line);box-shadow:0 6px 20px var(--soft-shadow)}
-[data-design="cabinet"] .capture-header h1{font-family:Georgia,"Times New Roman",serif;font-size:29px}
-[data-design="console"] .capture-shell{border-left:1px solid var(--line);border-right:1px solid var(--line)}
-[data-design="console"] .capture-header{padding-bottom:9px;border-bottom:2px solid var(--accent)}
-[data-design="console"] .capture-header h1{font-size:22px;text-transform:uppercase;letter-spacing:.035em}
-[data-design="glamour"] .capture-shell{border-left:1px solid var(--line);border-right:1px solid var(--line)}
-[data-design="glamour"] .capture-header h1::after{content:" ♥";color:var(--accent);font-size:17px;vertical-align:middle}
-[data-design="glamour"] .capture-page .primary{background:#d61686;color:white}
-[data-theme="dark"][data-design="glamour"] .capture-page .primary{background:#ff66be;color:#391331}
-@media(prefers-color-scheme:dark){:root:not([data-theme])[data-design="glamour"] .capture-page .primary{background:#ff66be;color:#391331}}
 @media(max-width:390px){.capture-shell{padding:15px 14px 22px}.shortcut{display:none}.capture-page .capture-actions{gap:6px}.capture-page .primary,.capture-page .secondary{padding:8px}}
 
 /* Shared numeric task importance; the thumb is a native keyboard control. */
@@ -64,3 +55,6 @@ body.capture-page{min-width:0;max-width:none;padding:0;min-height:100vh;backgrou
 .importance-score-field input[type="range"]{flex:1;min-width:0;width:auto;margin:0;padding:0;accent-color:var(--accent);cursor:pointer}
 .importance-score-field output{min-width:34px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
 [hidden].importance-score-field{display:none}
+.capture-shell{border-inline:1px solid var(--line)}
+.glamour .capture-header h1::after{content:" ♥";color:var(--accent);font-size:17px}
+.capture-page .primary{background:var(--accent);color:var(--accent-ink);border-radius:var(--r)}

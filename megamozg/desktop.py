@@ -22,7 +22,8 @@ import webbrowser
 _log = logging.getLogger("brainalot.desktop")
 WIDGET_SIZES = {"bar": (84, 48), "card": (360, 76)}
 MEDIA_ROW_HEIGHT = 52
-FULL_SIZE = (484, 900)
+FULL_SIZE = (484, 900)  # legacy compatibility
+PROFILE_SIZES = {"brainalot": (410, 800), "work": (1600, 1000)}
 FULL_GEOMETRY_LAYOUT = "unified-484x900-v1"
 MINIMUM_SIZES = {"full": (300, 360), **WIDGET_SIZES}
 STORAGE_FILE = "desktop-ui.json"
@@ -179,6 +180,7 @@ class DesktopBridge:
                 "topmost": self._host.topmost, "full_on_top": self._host.full_on_top, "side": self._host.side,
                 "media_visible": self._host.media_visible,
                 "work_expanded": self._host._expanded_full_geometry is not None,
+                "view_profile": self._host.view_profile, "size_default": self._host._size_default(),
                 "double_click": double_click_settings(area.dpi)}
 
     def window_action(self, action, value=None):
@@ -371,7 +373,10 @@ class CompactSurface:
             if not item: return
             point = cursor_position()
             if abs(point[0]-item["point"][0])+abs(point[1]-item["point"][1]) >= 5: item["moved"] = True
-            if item["moved"] and item["button"] == 0 and not item["id"] and not self._move_pending:
+            if item["moved"] and item["button"] == 2 and not item.get("native_drag"):
+                item["native_drag"] = True
+                self._input.put(("begin", item))
+            if item["moved"] and (item["button"] == 2 or item["button"] == 0 and not item["id"]) and not self._move_pending:
                 self._move_pending = True; self._input.put(("move", item))
         def up(_sender, event):
             item, self.press = self.press, None
@@ -562,12 +567,15 @@ class CompactSurface:
             if action == "close": return
             if self.closed: continue
             try:
-                if action == "begin": self.host.window_action("gesture_begin")
+                if action == "begin": self.host.window_action("gesture_begin", {"origin": list(item["point"]), "right_button": item.get("button") == 2})
                 elif action == "move":
                     try: self.host.window_action("gesture_move")
                     finally: self._move_pending = False
                 elif action == "up":
-                    if item["id"]:
+                    if item.get("native_drag"):
+                        self.host.window_action("gesture_end")
+                        self.last_click = None
+                    elif item["id"]:
                         self.last_click = None
                         # Small pointer drift is still a click when released on the same control.
                         if item["button"] == 0 and item["up_id"] == item["id"]: self._activate_control(item["id"])
@@ -621,6 +629,9 @@ class DesktopHost:
         self.state = DesktopState(root)
         self.media_visible = self.state.get({"desktop:spotify-visible": True})["desktop:spotify-visible"] is not False
         self.mode = "full"
+        self.view_profile = self.state.data.get("view_profile", "brainalot")
+        if not isinstance(self.view_profile, str) or self.view_profile not in PROFILE_SIZES:
+            self.view_profile = "brainalot"
         self.widget_mode = self.state.data.get("widget_mode", "bar")
         if self.widget_mode not in WIDGET_SIZES:
             self.widget_mode = "bar"
@@ -647,6 +658,18 @@ class DesktopHost:
         self._compact_surface = None
         self._expanded_full_geometry = None
 
+    def _size_default(self):
+        profiles = self.state.data.get("view_size_defaults")
+        saved = profiles.get(self.view_profile) if isinstance(profiles, dict) else None
+        if (isinstance(saved, dict) and all(type(saved.get(k)) is int and 1 <= saved[k] <= 100000
+                                            for k in ("width", "height"))):
+            return {"width": saved["width"], "height": saved["height"], "custom": True}
+        width, height = PROFILE_SIZES[self.view_profile]
+        return {"width": width, "height": height, "custom": False}
+
+    def _profile_result(self):
+        return {"ok": True, "profile": self.view_profile, "size_default": self._size_default()}
+
     def _set_rect(self, window, rect, minimum=None):
         set_native_rect(window, rect, minimum, on_top=window is not self.full or self.full_on_top)
 
@@ -669,9 +692,9 @@ class DesktopHost:
     def _areas(self):
         return work_areas(list(self.webview.screens))
 
-    def _rect(self, mode, anchor=None):
+    def _rect(self, mode, anchor=None, profile_default=False):
         areas = self._areas()
-        default = FULL_SIZE if mode == "full" else self._widget_size(mode)
+        default = tuple(self._size_default()[k] for k in ("width", "height")) if mode == "full" else self._widget_size(mode)
         saved = dict(self.state.data["geometry"].get(mode, {}))
         # Migrate old logical widget geometry once. Discard ambiguous oversized
         # tab dimensions; its native bounds must equal the visible small surface.
@@ -694,7 +717,7 @@ class DesktopHost:
         if mode in WIDGET_SIZES:
             # Compact views have a fixed size; only their position is remembered.
             saved.update(width=size[0], height=size[1])
-        elif migrate_full:
+        elif migrate_full or profile_default:
             saved.update(width=size[0], height=size[1])
         if anchor:
             saved.update(x=anchor["x"], y=anchor["y"])
@@ -718,7 +741,7 @@ class DesktopHost:
                                          hidden=True, frameless=True, easy_drag=False,
                                          on_top=self.full_on_top, shadow=False, min_size=MINIMUM_SIZES["full"],
                                          x=80, y=80,
-                                         width=FULL_SIZE[0], height=FULL_SIZE[1])
+                                         width=PROFILE_SIZES[self.view_profile][0], height=PROFILE_SIZES[self.view_profile][1])
         self.widget = webview.create_window("Brainalot", self._url(f"widget.html?mode={self.widget_mode}"),
                                            js_api=bridge, hidden=True, frameless=True, resizable=False,
                                            easy_drag=False, on_top=True, shadow=False, min_size=MINIMUM_SIZES["bar"],
@@ -825,7 +848,7 @@ class DesktopHost:
         self._switching = True
         try:
             for mode, window in (("full", self.full), (self.widget_mode, self.widget)):
-                rect, minimum = self._rect(mode)
+                rect, minimum = self._rect(mode, profile_default=mode == "full")
                 self._set_rect(window, rect, minimum)
         finally:
             self._switching = False
@@ -849,13 +872,33 @@ class DesktopHost:
             self._topology_timer.start()
 
     def _gesture(self, action, value):
+        if action == "gesture_probe":
+            return {"ok": True, "origin": list(cursor_position())}
         window = self.full if self.mode == "full" else self.widget
         if action == "gesture_begin":
             self._widget_popup({"open": False})
-            self._drag = {"origin": cursor_position(), "rect": native_rect(window),
+            origin = (value or {}).get("origin")
+            if not (isinstance(origin, (list, tuple)) and len(origin) == 2
+                    and all(type(part) is int and abs(part) <= 100000 for part in origin)):
+                origin = cursor_position()
+            rect = native_rect(window)
+            restored_work = False
+            if self.mode == "full" and (value or {}).get("right_button") and not (value or {}).get("edge"):
+                area = select_area(rect, self._areas())
+                if self._expanded_full_geometry is not None:
+                    normal = self._expanded_full_geometry
+                    width, height = min(normal["width"], area.width), min(normal["height"], area.height)
+                    rx = max(0, min(1, (origin[0]-rect["x"])/max(1, rect["width"])))
+                    ry = max(0, min(1, (origin[1]-rect["y"])/max(1, rect["height"])))
+                    rect = {"x": round(origin[0]-rx*width), "y": round(origin[1]-ry*height), "width": width, "height": height}
+                    self._expanded_full_geometry = None
+                    self._set_rect(window, rect)
+                    restored_work = True
+            self._drag = {"origin": tuple(origin), "rect": rect,
                           "edge": (value or {}).get("edge", ""), "moved": False,
                           "mode": self.mode,
                           "dpi": select_area(native_rect(window), self._areas()).dpi}
+            return {"ok": True, "dragged": False, "side": self.side, "restored_work": restored_work}
         elif self._drag:
             drag = self._drag
             x, y = cursor_position()
@@ -977,6 +1020,43 @@ class DesktopHost:
                 return self._widget_popup(value)
             if action == "widget_media":
                 return self._widget_media(value)
+            if action == "view_profile":
+                if not isinstance(value, str) or value not in PROFILE_SIZES:
+                    raise ValueError("Unknown view profile")
+                if value != self.view_profile:
+                    if self.mode == "full" and self._expanded_full_geometry is None:
+                        self._remember_geometry(self.full, "full")
+                    self._expanded_full_geometry = None
+                    self.view_profile = value
+                    self.state.data["view_profile"] = value
+                    rect, minimum = self._rect("full", profile_default=True)
+                    self._switching = True
+                    try:
+                        self._set_rect(self.full, rect, minimum)
+                    finally:
+                        self._switching = False
+                    area = select_area(rect, self._areas())
+                    with self.state.lock:
+                        self.state.data["geometry"]["full"] = {**rect, "units": "physical",
+                                                                 "screen": area.name, "dpi": area.dpi}
+                        self.state.save()
+                return self._profile_result()
+            if action == "view_size_default":
+                if type(value) is not bool:
+                    raise ValueError("view_size_default requires a boolean")
+                with self.state.lock:
+                    profiles = self.state.data.get("view_size_defaults")
+                    if not isinstance(profiles, dict):
+                        profiles = self.state.data["view_size_defaults"] = {}
+                    if value:
+                        rect = native_rect(self.full)
+                        area = select_area(rect, self._areas())
+                        profiles[self.view_profile] = {k: max(1, round(rect[k] * 96 / area.dpi))
+                                                       for k in ("width", "height")}
+                    else:
+                        profiles.pop(self.view_profile, None)
+                    self.state.save()
+                return self._profile_result()
             if action == "work_expand":
                 if type(value) is not bool:
                     raise ValueError("work_expand requires a boolean")
@@ -1066,6 +1146,7 @@ class DesktopHost:
 
     def open_page(self, path):
         view = internal_view(path)
+        self.window_action("view_profile", "work" if view == "work" else "brainalot")
         self.window_action("full")
         self.full.evaluate_js("window.dispatchEvent(new CustomEvent('brainalot-view',{detail:"
                               + json.dumps(view) + "}))")

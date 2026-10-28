@@ -92,6 +92,9 @@ if (isDesktop) {
     event.preventDefault(); void native.external_url(link.href);
   });
   // Ctrl+Shift+A in any Brainalot page toggles whether the full window stays above other windows.
+  const {installRightButtonWindowDrag}=await import('./desktop-gestures.js');
+  const stopRightDrag=installRightButtonWindowDrag(native,{surface:document});
+  window.addEventListener('pagehide',stopRightDrag,{once:true});
   document.addEventListener("keydown", event => {
     if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey || event.code !== "KeyA" || event.repeat) return;
     event.preventDefault();

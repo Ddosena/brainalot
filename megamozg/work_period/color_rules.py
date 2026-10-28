@@ -18,7 +18,15 @@ def _owners(state, projects):
     known = {project["id"] for project in projects}
     colors = state.get("period_planner", {}).get("calendar_colors", {})
     # A hidden or deleted project keeps its colour; it simply shows no points.
-    return {color: pid for color, pid in colors.items() if pid in known}
+    owners = {}
+    for color, pid in colors.items():
+        if pid in known:
+            owners.setdefault(color.lower(), set()).add(pid)
+    for project in projects:
+        color = project.get("color")
+        if isinstance(color, str):
+            owners.setdefault(color.lower(), set()).add(project["id"])
+    return owners
 
 
 def palette(state, events, projects):
@@ -32,9 +40,9 @@ def palette(state, events, projects):
             if event.get("color_name"):
                 names.setdefault(color, event["color_name"])
     rows = [{"color": color, "name": names.get(color, name), "standard": color not in names,
-             "count": counts.get(color, 0), "project_id": owners.get(color)} for color, name in STANDARD]
+             "count": counts.get(color, 0), "project_id": next(iter(sorted(owners.get(color, set()))), None)} for color, name in STANDARD]
     rows.extend({"color": color, "name": names.get(color, color), "standard": False,
-                 "count": count, "project_id": owners.get(color)}
+                 "count": count, "project_id": next(iter(sorted(owners.get(color, set()))), None)}
                 for color, count in sorted(counts.items()) if color not in NAMES)
     return rows
 
@@ -49,11 +57,12 @@ def enrich(state, projects, native_events, events):
     shown = {event["id"]: event for event in events}
     points = {}
     for event in native_events:
-        pid = owners.get(event.get("color")) if event.get("kind") == "calendar" else None
-        if pid is None or not event.get("date"):
+        pids = owners.get((event.get("color") or "").lower(), set()) if event.get("kind") == "calendar" else set()
+        if not pids or not event.get("date"):
             continue
         title = shown.get(event["id"], event)["title"]
-        points.setdefault(pid, []).append({
+        for pid in pids:
+            points.setdefault(pid, []).append({
             "id": "calendar:" + event["id"], "calendar_event_id": event["id"], "project_id": pid,
             "title": title, "date": event["date"], "end_date": event.get("end_date"),
             "start": event.get("start"), "end": event.get("end"), "all_day": bool(event.get("all_day")),
