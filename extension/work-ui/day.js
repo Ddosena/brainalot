@@ -5,14 +5,6 @@ export function installDay(ctx) {
 const {clamp,ddmm,dur,esc,nowMinute,pad,wd}=ctx;
 const {S,U,TODAY,DAY_FROM,DAY_SPAN}=ctx;
 const DOWF=ctx.DOWF;
-function goalChain(g){
-  const range=g.s===g.e?ddmm(g.s):`${ddmm(g.s)}–${ddmm(g.e)}`;
-  const cubes=ctx.shelf(g.id).map(k=>ctx.keycap(k)).join('');
-  const add=addCubeButton(ctx,g.id);
-  return `<div class="crow" style="--c:${ctx.goalColor(g)}"><div class="clab" data-goal="${esc(g.id)}" `+
-    `data-act="open-goal" data-arg="${esc(g.id)}" title="${t('Открыть цель · правая кнопка — меню')}">`+
-    `<b>${esc(g.title)}</b><small>${g.pct}% · ${range}</small></div><div class="cubes">${cubes}${add}</div></div>`;
-}
 function offerColumn(label,list,tomorrow=false){
   const cubes=list.map(k=>ctx.keycap(k)).join('');
   return `<div class="offer-column${tomorrow?' tomorrow':''}"><h4>${label} <span>${list.length}</span></h4>`+
@@ -21,12 +13,14 @@ function offerColumn(label,list,tomorrow=false){
 function dayScreen(){
   const i=U.day,list=ctx.dayCubes(i),doneList=list.filter(k=>k.pct>=100),inDay=list.filter(k=>k.pct<100),total=ctx.dayLoad(i);
   const goalsHere=ctx.poolGoals?ctx.poolGoals(i):ctx.activeOn(i).filter(ctx.visible);
-  // Two shelves side by side, each a list of rows: goal cubes by goal, possible cubes by source.
-  const chains=goalsHere.map(goalChain).join('');
   const others=unpinnedPossible(ctx,i),ids=new Set(others.map(k=>k.id));
   const calendar=k=>['calendar','calendar_optional'].includes(k.kind);
   // Tomorrow is for work that can be brought forward, not scheduled Calendar appointments.
-  const tomorrow=[...unpinnedPossible(ctx,i+1),...ctx.dayCubes(i+1).filter(k=>k.pct<100&&!k.pinned)]
+  // Owner 2026-10-28: cubes already placed on a day are taken, so they never appear here; the goal
+  // cubes come from goals stretched over tomorrow (including those also running today).
+  const tomorrowGoals=ctx.activeOn(i+1).filter(ctx.visible).flatMap(g=>ctx.shelf(g.id)).filter(k=>!k.pinned);
+  const tomorrow=[...unpinnedPossible(ctx,i+1),...tomorrowGoals]
+    .filter(k=>k.day==null)
     .filter(k=>!calendar(k)||k.all_day===true)
     .filter(k=>{if(ids.has(k.id))return false;ids.add(k.id);return true;});
   const offerRows=offerColumn('Brainalot',others.filter(k=>!calendar(k)))+
@@ -39,8 +33,11 @@ function dayScreen(){
     `<span class="muted">${t('Кубики на 100% встают сюда трофеями.')}</span>`;
   const basket=inDay.map(k=>ctx.keycap(k,{time:true})).join('')+addCubeButton(ctx,'',true);
   const pinned=ctx.pinnedPanel?ctx.pinnedPanel():'',repeatables=ctx.repeatablesPanel?ctx.repeatablesPanel():'';
-  const picker=ctx.goalPicker?ctx.goalPicker():'';
-  const goalRows=chains||`<p class="empty-note">${t('Создайте цель или добавьте кубик без цели.')}</p>`;
+  const picker=ctx.goalChips?ctx.goalChips():'';
+  // The chosen goals' shelf cubes in one row; no second line repeating the goal name.
+  const chosenCubes=goalsHere.flatMap(g=>ctx.shelf(g.id)).map(k=>ctx.keycap(k)).join('');
+  const goalRows=goalsHere.length?`<div class="cubes">${chosenCubes}${addCubeButton(ctx,goalsHere[0].id)}</div>`:
+    S.goals.length?`<p class="empty-note">${t('Выбери цели выше — появятся их кубики.')}</p>`:`<p class="empty-note">${t('Создайте цель или добавьте кубик без цели.')}</p>`;
   const offers=offerRows||`<p class="empty-note">${t('Пусто')}</p>`;
   return `<div class="main">
    <div class="toolbar"><button class="tri" data-act="day-prev" aria-label="${t("Предыдущий день")}">◀</button>`+
@@ -56,16 +53,35 @@ function dayScreen(){
 `<span class="navhint">${t("тащи кубик на шкалу или на часы · края — длительность · унеси со шкалы — вернётся на полку цели")}</span>`+
 `</div>${hTrack(i)}</section>
    <div class="daygrid"><section class="panel clockcard"><div id="clockhost" style="width:100%">${ctx.clockSvg(i)}</div>`+
-`<span class="cap">${t("Жёлтое — обязательное, выходит за кольцо. Кубики — внутри кольца.")}</span></section>
+`</section>
     <div class="day-workspace"><section class="panel trayp day-basket" data-drop="tray" data-day="${i}">`+
 `<h3>${t("В дне")} <span>${inDay.length} · ${inDayTime} ${t("· без времени — брось сюда")}</span>`+
 `</h3><div class="cubes">${basket}</div></section>
      ${pinned}<div class="shelves"><section class="panel trayp" data-drop="shelf"><h3>${t("Кубики целей")} <span>${goalsHere.length}</span>`+
 `</h3>${picker}${goalRows}</section>
+      <div class="side-shelves"><div class="side-top">${repeatables}<section class="panel trayp tomorrow-shelf">${offerColumn(t('Завтра'),tomorrow,true)}</section></div>
       <section class="panel trayp offers" data-drop="shelf">`+
 `<h3>${t("Brainalot и календарь")} <span>${others.length} ${t("· возможные")}</span>`+
-`</h3><div class="offer-columns">${offers}</div><div class="day-repeatables">${repeatables}</div></section></div><section class="panel trayp tomorrow-shelf">${offerColumn(t('Завтра'),tomorrow,true)}</section></div></div>
+`</h3><div class="offer-columns">${offers}</div></section></div></div></div>
   </div>`;
+}
+// Owner 2026-10-29: in Day, hovering a goal lights up all its cubes (timeline, clock, shelves);
+// hovering a cube lights up only its goal. Classes only: no re-render, nothing is saved.
+let hover=null;
+function paintHover(){
+  const doc=globalThis.document,root=doc?.querySelector?.('.app.dayapp');
+  doc?.querySelectorAll?.('.hl-link').forEach(n=>n.classList.remove('hl-link'));
+  if(!root)return;
+  root.classList.toggle('hl-on',hover?.from==='goal');
+  if(!hover)return;
+  if(hover.from==='goal')root.querySelectorAll('[data-cube]').forEach(n=>{if(ctx.cube(n.dataset.cube)?.goal===hover.goal)n.classList.add('hl-link');});
+  root.querySelectorAll('.dg[data-goal],.clab[data-goal],.gchip[data-goal]').forEach(n=>{if(n.dataset.goal===hover.goal)n.classList.add('hl-link');});
+}
+function hoverAt(target){
+  const el=U.screen==='day'&&!ctx.D?.pdrag&&!ctx.D?.rdrag?target?.closest?.('.dg[data-goal],.clab[data-goal],.gchip[data-goal],[data-cube]'):null;
+  const goal=el?(el.dataset.cube?ctx.cube(el.dataset.cube)?.goal||null:el.dataset.goal):null;
+  const next=goal?{goal,from:el.dataset.cube?'cube':'goal'}:null;
+  if(next?.goal!==hover?.goal||next?.from!==hover?.from){hover=next;paintHover();}
 }
 function dayGoals(i){
   const load=g=>S.cubes.filter(k=>k.goal===g.id&&k.day===i).reduce((a,k)=>a+k.min,0);
@@ -104,5 +120,5 @@ function hTrack(i){
   return `<div class="htrack" id="htrack" data-drop="track" data-day="${i}"><div class="hrs">${hours}</div>`+
     `<div class="grid"></div>${nowline}${blocks}</div>`;
 }
-Object.assign(ctx,{dayScreen,dayGoals,hTrack});
+Object.assign(ctx,{paintHover,hoverAt,dayScreen,dayGoals,hTrack});
 }

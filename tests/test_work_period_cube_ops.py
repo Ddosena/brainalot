@@ -112,7 +112,7 @@ def test_selected_merge_failure_is_atomic_without_moving_other_blocks(problem):
 
 
 @pytest.mark.parametrize("fact", ["progress", "actual", "history", "started"])
-def test_fact_rows_cannot_be_deleted_or_merged_and_source_is_unchanged(fact):
+def test_fact_rows_cannot_be_merged_but_goal_cube_can_be_deleted(fact):
     state = synthetic_state()
     current = read(state)
     row = next(row for row in current["cubes"] if row["id"] == "geometry")
@@ -125,11 +125,13 @@ def test_fact_rows_cannot_be_deleted_or_merged_and_source_is_unchanged(fact):
     else:
         row["status"] = "started"
     before = deepcopy(state)
-    for operation, payload in [(cube_ops.delete, {"cube_id": "geometry"}),
-            (cube_ops.merge, {"cube_ids": ["geometry", "slides"], "title": "Invalid"})]:
-        with pytest.raises(ValidationError, match="факты"):
-            operation(state, payload, current, *([model._place] if operation == cube_ops.merge else []))
+    with pytest.raises(ValidationError, match="факты"):
+        cube_ops.merge(state, {"cube_ids": ["geometry", "slides"], "title": "Invalid"}, current, model._place)
     assert state == before
+    # Owner 2026-10-29: a done/started goal cube can be deleted; native facts stay stored for undo.
+    deleted = cube_ops.delete(state, {"cube_id": "geometry"}, current)
+    assert "geometry" in deleted["period_planner"]["cancellations"]
+    assert deleted["planning"] == before["planning"] and state == before
 
 
 def test_delete_selected_cube_cancels_scope_preserves_parent_siblings_facts_and_replay(planner):

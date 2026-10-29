@@ -219,6 +219,7 @@ export function installDialogs(ctx) {
     const completion=ctx.isDone(g)?['goal-reopen',t('Вернуть в работу')]:['goal-done',t('Готово — на полку')];
     return [
       ['open-goal',t('Открыть')],manual?completion:null,['new-cube',t('+ Кубик в цель')],
+      ctx.isDone(g)?null:['goal-hide',g.hidden?t('Показать на неделе'):t('Скрыть с недели')],
       ['goal-delete',t('Удалить цель'),'danger'],
     ];
   }
@@ -226,7 +227,9 @@ export function installDialogs(ctx) {
     const completion=k.pct>=100?['cube-reopen',t('Вернуть в работу')]:['cube-done',t('Готово')];
     const unplace=k.day!=null&&k.pct<100?['cube-unplace',t('Убрать из дня')]:null;
     const label=k.repeatable_id?t('Открыть повторяемый кубик'):t('Сделать повторяемым');
-    return [['open-cube',t('Открыть')],completion,unplace,['cube-repeatable',label],['cube-delete',t('Удалить кубик'),'danger']];
+    // Owner 2026-10-28: «⧉» adds another part of the same cube (its minutes add up); Ctrl+drag does the same at a chosen time.
+    const part=k.goal&&k.pct<100?['cube-part','⧉ '+t('Ещё часть')]:null;
+    return [['open-cube',t('Открыть')],completion,unplace,part,['cube-repeatable',label],['cube-delete',t('Удалить кубик'),'danger']];
   }
   function menuContent(m) {
     if(m.kind==='day') {
@@ -234,6 +237,10 @@ export function installDialogs(ctx) {
       return {title:`${DOWF[wd(day)]} · ${ddmm(day)}`,items:[
         ['go-day',t('Перейти в день')],['new-cube-day',t('+ Кубик в этот день')],['new-goal',t('+ Цель с этого дня')],
       ]};
+    }
+    if(m.kind==='goalblock') {
+      const [id,s,e]=m.id.split('|'),g=ctx.goal(id);
+      return g?{title:`${g.title} · ${ddmm(+s)}${s===e?'':'–'+ddmm(+e)}`,items:[['goal-block-remove',t('Убрать блок'),'danger']]}:null;
     }
     if(m.kind==='repeatable') {
       const item=ctx.repeatable(m.id);

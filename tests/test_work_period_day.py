@@ -144,6 +144,18 @@ def test_exact_current_forecast_materializes_only_when_facts_are_committed(plann
     assert next(task for task in closed['tasks'] if task['id'] == 'a')['status'] == 'completed'
 
 
+def test_short_forecast_tail_off_the_five_minute_grid_stays_executable(planner):
+    # Owner report 2026-10-28: a 24-minute forecast tail blocked readiness and delete.
+    from megamozg.work_period import day
+    planning = deepcopy(planner.snapshot()['state']['planning'])
+    source = next(cube for cube in planning['result']['cubes'] if cube.get('task_id') == 'a' and not cube.get('locked'))
+    source.update(minutes=24, is_remainder=True)
+    spec = day._proven_task_source(planning, 'planned-'+source['id'])
+    assert spec is not None and spec['minutes'] == 25 and spec['kind'] == 'task'
+    source['minutes'] = 3
+    assert day._proven_task_source(planning, 'planned-'+source['id'])['minutes'] == 5
+
+
 def test_composite_exact_forecast_leaves_progress_atomically_and_prorata(planner):
     candidates = [cube for cube in planner.model()['cubes'] if cube.get('candidate') and cube.get('task_id') == 'a'][:2]
     assert len(candidates) == 2

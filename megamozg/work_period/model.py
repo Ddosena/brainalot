@@ -27,7 +27,7 @@ from . import library_rules
 from . import color_rules
 
 NAMESPACE = "period_planner"
-ACTIONS = frozenset({"cube_activity_set", "cube_pin", "repeatable_save", "repeatable_delete", "repeatable_drop", "prep_repeatable_cleanup", "undo", "ui_batch", "cube_reassign", "period_set", "period_shift", "period_clear", "project_visibility", "cube_select", "cube_return",
+ACTIONS = frozenset({"cube_activity_set", "cube_pin", "repeatable_save", "repeatable_delete", "repeatable_drop", "prep_repeatable_cleanup", "undo", "ui_batch", "cube_reassign", "period_set", "period_shift", "period_clear", "project_visibility", "goal_hide", "cube_select", "cube_return",
     "cube_move", "cube_time", "cube_merge", "cube_rename", "cube_cancel", "task_rename",
     "calendar_source_import", "calendar_event_move", "calendar_offer_estimate", "cube_resize", "cube_drop", "course_source_import", "calendar_event_rename", "assignment_rename", "cube_delete"}) | ruler_rules.ACTIONS | color_rules.ACTIONS
 CONTEXT_FIELDS = frozenset({"mode", "date", "week_start", "cube_id", "task_id", "project_id", "window_start", "expanded_week", "calendar_event_id"})
@@ -574,7 +574,8 @@ def read_model(snapshot):
     for cube in cubes:
         cube["pinned"] = bool(ext.get("cube_pins", {}).get(cube["id"]))
         cube["time_retained"] = bool(ext.get("time_retained", {}).get(cube["id"]))
-        default = "work" if cube.get("kind") in {"task", "prep", "weekly_review"} else "personal"
+        timed_calendar = cube.get("kind") in {"calendar", "calendar_optional"} and not cube.get("all_day")
+        default = "work" if cube.get("kind") in {"task", "prep", "weekly_review"} or timed_calendar else "personal"
         explicit = cube.get("activity_kind")
         canonical = explicit if isinstance(explicit, str) and explicit in {"work", "personal"} else default
         cube["activity_kind"] = canonical if cube.get("standalone") else ext.get("cube_activity", {}).get(cube["id"], canonical)
@@ -676,6 +677,7 @@ def read_model(snapshot):
             # The day of an explicit "done" outcome; reopening replaces exactly that fact.
             "completed_on": completed_on,
             "volume_by_cubes": bool(ext.get("volume_by_cubes", {}).get(tid)),
+            "hidden": bool(ext.get("hidden_goals", {}).get(tid)),
             "period_explicit": bool(explicit), "source_status": source.get("status"),
             # A manual task is the owner's own: all its fields are editable in Week.
             "origin": native.get("origin", "agent"),
@@ -1078,6 +1080,18 @@ def apply_command(state, action, data, library_notes=None):
         if data["project_id"] not in {p["id"] for p in model["projects"]} or type(data["visible"]) is not bool:
             raise ValidationError("Требуются существующий проект и visible=true/false")
         ext.setdefault("visibility", {})[data["project_id"]] = data["visible"]
+        return state
+    if action == "goal_hide":
+        # Owner 2026-10-28: hiding only moves a goal out of the Week chart into a
+        # thin reminder line; cubes, facts and percentages are untouched.
+        _fields(data, {"task_id", "hidden"})
+        if data["task_id"] not in {t["id"] for t in model["tasks"]} or type(data["hidden"]) is not bool:
+            raise ValidationError("Требуются существующая цель и hidden=true/false")
+        hidden = ext.setdefault("hidden_goals", {})
+        if data["hidden"]:
+            hidden[data["task_id"]] = True
+        else:
+            hidden.pop(data["task_id"], None)
         return state
     required = {"cube_id", "date"} if action in {"cube_select", "cube_move"} else {"cube_id", "start"} if action == "cube_time" else {"cube_id", "title"} if action == "cube_rename" else {"cube_id", "reason"} if action == "cube_cancel" else {"cube_id"}
     _fields(data, required, {"start"} if action in {"cube_select", "cube_move"} else ())

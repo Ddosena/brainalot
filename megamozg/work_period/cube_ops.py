@@ -75,14 +75,28 @@ def _title(value):
     return value.strip()
 
 
-def _unstarted(row, *, inactive_cleanup=False, stale_cleanup=False):
+def fact_delete_allowed(state, row):
+    """Owner 2026-10-29: a done or started goal/repeatable cube (also a merged one) may be deleted.
+    It is the usual cancellation overlay, so native facts stay stored and undo restores them.
+    Library cubes keep their own deletion path through the Note."""
+    return row.get("kind") in {"task", "repeatable"} and not row.get("standalone")
+
+
+def _factual(row):
+    return bool(row.get("progress_percent") or row.get("actual_minutes")
+            or row.get("historical_facts") or row.get("factual") or row.get("started")
+            or row.get("status") in {"started", "completed"})
+
+
+def _unstarted(row, *, inactive_cleanup=False, stale_cleanup=False, allow_facts=False):
     if row.get("status") == "cancelled":
         raise ValidationError("Кубик уже удалён или отменён; его история сохранена")
-    if (row.get("progress_percent") or row.get("actual_minutes")
-            or row.get("historical_facts") or row.get("factual") or row.get("started")
-            or row.get("status") in {"started", "completed"}):
+    factual = _factual(row)
+    if factual and not allow_facts:
         raise ValidationError("У кубика уже есть факты выполнения: удаление и объединение запрещены")
-    if not row.get("available") and not stale_cleanup and not (inactive_cleanup and library_rules.can_cleanup(row)):
+    # A completed cube is unavailable only because it is done; the owner may still delete it.
+    if (not row.get("available") and not (allow_facts and factual) and not stale_cleanup
+            and not (inactive_cleanup and library_rules.can_cleanup(row))):
         raise ValidationError("Кубик недоступен: проверьте остаток и границы ответственности")
 
 
@@ -143,7 +157,10 @@ def delete(state, data, model):
     if row.get("kind") not in {"task", "prep", "weekly_review", "calendar_optional", "brainalot", "repeatable"}:
         raise ValidationError("Этот источник нельзя удалить действием для кубика")
     stale_cleanup = stale_cleanup_allowed(state, row)
-    _unstarted(row, inactive_cleanup=True, stale_cleanup=stale_cleanup)
+    # Owner 2026-10-29: completed or started cubes can be deleted too. Deletion is the usual
+    # cancellation overlay: native facts stay stored (undo restores them), the cube and its
+    # credit leave the goal.
+    _unstarted(row, inactive_cleanup=True, stale_cleanup=stale_cleanup, allow_facts=fact_delete_allowed(state, row))
     result = deepcopy(state)
     ext = result.setdefault(NAMESPACE, {})
     ext.setdefault("cancellations", {})[cube_id] = {

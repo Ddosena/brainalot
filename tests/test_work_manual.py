@@ -344,7 +344,7 @@ def test_manual_cube_resize_uses_final_interval_and_grows_volume(planner):
     assert next(t for t in result['tasks'] if t['id'] == task['id'])['minutes'] == 135
     assert any('вырос' in warning for warning in result['warnings'])
     state = planner.store.read()
-    for minutes in (0, 10, 16, 255):
+    for minutes in (0, 3, 16, 255):
         with pytest.raises(ValidationError):
             week_op(planner, 'cube_resize', {'cube_id': cube['id'], 'date': monday.isoformat(), 'start': '12:45', 'minutes': minutes})
         assert planner.store.read() == state
@@ -432,6 +432,20 @@ def test_repeatable_template_makes_independent_instances_and_preserves_facts(pla
     week_op(planner, 'cube_return', {'cube_id': c2['id']})
     assert all(c['id'] != c2['id'] for c in planner.model()['cubes'])
     assert any(r['id'] == builtin['id'] for r in planner.model()['repeatables'])
+
+
+def test_repeatable_instance_resizes_freely_without_changing_template(planner):
+    # Owner report 2026-10-28: stretching «П. к уроку» was refused as a task stage.
+    _, monday = started(planner)
+    builtin = next(r for r in planner.model()['repeatables'] if r['id'] == 'prep-universal')
+    dropped = week_op(planner, 'repeatable_drop', {'repeatable_id': builtin['id'], 'date': monday.isoformat(), 'start': '17:15'})
+    instance = next(c for c in dropped['cubes'] if c.get('repeatable_id') == builtin['id'])
+    assert instance['can_resize'] is True
+    for start, minutes in (('17:00', 40), ('17:00', 20)):
+        week_op(planner, 'cube_resize', {'cube_id': instance['id'], 'date': monday.isoformat(), 'start': start, 'minutes': minutes})
+        row = next(c for c in planner.model()['cubes'] if c['id'] == instance['id'])
+        assert (row['minutes'], row['start']) == (minutes, start)
+    assert next(r for r in planner.model()['repeatables'] if r['id'] == builtin['id'])['minutes'] == 25
 
 
 def test_make_repeatable_from_existing_cube_copies_details_without_facts(planner):

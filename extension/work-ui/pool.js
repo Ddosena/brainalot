@@ -29,9 +29,21 @@ export function unpinnedPossible(ctx, day){
   const cubes=ctx.possibleOn?ctx.possibleOn(day):ctx.S.cubes.filter(k=>!k.goal&&k.day==null&&!k.repeatable_instance);
   return cubes.filter(k=>!k.pinned);
 }
+// Owner 2026-10-28: «в плане» is the whole working day — the day's cubes plus timed calendar
+// events (lessons, webinars); overlapping events count once.
+export function dayPlanMinutes(cubes,events){
+  let sum=cubes.reduce((a,k)=>a+k.min,0),end=-Infinity;
+  for(const e of [...events].sort((a,b)=>a.at-b.at)){const from=Math.max(e.at,end),to=e.at+e.min;if(to>from){sum+=to-from;end=to;}}
+  return sum;
+}
 export function addCubeButton(ctx,id,inDay=false){
   return `<button class="addcap" data-act="new-cube" data-arg="${ctx.esc(id)}" title="${inDay?t('Добавить кубик в этот день'):t('Добавить кубик в цель')}">`+
     `<b>+</b><small>${t('кубик')}</small></button>`;
+}
+// Owner 2026-10-28: a timeline cube names its goal at the bottom; a long title keeps its first two meaningful words.
+function goalTag(title){
+  const text=String(title||'').trim(),words=text.split(/\s+/).filter(w=>w.length>2);
+  return text.length>18&&words.length>2?words.slice(0,2).join(' '):text;
 }
 export function trackBlock(ctx,e,{axis,position,size,live=false}){
   const horizontal=axis==='h',end=e.at+e.min,time=`${ctx.clk(e.at)}–${ctx.clk(end)}`,title=ctx.esc(e.title);
@@ -45,33 +57,47 @@ export function trackBlock(ctx,e,{axis,position,size,live=false}){
   const cube=e.isGhost?'':` data-cube="${ctx.esc(e.id)}"`,dragAttr=drag?` data-drag="${ctx.esc(e.id)}"`:'';
   const resize=side=>drag?`<span class="rz ${side}" data-resize="${side}" data-id="${ctx.esc(e.id)}"></span>`:'';
   const first=resize(horizontal?'l':'t'),last=resize(horizontal?'r':'b'),mark=done?'✓ ':'';
-  const hint=horizontal?` title="${title} · ${time}"`:'';
+  const goalTitle=e.goal?ctx.goal(e.goal)?.title:'',tag=goalTitle?`<em class="gt">${ctx.esc(goalTag(goalTitle))}</em>`:'';
+  const hint=horizontal?` title="${title} · ${time}${goalTitle?' · '+ctx.esc(goalTitle):''}"`:'';
   return `<div class="${axis}b${cls}"${cube}${dragAttr} style="${geometry};--c:${ctx.colorOf(e)};--p:${e.pct}%"${hint}>`+
-    `${first}<i></i>${mark}${title}<small>${time}</small>${last}</div>`;
+    `${first}<i></i>${mark}${title}<small>${time}</small>${tag}${last}</div>`;
 }
 export function installPool(ctx){
   const {S,U,esc}=ctx;
   const activeGoals=()=>S.goals.filter(g=>!ctx.isDone(g)&&ctx.visible(g));
+  // Owner 2026-10-29: in Day the goal shelf is a multi-select of goal chips. Until the owner picks,
+  // the goals of the day are selected; after that U.poolGoals is exactly the owner's choice (may be empty).
   function poolGoals(day){
+    if(U.screen==='day'){
+      const active=activeGoals();
+      if(Array.isArray(U.poolGoals))return U.poolGoals.map(id=>active.find(g=>g.id===id)).filter(Boolean);
+      return active.filter(g=>g.s<=day&&g.e>=day);
+    }
     const selected=activeGoals().find(g=>g.id===U.poolGoal);
     if(selected)return [selected];
-    const today=activeGoals().filter(g=>g.s<=day&&g.e>=day);
-    return U.screen==='day'?[today[0]||activeGoals()[0]].filter(Boolean):today;
+    return activeGoals().filter(g=>g.s<=day&&g.e>=day);
   }
-  function projectOptions(project, list, selected){
-    const goals=list.filter(g=>g.p===project.id);
-    if(!goals.length)return '';
-    const options=goals.map(g=>{
-      const chosen=g.id===selected?.id?' selected':'';
-      return `<option value="${esc(g.id)}"${chosen}>${esc(g.title)}</option>`;
+  function togglePoolGoal(id){
+    const current=poolGoals(U.day).map(g=>g.id);
+    U.poolGoals=current.includes(id)?current.filter(x=>x!==id):[...current,id];
+  }
+  // Nearest goals first: those running on the day, then by distance to their dates.
+  function nearGoals(day){
+    const dist=g=>g.s<=day&&day<=g.e?0:Math.min(Math.abs(g.s-day),Math.abs(g.e-day));
+    return activeGoals().sort((a,b)=>dist(a)-dist(b)||a.e-b.e||a.s-b.s);
+  }
+  function goalChips(){
+    const list=nearGoals(U.day);if(!list.length)return '';
+    const chosen=new Set(poolGoals(U.day).map(g=>g.id));
+    const chips=list.map(g=>{
+      const on=chosen.has(g.id),range=g.s===g.e?ctx.ddmm(g.s):`${ctx.ddmm(g.s)}–${ctx.ddmm(g.e)}`;
+      // A pill like variant B of the stand: colour dot, name (cut to one size), share done.
+      return `<button class="gchip${on?' on':''}" data-act="pool-goal" data-arg="${esc(g.id)}" data-goal="${esc(g.id)}" aria-pressed="${on}" `+
+        `title="${esc(g.title)} · ${range} · ${g.pct}%" style="--c:${ctx.goalColor(g)}"><span class="dot"></span><b>${esc(g.title)}</b><small>${g.pct}%</small></button>`;
     }).join('');
-    return `<optgroup label="${esc(project.name)}" style="color:${project.c}">${options}</optgroup>`;
+    return `<div class="goal-chips" data-scroll-strip tabindex="0" aria-label="${t('Цели')}">${chips}</div>`;
   }
-  function goalPicker(){
-    const list=activeGoals(),selected=poolGoals(U.day)[0];if(!list.length)return '';
-    const options=S.projects.filter(p=>!p.hidden).map(p=>projectOptions(p,list,selected)).join('');
-    return `<div class="goal-picker" style="--c:${ctx.goalColor(selected)}"><span aria-hidden="true"></span>`+
-      `<select data-pool-goal aria-label="${t('Выбрать цель')}">${options}</select></div>`;
-  }
-  Object.assign(ctx,{possibleOn:day=>possibleOn(S.cubes,ctx.iso(day)),poolGoals,goalPicker});
+
+
+  Object.assign(ctx,{possibleOn:day=>possibleOn(S.cubes,ctx.iso(day)),poolGoals,goalChips,togglePoolGoal});
 }

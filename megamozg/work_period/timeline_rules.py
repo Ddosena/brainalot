@@ -11,7 +11,7 @@ def capabilities(cube):
         return True, None
     if cube.get("actual_minutes") or cube.get("progress_percent"):
         return False, "У кубика уже есть выполненная работа; её длительность здесь не меняется"
-    if cube.get("kind") in {"prep", "weekly_review", "brainalot"}:
+    if cube.get("kind") in {"prep", "weekly_review", "brainalot", "repeatable"}:
         return True, None
     if cube.get("kind") == "calendar_optional":
         if cube.get("source_duration_minutes") is not None:
@@ -27,13 +27,15 @@ def enrich(state, cubes):
     overrides = state.get("period_planner", {}).get("cube_durations", {})
     for cube in result:
         cube.setdefault("source_minutes", cube["minutes"])
-        if not cube.get("standalone") and cube["id"] in overrides and cube.get("kind") in {"task", "prep", "weekly_review", "brainalot"}:
+        if not cube.get("standalone") and cube["id"] in overrides and cube.get("kind") in {"task", "prep", "weekly_review", "brainalot", "repeatable"}:
             cube["minutes"] = overrides[cube["id"]]
         cube["source_duration_unknown"] = cube.get("kind") == "calendar_optional" and cube.get("source_duration_minutes") is None
         cube["can_resize"], cube["resize_block_reason"] = capabilities(cube)
         factual = bool(cube.get("actual_minutes") or cube.get("progress_percent") or cube.get("historical_facts") or cube.get("factual") or cube.get("started") or cube.get("status") in {"started", "completed"})
         from .cube_ops import stale_cleanup_allowed
-        cube["can_delete"] = bool((cube.get("available", True) and cube.get("status") != "cancelled" and not factual)
+        from .cube_ops import fact_delete_allowed
+        cube["can_delete"] = bool((cube.get("status") != "cancelled" and (cube.get("available", True) and not factual
+                                   or factual and fact_delete_allowed(state, cube)))
                                   or stale_cleanup_allowed(state, cube))
         cube["delete_block_reason"] = None if cube["can_delete"] else "У кубика есть факты выполнения" if factual else "Кубик недоступен или уже удалён"
         if cube.get("selected_date") and cube.get("start"):
@@ -52,7 +54,7 @@ def resize(state, data, model, place):
     if not allowed:
         raise ValidationError(reason)
     if not cube.get("selected_date"):
-        if cube.get("kind") not in {"task", "brainalot", "prep", "weekly_review"} or data["date"] is not None or data["start"] is not None:
+        if cube.get("kind") not in {"task", "brainalot", "prep", "weekly_review", "repeatable"} or data["date"] is not None or data["start"] is not None:
             raise ValidationError("Сначала разместите кубик на времени")
     elif cube.get("start") is not None and (not isinstance(data["start"], str) or not data["start"]):
         raise ValidationError("Для изменения границы укажите точное начало ЧЧ:ММ")
@@ -60,8 +62,9 @@ def resize(state, data, model, place):
         raise ValidationError("Для изменения границы укажите точное начало ЧЧ:ММ")
     minimum = 0 if cube["kind"] in {"prep", "weekly_review"} else 1
     if cube["kind"] == "task":
-        if type(data["minutes"]) is not int or not 15 <= data["minutes"] <= 240 or data["minutes"] % 15:
-            raise ValidationError("Длительность кубика: 15–240 минут, шаг 15 минут")
+        # The timeline snaps edges to 15 minutes, so a 25-minute cube can become 40.
+        if type(data["minutes"]) is not int or not 5 <= data["minutes"] <= 240 or data["minutes"] % 5:
+            raise ValidationError("Длительность кубика: 5–240 минут, шаг 5 минут")
     elif type(data["minutes"]) is not int or not minimum <= data["minutes"] <= 1440:
         raise ValidationError(f"Укажите целое число минут от {minimum} до 1440")
     # Validate the final interval before changing native duration or allocation.

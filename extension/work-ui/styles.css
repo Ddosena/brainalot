@@ -74,6 +74,7 @@ border:1px solid color-mix(in srgb,var(--c) 75%,transparent);padding:4px 10px;ov
 .gband.cut-l{border-left-style:dashed;border-top-left-radius:0;border-bottom-left-radius:0;margin-left:0}
 .gband.cut-r{border-right-style:dashed;border-top-right-radius:0;border-bottom-right-radius:0;margin-right:0}
 .gband.dragging{cursor:grabbing;z-index:5;box-shadow:0 8px 22px rgba(0,0,0,.3)}
+.gband.done{opacity:.55;cursor:pointer;border-style:dashed}
 .wk.edge-next::after,.wk.edge-prev::after{content:attr(data-edge);position:absolute;top:50%;transform:translateY(-50%);padding:6px 10px;
 border-radius:7px;background:var(--accent);color:var(--accent-ink);font-size:12px;z-index:9}
 .wk.edge-next::after{right:6px}.wk.edge-prev::after{left:6px}
@@ -216,6 +217,7 @@ pointer-events:none}
 .vb{position:absolute;left:12px;right:4px;border-radius:var(--br);background:color-mix(in srgb,var(--c) 28%,var(--surface));border:1px solid var(--c);
 padding:3px 8px;font-size:11.5px;overflow:hidden;z-index:2;touch-action:none;cursor:grab;line-height:1.25}
 .vb small{display:block;color:var(--muted);font-size:10px}
+.vb .gt{display:block;font-size:9.5px;font-style:normal;opacity:.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vb i{position:absolute;left:0;bottom:0;height:3px;width:var(--p);background:var(--c)}
 .vb.fixed{left:-4px;right:-6px;background:var(--important);border-color:var(--important);color:#3a2700;font-weight:650;z-index:3;cursor:default}
 .vb.fixed small{color:#6b4c0a}
@@ -367,6 +369,7 @@ text-overflow:ellipsis;background:color-mix(in srgb,var(--c) 32%,var(--surface))
 .htrack .hb.live{box-shadow:0 0 0 2px var(--hand)}
 .htrack .hb i{position:absolute;left:0;bottom:0;height:3px;width:var(--p);background:var(--c)}
 .htrack .hb small{opacity:.75;margin-left:6px}
+.htrack .hb .gt{position:absolute;left:8px;right:8px;bottom:5px;font-size:9.5px;font-style:normal;opacity:.7;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
 .htrack .hb .rz{position:absolute;top:0;bottom:0;width:8px;cursor:ew-resize;z-index:2}
 .htrack .hb .rz.l{left:0}.htrack .hb .rz.r{right:0}
 .htrack .hb .rz::after{content:"";position:absolute;top:30%;bottom:30%;left:3px;width:2px;border-radius:1px;background:var(--c);opacity:.8}
@@ -469,4 +472,38 @@ border:1px solid var(--done);font-weight:700;font-size:12px;white-space:nowrap;t
 .vb.done small{color:var(--text)}
 .done-tile small,.arrow .mb>span{opacity:1}
 .arrow .mb>span{color:var(--text)}
-
+.hidden-goals{display:flex;flex-direction:column;gap:3px;margin:0 0 6px}
+.hg{display:flex;align-items:center;gap:8px;min-width:0;padding:2px 8px;border:1px dashed color-mix(in srgb,var(--c) 55%,var(--line));border-radius:var(--br);font-size:11.5px;color:var(--muted)}
+.hg .link{padding:0;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.hg small{white-space:nowrap}.hg .link:last-child{margin-left:auto;color:var(--muted)}
+.hg-cube{flex:none;max-width:220px;padding:1px 7px;border-radius:6px;background:color-mix(in srgb,var(--c) 30%,var(--surface));border:1px solid var(--c);color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:grab;touch-action:none}
+.gband.extra{cursor:pointer;border-style:dotted;background:color-mix(in srgb,var(--c) 14%,var(--surface))}
+/* Owner 2026-10-28: repeatables and «Завтра» sit on top of the right column, above a denser «Brainalot и календарь». */
+.side-shelves{display:grid;gap:12px;min-width:0;align-content:start}
+.side-top{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;min-width:0}
+.side-top>.panel{margin:0;max-width:none}.side-top .repeatables{padding:10px}.side-top .tomorrow-shelf .tomorrow{max-width:none}
+.side-shelves .offer-columns{grid-template-columns:minmax(0,1fr) max-content;gap:10px}
+/* Owner 2026-10-28: a roomier goal area so overlapping goals are easy to see and drag. */
+.wk{grid-auto-rows:48px;row-gap:8px;padding:12px 0;min-height:150px}
+/* Owner 2026-10-29: goal ↔ cube hover link in Day. */
+.dayapp [data-cube],.dayapp .dg,.dayapp .clab{transition:opacity .12s,filter .12s,box-shadow .12s}
+.dayapp.hl-on [data-cube]:not(.hl-link){opacity:.42}
+.dayapp [data-cube].hl-link{filter:brightness(1.18) drop-shadow(0 0 6px var(--accent))}
+.dayapp .dg.hl-link,.dayapp .clab.hl-link{position:relative;z-index:1;transform:translateY(-2px);
+background:color-mix(in srgb,var(--c,var(--accent)) 26%,var(--surface));
+box-shadow:0 0 0 3px var(--c,var(--accent)),0 0 22px 4px color-mix(in srgb,var(--c,var(--accent)) 60%,transparent)}
+.dayapp .dg.hl-link .t,.dayapp .clab.hl-link b{color:var(--text)}
+/* Owner 2026-10-29: goal pills (variant B of the stand) — equal width, two rows, wheel/drag scroll, multi-select. */
+.goal-chips{display:grid;grid-template-rows:repeat(2,auto);grid-auto-flow:column;grid-auto-columns:200px;gap:7px 8px;overflow-x:auto;overflow-y:hidden;
+padding:3px 3px 9px;margin:0 0 12px;scrollbar-width:thin;overscroll-behavior:contain}
+.gchip{display:flex;align-items:center;gap:7px;width:200px;height:32px;padding:0 12px 0 10px;border-radius:999px;cursor:pointer;
+border:1px solid color-mix(in srgb,var(--c) 50%,var(--line));background:transparent;color:var(--text);font-size:12px;
+transition:background .15s,border-color .15s,box-shadow .15s}
+.gchip .dot{flex:none;width:9px;height:9px;border-radius:3px;background:var(--c)}
+.gchip b{flex:1;min-width:0;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
+.gchip small{flex:none;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.gchip:hover{background:color-mix(in srgb,var(--c) 12%,transparent);border-color:color-mix(in srgb,var(--c) 75%,var(--line))}
+.gchip.on{background:color-mix(in srgb,var(--c) 28%,var(--surface));border-color:var(--c)}
+.gchip.on b{font-weight:650}.gchip.on small{color:var(--text)}
+.gchip:focus-visible{outline:2px solid var(--c);outline-offset:2px}
+.dayapp .gchip.hl-link{box-shadow:0 0 0 3px var(--c),0 0 16px 2px color-mix(in srgb,var(--c) 50%,transparent)}

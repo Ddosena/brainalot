@@ -3,13 +3,14 @@ function fieldKey(node) {
   if(node.nodeType!==1)return false;
   if(node.id)return node.id;
   const radioValue=node.type==='radio'?node.value:'';
-  const {field,id,srcInput,cube,goal}=node.dataset;
+  const {field,id,srcInput,cube,goal,seg}=node.dataset;
   if(field)return `field:${field}:${id}:${radioValue}`;
   if(srcInput)return `source:${srcInput}`;
   const kind=node.nodeName,firstClass=node.classList[0];
   // Preserve the existing cube key, including its newline.
   if(cube)return `cube:${kind}:\n${firstClass}:${cube}`;
-  if(goal)return `goal:${kind}:${firstClass}:${goal}`;
+  // One goal may have several Week blocks; data-seg keeps them apart.
+  if(goal)return `goal:${kind}:${firstClass}:${goal}${seg?':'+seg:''}`;
   if(node.name)return `name:${node.name}:${radioValue}`;
   return '';
 }

@@ -18,6 +18,7 @@ function weekScreen(){
 `<b>${ddmm(ws)} — ${ddmm(end)}</b><button class="tri" data-act="week-next" aria-label="${t("Следующая неделя")}">`+
 `▶</button>${todayButton}
     <span class="navhint">${t("тяни цель — перенос · края — дни · держи у края — соседняя неделя · правая кнопка — меню")}</span></div>
+   ${hiddenGoals()}
    <section class="panel"><div class="wk" data-from="${ws}" style="background:${wkBackground(ws)}">${bands()}</div>`+
 `<div class="days">${dayCells}</div></section>
    ${doneShelf()}
@@ -33,34 +34,74 @@ function wkBackground(ws){
     `color-mix(in srgb,var(--today) 70%,transparent) calc(100%/7*${t}) calc(100%/7*${next}),`+
     `transparent calc(100%/7*${next}))`;
 }
-function goalBand(g,ws,a,b,r){
+// Owner 2026-10-28: neighbouring goals get calm shades of their project colour so they do not merge.
+const SHADES=[100,72,52];
+function goalBand(g,ws,a,b,r,i=0,extra=null,view={s:g.s,e:g.e}){
+  if(extra)return extraBand(g,ws,a,b,r,i,extra);
   const n=S.cubes.filter(k=>k.goal===g.id).length;
-  const cls=(g.id===U.sel?' sel':'')+(g.s<ws?' cut-l':'')+(g.e>ws+6?' cut-r':'');
-  const left=g.s>=ws?`<span class="edge l" title="${t('Тяни — начало')}"></span>`:'';
-  const right=g.e<=ws+6?`<span class="edge r" title="${t('Тяни — конец')}"></span>`:'';
-  const range=g.s===g.e?ddmm(g.s):`${ddmm(g.s)}–${ddmm(g.e)}`;
+  // Owner 2026-10-28: completed goals stay on their dates (faded, ✓), so past weeks show what was done;
+  // they remain draggable like any goal.
+  const done=ctx.isDone(g),cls=(g.id===U.sel?' sel':'')+(view.s<ws?' cut-l':'')+(view.e>ws+6?' cut-r':'')+(done?' done':'');
+  const left=view.s>=ws?`<span class="edge l" title="${t('Тяни — начало')}"></span>`:'';
+  const right=view.e<=ws+6?`<span class="edge r" title="${t('Тяни — конец')}"></span>`:'';
+  const range=view.s===view.e?ddmm(view.s):`${ddmm(view.s)}–${ddmm(view.e)}`;
   const volume=g.auto&&!g.h?t('объём по кубикам'):String(g.h).replace('.',',')+t(' ч');
   const count=n?` · ${n} ${t('куб.')}`:'',due=g.due!=null?t(' · срок ')+ddmm(g.due):'';
   const colStart=a+1,colEnd=b+2,row=r+1;
   return `<div class="gband${cls}" role="button" tabindex="0" aria-label="${esc(g.title)}" `+
-    `data-act="open-goal" data-arg="${esc(g.id)}" data-band data-goal="${esc(g.id)}" `+
-    `style="grid-column:${colStart}/${colEnd};grid-row:${row};--c:${ctx.goalColor(g)};--p:${g.pct}%" `+
-    `title="${esc(g.title)} ${t('— нажми, чтобы открыть; тяни, чтобы перенести')}">${left}<i></i><b>${esc(g.title)}</b>`+
+    `data-act="open-goal" data-arg="${esc(g.id)}" data-band data-vs="${view.s}" data-ve="${view.e}" data-goal="${esc(g.id)}" `+
+    `style="grid-column:${colStart}/${colEnd};grid-row:${row};--c:color-mix(in srgb,${ctx.goalColor(g)} ${SHADES[i%SHADES.length]}%,#8c929b);--p:${g.pct}%" `+
+    `title="${esc(g.title)} ${t('— нажми, чтобы открыть; тяни, чтобы перенести')}">${left}<i></i><b>${done?'✓ ':''}${esc(g.title)}</b>`+
     `<small>${range} · ${volume} · ${g.pct}%${count}${due}</small>${right}</div>`;
+}
+// Owner 2026-10-28: a cube placed outside its goal period gives the goal a separate block on those days
+// instead of stretching the period. It is a projection of the cubes: it cannot be dragged or resized.
+// Days right next to the period (or to each other) are one block; a separate block needs a gap of a day.
+function goalSpans(g){
+  const days=[...new Set(S.cubes.filter(k=>k.goal===g.id&&k.day!=null&&k.status!=='cancelled'&&(k.day<g.s||k.day>g.e)).map(k=>k.day))].sort((x,y)=>x-y);
+  const blocks=[];for(const d of days){const last=blocks[blocks.length-1];if(last&&d===last.e+1)last.e=d;else blocks.push({s:d,e:d});}
+  const view={s:g.s,e:g.e};let merged=true;
+  while(merged){merged=false;for(const x of blocks)if(!x.used&&x.e+1>=view.s&&x.s<=view.e+1){view.s=Math.min(view.s,x.s);view.e=Math.max(view.e,x.e);x.used=merged=true;}}
+  return {view,extras:blocks.filter(x=>!x.used)};
+}
+function extraBand(g,ws,a,b,r,i,span){
+  const n=S.cubes.filter(k=>k.goal===g.id&&k.day!=null&&k.day>=span.s&&k.day<=span.e).length;
+  const range=span.s===span.e?ddmm(span.s):`${ddmm(span.s)}–${ddmm(span.e)}`;
+  return `<div class="gband extra${g.id===U.sel?' sel':''}" role="button" tabindex="0" aria-label="${esc(g.title)}" `+
+    `data-act="open-goal" data-arg="${esc(g.id)}" data-goal="${esc(g.id)}" data-seg="${span.s}" data-seg-end="${span.e}" `+
+    `style="grid-column:${a+1}/${b+2};grid-row:${r+1};--c:color-mix(in srgb,${ctx.goalColor(g)} ${SHADES[i%SHADES.length]}%,#8c929b);--p:0%" `+
+    `title="${esc(g.title)} ${t('— отдельный блок: кубик вне периода цели · правая кнопка — убрать блок')}"><i></i><b>${esc(g.title)}</b>`+
+    `<small>${range} · ${n} ${t('куб.')} ${t('вне периода')}</small></div>`;
+}
+// Owner 2026-10-28: a hidden unfinished goal leaves the chart but stays as a thin line above it:
+// its next unfinished cube (still draggable into a day), the goal, done share and what is left.
+function hiddenGoals(){
+  const rows=S.goals.filter(g=>g.hidden&&!ctx.isDone(g)&&ctx.visible(g)).map(g=>{
+    const own=ctx.readinessCubes(g),left=own.filter(k=>k.pct<100),next=left[0]||S.cubes.find(k=>k.goal===g.id&&k.pct<100&&k.available!==false);
+    const cube=next?`<span class="hg-cube" data-cube="${esc(next.id)}"${next.day==null?` data-drag="${esc(next.id)}"`:''} title="${esc(next.title)}">${esc(next.title)}</span>`:'';
+    const rest=own.length?` · ${t('осталось')} ${left.length}/${own.length}`:'';
+    return `<div class="hg" style="--c:${ctx.goalColor(g)}">${cube}<button class="link" data-act="open-goal" data-arg="${esc(g.id)}">${esc(g.title)}</button>`+
+      `<small>${g.pct}%${rest}</small><button class="link" data-act="goal-hide" data-arg="${esc(g.id)}">${t('показать')}</button></div>`;
+  }).join('');
+  return rows?`<div class="hidden-goals">${rows}</div>`:'';
 }
 function bands(){
   const ws=U.weekStart,rows=[];
-  const list=S.goals.filter(g=>!ctx.isDone(g)&&ctx.visible(g)&&g.e>=ws&&g.s<=ws+6).sort((a,b)=>a.s-b.s||a.e-b.e);
-  const html=list.map(g=>{
-    const a=Math.max(g.s,ws)-ws,b=Math.min(g.e,ws+6)-ws;let r=rows.findIndex(end=>end<a);if(r<0){r=rows.length;rows.push(b);}else rows[r]=b;
-    return goalBand(g,ws,a,b,r);
+  const goals=S.goals.filter(g=>ctx.visible(g)&&!(g.hidden&&!ctx.isDone(g)));
+  const shade=new Map(goals.map((g,i)=>[g.id,i]));
+  const spans=goals.flatMap(g=>{const {view,extras}=goalSpans(g);
+    return [{g,s:view.s,e:view.e,extra:null,view},...extras.map(x=>({g,s:x.s,e:x.e,extra:x}))];})
+    .filter(x=>x.e>=ws&&x.s<=ws+6).sort((a,b)=>a.s-b.s||a.e-b.e);
+  const html=spans.map(({g,s,e,extra,view})=>{
+    const a=Math.max(s,ws)-ws,b=Math.min(e,ws+6)-ws;let r=rows.findIndex(end=>end<a);if(r<0){r=rows.length;rows.push(b);}else rows[r]=b;
+    return goalBand(g,ws,a,b,r,shade.get(g.id),extra,view);
   }).join('');
   return html||`<div class="wk-empty">${t("На этой неделе целей нет — «+ Цель» или двойной клик по дню")}</div>`;
 }
 function dayCell(i){
   const list=ctx.dayCubes(i),done=list.filter(k=>k.pct>=100).length,load=ctx.dayLoad(i);
   const doneText=done?` · ✓${done}`:'';
-  const foot=list.length?`${list.length} ${t('куб. ·')} ${dur(load)}${doneText}`:i<TODAY?t('Прошло'):t('Пусто — брось кубик');
+  const foot=list.length||load?`${list.length} ${t('куб. ·')} ${dur(load)}${doneText}`:i<TODAY?t('Прошло'):t('Пусто — брось кубик');
   const cls=(i===TODAY?' today':'')+(i<TODAY?' past':'')+(i===U.day?' picked':'');
   const today=i===TODAY?t(' · сегодня'):'',width=Math.min(100,load/480*100);
   return `<div class="day${cls}" role="button" tabindex="0" aria-label="${dow(i)} ${ddmm(i)}" `+

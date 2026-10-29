@@ -8,9 +8,12 @@ function harness(){
  const ctx={U:{},D:{},DAY_FROM:480,DAY_SPAN:960,CUBE_MAX:240,HALF:720,PPD_MIN:5,PPD_MAX:40,clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),listen:(_target,event,fn)=>events[event]=fn,cube:()=>({id:'x',title:'X',day:null,min:30}),paintDrop(){},idle(){},render(){},$:()=>null};
  installDrag(ctx);return {ctx,events,strip};
 }
-test('strip wheel consumes movement only while it can scroll, otherwise chains to page',()=>{
+test('wheel over an overflowing strip never scrolls the page, even at its ends',()=>{
+ // Owner 2026-10-29: the page sometimes moved together with the «Завтра» strip.
  const {events,strip}=harness();const wheel=delta=>{let prevented=false;events.wheel({target:{closest:s=>s==='[data-scroll-strip]'?strip:null},deltaY:delta,deltaX:0,ctrlKey:false,preventDefault(){prevented=true;}});return prevented;};
- assert.equal(wheel(-20),false);assert.equal(wheel(100),true);assert.equal(strip.scrollLeft,100);strip.scrollLeft=721;assert.equal(wheel(20),false);assert.equal(wheel(-20),true);
+ assert.equal(wheel(-20),true);assert.equal(strip.scrollLeft,0);assert.equal(wheel(100),true);assert.equal(strip.scrollLeft,100);
+ strip.scrollLeft=721;assert.equal(wheel(20),true);assert.equal(strip.scrollLeft,721);assert.equal(wheel(-20),true);
+ strip.scrollWidth=309;assert.equal(wheel(20),false);
 });
 test('horizontal held drag scrolls and vertical exit switches to cube drag',()=>{
  const {ctx,strip}=harness();ctx.D.pdrag={id:'x',x:100,y:130,canDrag:true,src:{classList:{add(){}}},strip,scrollLeft:100,gesture:null};

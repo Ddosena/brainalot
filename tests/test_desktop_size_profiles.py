@@ -5,7 +5,7 @@ from megamozg import desktop
 
 class Window:
     def __init__(self):
-        self.rect = {"x": 100, "y": 50, "width": 410, "height": 800}
+        self.rect = {"x": 100, "y": 50, "width": 620, "height": 1000}
         self.events = SimpleNamespace(loaded=SimpleNamespace(is_set=lambda: False))
     def show(self): pass
     def restore(self): pass
@@ -31,7 +31,7 @@ def size(host):
 
 def test_switch_and_manual_resize_do_not_change_defaults(setup):
     host, _ = setup
-    assert desktop.DesktopBridge(host).bootstrap()["size_default"] == {"width": 410, "height": 800, "custom": False}
+    assert desktop.DesktopBridge(host).bootstrap()["size_default"] == {"width": 620, "height": 1000, "custom": False}
     host.full.rect.update(width=700, height=720)
     host.window_action("view_profile", "brainalot")
     assert size(host) == (700, 720)
@@ -39,7 +39,7 @@ def test_switch_and_manual_resize_do_not_change_defaults(setup):
     assert size(host) == (1600, 1000)
     host.full.rect.update(width=1100, height=900)
     host.window_action("view_profile", "brainalot")
-    assert size(host) == (410, 800)
+    assert size(host) == (620, 1000)
     host.window_action("view_profile", "work")
     assert size(host) == (1600, 1000)
 
@@ -62,7 +62,7 @@ def test_capture_and_reset_are_independent_persistent_and_do_not_resize(setup, t
     host.window_action("view_profile", "work")
     assert size(host) == (1200, 850)
     host.window_action("view_profile", "brainalot")
-    assert size(host) == (410, 800)
+    assert size(host) == (620, 1000)
 
 
 def test_dpi_clamping_and_capture(setup, monkeypatch):
@@ -86,7 +86,7 @@ def test_expanded_profile_switch_and_pin(setup):
     host.window_action("work_expand", True)
     assert size(host) == (1920, 1040)
     host.window_action("view_profile", "brainalot")
-    assert size(host) == (410, 800)
+    assert size(host) == (620, 1000)
     assert host._expanded_full_geometry is None and host.full_on_top is False
     host.window_action("view_profile", "work")
     assert size(host) == (1600, 1000)
@@ -101,7 +101,7 @@ def test_invalid_and_corrupt_values_and_legacy_startup(setup):
     host.state.data["geometry"]["full"] = {"x": 10, "y": 10, "width": 900, "height": 700, "units": "physical", "dpi": 96}
     host.state.data["full_geometry_layout"] = desktop.FULL_GEOMETRY_LAYOUT
     host._restore_geometry()
-    assert size(host) == (410, 800)
+    assert size(host) == (620, 1000)
 
 
 def test_open_page_selects_profile(setup):
@@ -109,7 +109,7 @@ def test_open_page_selects_profile(setup):
     host.open_page("work.html")
     assert host.view_profile == "work" and size(host) == (1600, 1000)
     host.open_page("panel.html")
-    assert host.view_profile == "brainalot" and size(host) == (410, 800)
+    assert host.view_profile == "brainalot" and size(host) == (620, 1000)
 
 
 def test_clamped_normal_work_is_not_treated_as_expanded_on_drag(setup, monkeypatch):
@@ -128,4 +128,4 @@ def test_invalid_persisted_profile_falls_back_to_brainalot(tmp_path, invalid):
     state.save()
     host = desktop.DesktopHost(tmp_path, 1, "token", lambda: True)
     assert host.view_profile == "brainalot"
-    assert host._size_default() == {"width": 410, "height": 800, "custom": False}
+    assert host._size_default() == {"width": 620, "height": 1000, "custom": False}

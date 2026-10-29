@@ -2757,12 +2757,12 @@ void initializeLibraryView().catch(error => showLibraryWindowError(error.message
 void refresh();
 
 // Width determines type density; height only adds a small bounded correction.
-// Apply the common density at 70%; browser zoom remains independent.
+// Owner 2026-10-28: the 70% reduction is withdrawn; browser zoom remains independent.
 function applyPanelScale() {
   const widthScale = Math.pow(window.innerWidth / 440, .24);
   const heightScale = Math.max(.97, Math.min(1.03, Math.pow(window.innerHeight / 800, .04)));
   const scale = Math.max(.88, Math.min(1.18, widthScale * heightScale));
-  document.documentElement.style.setProperty("--panel-scale", (scale * .70).toFixed(4));
+  document.documentElement.style.setProperty("--panel-scale", scale.toFixed(4));
   document.body.classList.add("adaptive-panel");
 }
 applyPanelScale();

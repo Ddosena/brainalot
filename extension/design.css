@@ -272,7 +272,9 @@ body.adaptive-panel .note-heading{min-width:0}
 body.adaptive-panel .task-details,body.adaptive-panel .library-details{min-width:0}
 body.adaptive-panel .task-time-controls{margin-left:auto;order:4}
 body.adaptive-panel .calendar-event-row{flex-wrap:wrap}
-body.adaptive-panel #rotation-card.rotation .stack-stage{--stack-card-h:208px}
+/* Owner 2026-10-28: the recall card follows the panel width (about 0.6 of it) so it reads closer to square. */
+body.adaptive-panel #rotation-card.rotation{container-type:inline-size}
+body.adaptive-panel #rotation-card.rotation .stack-stage{--stack-card-h:clamp(208px,calc((100cqw - 54px) * .6),340px)}
 body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note:not(.has-stack-image){padding:14px}
 body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note .stack-excerpt{-webkit-line-clamp:3;margin-top:7px}
 body.adaptive-panel #rotation-card.rotation .stack-stage .stack-note .note-heading:has(.task-time-controls) .task-time-controls{align-self:flex-end;flex:none;margin-bottom:5px}

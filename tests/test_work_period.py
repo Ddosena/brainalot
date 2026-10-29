@@ -642,7 +642,7 @@ def test_pending_native_delete_blocks_commands_and_context(planner, monkeypatch)
     assert len(calls) >= 2
 
 
-def test_native_facts_after_overlay_merge_are_authoritative_and_protect_composition(planner):
+def test_native_facts_after_overlay_merge_are_authoritative_and_composition_delete_is_undoable(planner):
     result = command(planner, 'cube_merge', {'cube_ids': ['geometry', 'slides'], 'title': 'Presentation'})
     merged = next(cube for cube in result['cubes'] if cube['id'].startswith('merged-'))
     native = planner.store.planning_operation({'request_id': 'native-progress',
@@ -651,12 +651,16 @@ def test_native_facts_after_overlay_merge_are_authoritative_and_protect_composit
     current = next(cube for cube in planner.model()['cubes'] if cube['id'] == merged['id'])
     assert current['actual_minutes'] == 12 and current['progress_percent'] > 0
     assert current['historical_facts'][0]['cube_id'] == 'geometry'
-    assert current['status'] == 'started' and not current['can_delete']
-    for action, data in [('cube_delete', {'cube_id': merged['id']}),
-                         ('cube_merge', {'cube_ids': [merged['id'], 'other'], 'title': 'Unsafe'})]:
-        with pytest.raises(ValidationError, match='факты'):
-            command(planner, action, data)
+    assert current['status'] == 'started' and current['can_delete']
+    with pytest.raises(ValidationError, match='факты'):
+        command(planner, 'cube_merge', {'cube_ids': [merged['id'], 'other'], 'title': 'Unsafe'})
     assert planner.snapshot() == native
+    # Owner 2026-10-29: a started/done composition can be deleted; native facts stay and undo restores it.
+    deleted = command(planner, 'cube_delete', {'cube_id': merged['id']})
+    assert next(c for c in deleted['cubes'] if c['id'] == merged['id'])['status'] == 'cancelled'
+    assert planner.snapshot()['state']['planning'] == native['state']['planning']
+    command(planner, 'undo', {'revision': deleted['revision']})
+    assert next(c for c in planner.model()['cubes'] if c['id'] == merged['id'])['status'] == 'started'
     returned = command(planner, 'cube_return', {'cube_id': merged['id']})
     assert next(c for c in returned['cubes'] if c['id'] == merged['id'])['selected_date'] is None
     assert planner.snapshot()['state']['planning'] == native['state']['planning']
@@ -1076,10 +1080,13 @@ def test_prep_cleanup_preserves_selected_factual_and_original_sources(tmp_path):
     assert planner.snapshot()['state']['planning']['constructor']['cubes']['constructor:prep-clean'] == before['planning']['constructor']['cubes']['constructor:prep-clean']
 
 
-def test_optional_calendar_activity_defaults_to_personal(color_planner):
+def test_optional_calendar_activity_all_day_personal_timed_work(color_planner):
+    # Owner 2026-10-28: timed calendar lessons are work, all-day reminders are not.
     planner, source, _ = color_planner
     result = command(planner, 'calendar_source_import', {'source': source})
-    assert all(c['activity_kind'] == 'personal' for c in result['cubes'] if c['kind'] == 'calendar_optional')
+    optional = [c for c in result['cubes'] if c['kind'] == 'calendar_optional']
+    assert optional
+    assert all(c['activity_kind'] == ('personal' if c.get('all_day') else 'work') for c in optional)
     assert all(c['activity_kind'] == 'work' for c in result['cubes'] if c['kind'] == 'task')
 
 
@@ -1323,3 +1330,17 @@ def test_recalculate_cannot_invalidate_live_forecast(planner, monkeypatch):
         planner.store.planning_operation({'request_id': 'recalculate-active', 'expected_revision': before['revision'],
             'action': 'recalculate', 'data': {'from_date': '2027-01-08'}})
     assert planner.snapshot() == before and timer.state() == before_timer
+
+
+def test_goal_hide_keeps_cubes_and_facts_and_round_trips(planner):
+    # Owner 2026-10-28: hiding a goal only moves it out of the Week chart.
+    before = planner.model()
+    native = deepcopy(planner.snapshot()['state']['planning'])
+    hidden = command(planner, 'goal_hide', {'task_id': 'a', 'hidden': True})
+    assert next(t for t in hidden['tasks'] if t['id'] == 'a')['hidden'] is True
+    assert [c['id'] for c in hidden['cubes']] == [c['id'] for c in before['cubes']]
+    assert planner.snapshot()['state']['planning'] == native
+    shown = command(planner, 'goal_hide', {'task_id': 'a', 'hidden': False})
+    assert next(t for t in shown['tasks'] if t['id'] == 'a')['hidden'] is False
+    with pytest.raises(ValidationError):
+        command(planner, 'goal_hide', {'task_id': 'missing', 'hidden': True})

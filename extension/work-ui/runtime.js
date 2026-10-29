@@ -10,7 +10,7 @@ import {installDialogs} from './dialogs.js';
 import {installDrag} from './drag.js';
 import {installShell} from './shell.js';
 import {installRepeatables,repeatableCube,REPEATABLE_PREFIX} from './repeatables.js';
-import {installPool} from './pool.js';
+import {installPool,dayPlanMinutes} from './pool.js';
 import {installTimer} from './timer.js';
 
 export function createWorkRuntime({commands,screen='week',date=null,baseDate,document:doc=globalThis.document,window:win=globalThis.window,
@@ -50,7 +50,7 @@ id.startsWith(REPEATABLE_PREFIX)?repeatableCube(S.repeatables.find(item=>item.id
   const goalColor=g=>proj(g?.p)?.c||'#888',colorOf=k=>k.isRepeatableTemplate||k.repeatable_instance?'var(--accent)':k.goal?goalColor(goal(k.goal)):
 'var(--possible)',isDone=g=>g.pct>=100,visible=g=>!proj(g.p)?.hidden;
   const eventsFor=i=>S.events.filter(e=>e.day===i&&e.at!=null&&e.min>0).map(e=>({...e,fixed:true}));
-  const dayCubes=i=>S.cubes.filter(k=>k.day===i),dayLoad=i=>dayCubes(i).reduce((a,k)=>a+k.min,0),shelf=gid=>S.cubes.filter(k=>k.goal===gid&&
+  const dayCubes=i=>S.cubes.filter(k=>k.day===i),dayLoad=i=>dayPlanMinutes(dayCubes(i),eventsFor(i)),shelf=gid=>S.cubes.filter(k=>k.goal===gid&&
 k.day==null&&k.pct<100),activeOn=i=>S.goals.filter(g=>!isDone(g)&&g.s<=i&&i<=g.e);
   const timedOn=i=>[...eventsFor(i),...S.cubes.filter(k=>k.day===i&&k.at!=null)];
   const conflict=(i,at,min,except)=>{const ex=new Set([].concat(except||[]));return timedOn(i).find(x=>!ex.has(x.id)&&at<x.at+x.min&&x.at<at+min);};
@@ -105,7 +105,7 @@ for(const field of dirtyFields)if(!field.isConnected)dirtyFields.delete(field);}
     const startedPlan=S.hasStandalone||S.planning_initialized!==false&&(S.started||U.started);
     const dayClass=U.screen==='day'||!startedPlan?' dayapp':'';
     patchMarkup($('#stage'),`<div class="app${dayClass}">${ctx.appbar()}${renderContent(startedPlan)}</div>`);
-    ctx.placeThumb();restoreScroll(arrowTop);renderLayer();ctx.paintTimer?.();
+    ctx.placeThumb();restoreScroll(arrowTop);renderLayer();ctx.paintTimer?.();ctx.paintHover?.();
     lastRenderMs=performance.now()-started;renderTimes.push({sequence:++renderCount,ms:lastRenderMs});
     if(renderTimes.length>100)renderTimes.shift();maxRenderMs=Math.max(maxRenderMs,lastRenderMs);
   }
@@ -199,12 +199,19 @@ function installActions(ctx,{commands,onNavigate,onTheme,isDragging,dirtyFields}
 goal(U.sel)?.p});},
     'new-cube':a=>ctx.openModal({type:'cube-new',goal:a||null,where:!a&&U.screen==='day'?'day':'shelf'}),
     'open-goal':a=>ctx.openGoal(a,false),'pick-goal':a=>ctx.pickGoal(a),'close-goal':()=>{if(U.modal?.type==='goal')close();else U.sel=null;},
-    'goal-done':a=>ctx.goalDone(a),'goal-reopen':a=>send('goal.done',{id:a,done:false}),
+    'goal-done':a=>ctx.goalDone(a),'goal-hide':a=>{const g=goal(a);if(g)return send('goal.hide',{id:a,hidden:!g.hidden},g.hidden?t('Цель снова на неделе'):t('Цель скрыта — строка над неделей'));},'goal-reopen':a=>send('goal.done',{id:a,done:false}),
     'goal-delete':a=>send('goal.delete',{id:a},t('Цель удалена вместе с кубиками'),()=>{if(U.sel===a)U.sel=null;
 if(U.modal?.id===a)close();}),
     'open-cube':a=>ctx.openModal({type:'cube',id:a}),'cube-done':a=>ctx.cubeDone(a),'cube-reopen':a=>send('cube.update',{id:a,readiness_pct:80},
 t('Кубик снова в работе')),
     'cube-unplace':a=>send('cube.return',{id:a},t('Кубик возвращён на полку')),
+    'cube-part':a=>ctx.cubePart(a,null,null),'pool-goal':a=>ctx.togglePoolGoal(a),
+    // Owner 2026-10-28: removing a separate goal block returns its unfinished cubes to the goal shelf;
+    // completed cubes keep their facts and date.
+    'goal-block-remove':a=>{const [id,s,e]=String(a).split('|'),from=+s,to=+e;
+      const list=S.cubes.filter(k=>k.goal===id&&k.day!=null&&k.day>=from&&k.day<=to),open=list.filter(k=>k.pct<100);
+      void (async()=>{for(const k of open)await send('cube.return',{id:k.id});
+        toast(open.length<list.length?t('Невыполненные кубики возвращены на полку; выполненные остаются в своих днях как факт'):t('Блок убран, кубики на полке цели'));render();})();},
     'cube-delete':a=>send('cube.delete',{id:a},t('Кубик удалён'),()=>{if(U.modal?.id===a)close();}),
     'cube-pin':a=>send('cube.pin',{id:a,pinned:!cube(a)?.pinned},'',()=>ctx.timer(()=>$(`[data-act="cube-pin"][data-arg="${cssId(a)}"]`)?.focus(),0)),
     'cube-repeatable':a=>ctx.saveCubeRepeatable(a),'repeatable-edit':a=>ctx.openModal({type:'repeatable',id:a}),
@@ -233,6 +240,7 @@ const n=$('#av');n.scrollTop=center*U.ppd-n.clientHeight/2;return 'done';},
     if(!button||!ACTS[button.dataset.act]){if(hadMenu)renderLayer();return;}
     const r=ACTS[button.dataset.act](button.dataset.arg,button,e);if(r!=='done'){ctx.saveUI();render();}
   });
+  listen(document,'pointerover',e=>ctx.hoverAt?.(e.target));
   listen(document,'dblclick',e=>{const day=e.target.closest('.day[data-day]');if(day){U.day=+day.dataset.day;navigate('day');render();return;
 }const wk=e.target.closest('.wk');if(wk&&!e.target.closest('.gband')){const r=wk.getBoundingClientRect(),
 col=clamp(Math.floor((e.clientX-r.left)/r.width*7),0,6);ACTS['new-goal'](String(U.weekStart+col));}});
@@ -244,7 +252,8 @@ e.clientY};U.menu=null;render();ctx.timer(()=>$('.quick [name=title]')?.focus(),
     const cell=e.target.closest('.day[data-day]'),wk=!e.target.closest('[data-goal]')&&e.target.closest('.wk');if(cell||wk){e.preventDefault();
 let day=cell?+cell.dataset.day:null;if(wk){const r=wk.getBoundingClientRect();day=U.weekStart+clamp(Math.floor((e.clientX-r.left)/r.width*7),0,6);
 }U.menu={kind:'day',id:String(day),x:e.clientX,y:e.clientY};renderLayer();return;}
-    const c=e.target.closest('[data-cube]'),g=e.target.closest('[data-goal]');if(!c&&!g)return;e.preventDefault();const template=c&&
+    const c=e.target.closest('[data-cube]'),g=e.target.closest('[data-goal]');if(!c&&!g)return;e.preventDefault();
+    if(!c&&g.dataset.seg){U.menu={kind:'goalblock',id:`${g.dataset.goal}|${g.dataset.seg}|${g.dataset.segEnd}`,x:e.clientX,y:e.clientY};renderLayer();return;}const template=c&&
 cube(c.dataset.cube);U.menu={kind:template?.isRepeatableTemplate?'repeatable':c?'cube':'goal',id:template?.isRepeatableTemplate?template.repeatableId:
 c?c.dataset.cube:g.dataset.goal,x:e.clientX,y:e.clientY};renderLayer();
   });
@@ -257,6 +266,9 @@ c?c.dataset.cube:g.dataset.goal,x:e.clientX,y:e.clientY};renderLayer();
     if((e.key==='Enter'||e.key===' ')&&e.target.matches('[role=button][tabindex],[role=group][data-cube][tabindex]')){e.preventDefault();
 if(e.target.matches('.gband')){ctx.openGoal(e.target.dataset.goal,true);render();}else e.target.click();return;}
     if(e.key==='Enter'&&e.target.matches('[data-src-input]')){e.preventDefault();void ctx.addSource(e.target.dataset.srcInput,e.target.value);return;}
+    if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyZ'&&!e.target.closest('input,textarea,select,[contenteditable]')&&!isDragging()){
+      e.preventDefault();if(!commands.canUndo){toast(t('Нечего отменять'));return;}
+      void commands.undo().then(()=>{toast(t('Отменено'));render();}).catch(error=>toast(error.message));return;}
     if(e.key!=='Escape')return;if(U.quick){U.quick=null;render();return;}if(isDragging()){ctx.cancelDrags();return;}if(U.menu||U.modal){U.menu=null;
 close();renderLayer();}
   });
@@ -264,7 +276,6 @@ close();renderLayer();}
 if(e.target.matches('[data-field],[name],[data-src-input],[data-time-preset]')){e.target.dataset.workDirty='1';
 if(e.target.dataset.field)dirtyFields.add(e.target);}});
   listen(document,'change',async e=>{
-    if(e.target.matches('[data-pool-goal]')){U.poolGoal=e.target.value;render();return;}
     if(e.target.name==='goal'){const activity=e.target.form?.querySelector('[name=activity_kind]');if(activity&&
 !explicitActivity.has(activity)){activity.value=e.target.value?'work':'personal';activity.dataset.workDirty='1';}return;}
     const el=e.target,f=el.dataset.field,id=el.dataset.id;if(!f)return;const v=el.value;let type,p={id};

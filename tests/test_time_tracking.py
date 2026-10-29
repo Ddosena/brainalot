@@ -429,6 +429,9 @@ def test_calendar_events_count_past_part_once_and_timer_wins(tmp_path):
     assert report["total_ms"] == 90 * minute
     assert _row(report, "calendar", "cal:a")["calendar_ms"] == 55 * minute
     assert "calendar_ms" not in _row(report, "library", "stable-1")
+    # Owner 2026-10-28: timed calendar events count as work, never as unclassified.
+    assert _row(report, "calendar", "cal:a")["work_ms"] == 55 * minute
+    assert _row(report, "calendar", "cal:a")["unclassified_ms"] == 0
 
 
 def test_calendar_event_marked_did_not_happen_is_removed_until_restored(tmp_path):

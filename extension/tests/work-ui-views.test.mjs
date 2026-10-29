@@ -37,7 +37,9 @@ test('approved CSS preserves prototype layout apart from documented integration 
   '.cube-play','.cube-play:focus-visible','.cbK::after,.hb::after,.vb::after','.cbK.time-running,.vb.time-running',
   '.active-timer','.active-timer[hidden]','.active-timer>span','.active-timer output',
   '.work-timer','.timer-reading,.timer-actions','.timer-reading','.work-timer p','.timer-settings','.timer-settings summary','.timer-settings .fields','.timer-stats',
-  '.day-basket','.goal-picker','.goal-picker>span','.goal-picker select','.goal-picker option'
+  '.day-basket','.goal-picker','.goal-picker>span','.goal-picker select','.goal-picker option',
+  // Owner 2026-10-28: timeline cubes name their goal at the bottom.
+  '.htrack .hb .gt','.vb .gt','.gband.done'
  ].map(cssCanonical));
  const actual=readFileSync(new URL('../work-ui/styles.css',import.meta.url),'utf8').split('/* Day pools:')[0].replace(/([^{}]+)\{([^{}]*)\}/g,(rule,selector,body)=>{
   const key=cssCanonical(selector);
@@ -58,7 +60,7 @@ test('goal card has no manual done action when cubes exist',()=>{const c=context
 test('explicit add cube to a completed goal keeps that exact goal instead of creating a standalone note',()=>{const c=context();c.S.goals[0].pct=100;c.U.modal={type:'cube-new',goal:'g',where:'shelf'};const html=c.modalHtml();assert.match(html,/<option value="g" selected>/);assert.doesNotMatch(html,/<option value="" selected>/);});
 test('forecast-only goal keeps manual completion actions until a real cube participates',()=>{const c=context(),g=c.S.goals[0];g.readiness_cube_ids=[];c.S.cubes[0].candidate=true;c.U.menu={kind:'goal',id:g.id,x:0,y:0};assert.match(c.goalCard(g),/data-act="goal-done"/);assert.match(c.menuHtml(),/data-act="goal-done"/);g.readiness_cube_ids=['k'];assert.doesNotMatch(c.goalCard(g),/data-act="goal-done"/);assert.doesNotMatch(c.menuHtml(),/data-act="goal-done"/);});
 test('day rows contain all active goals and passive date bars',()=>{const c=context();c.S.goals.push({...c.S.goals[0],id:'g2',title:'Second'});const html=c.dayGoals(2);assert.match(html,/Second/);assert.equal((html.match(/class="gspan"/g)||[]).length,2);assert.doesNotMatch(html,/data-act="pick-day"/);});
-test('day has both source and goal shelves, trophy and time labels',()=>{const c=context();c.S.cubes.push({id:'o',goal:null,title:'Offer',src:'Brainalot',min:30,pct:0,day:null,at:null});const html=c.dayScreen();assert.match(html,/Кубики целей/);assert.match(html,/Brainalot и календарь/);assert.match(html,/data-pool-goal/);assert.match(html,/13:00–14:00/);assert.match(c.trophy({...c.S.cubes[0],pct:100}),/class="medal">✓/);});
+test('day has both source and goal shelves, trophy and time labels',()=>{const c=context();c.S.cubes.push({id:'o',goal:null,title:'Offer',src:'Brainalot',min:30,pct:0,day:null,at:null});const html=c.dayScreen();assert.match(html,/Кубики целей/);assert.match(html,/Brainalot и календарь/);assert.match(html,/data-act="pool-goal"/);assert.match(html,/13:00–14:00/);assert.match(c.trophy({...c.S.cubes[0],pct:100}),/class="medal">✓/);});
 test('tomorrow omits timed Calendar lessons but keeps them on their own day track',()=>{
   const c=context();
   c.S.events.push({id:'lesson',kind:'calendar',title:'Timed lesson',day:3,at:600,min:60,all_day:false});
@@ -76,19 +78,21 @@ test('tomorrow offers all-day Calendar tasks and Brainalot cubes, excluding time
   );
   const html=c.dayScreen();
   assert.match(html,/All-day homework/);
-  assert.match(html,/Tomorrow library task/);
+  // Owner 2026-10-28: a cube already placed on tomorrow is taken and stays out of the strip.
+  assert.doesNotMatch(html,/Tomorrow library task/);
   assert.doesNotMatch(html,/Timed optional lesson|Unknown duration lesson/);
 });
-test('tomorrow applies the same all-day rule to already placed Calendar cubes',()=>{
+test('tomorrow skips cubes already placed on a day and offers unplaced cubes of goals running tomorrow',()=>{
   const c=context(),base={goal:null,min:30,pct:0,day:3,at:600,kind:'calendar_optional'};
   c.S.cubes.push(
     {...base,id:'all-day',title:'Placed all-day task',all_day:true},
     {...base,id:'timed',title:'Placed timed lesson',all_day:false},
-    {...base,id:'legacy-calendar',title:'Legacy timed Calendar',kind:'calendar',all_day:false}
+    {id:'tomorrow-goal-cube',goal:'g2',title:'Next goal shelf cube',min:60,pct:0,day:null,at:null,links:[]}
   );
-  const html=c.dayScreen();
-  assert.match(html,/Placed all-day task/);
-  assert.doesNotMatch(html,/Placed timed lesson|Legacy timed Calendar/);
+  c.S.goals.push({...c.S.goals[0],id:'g2',title:'Tomorrow goal',s:3,e:4});
+  const strip=c.dayScreen().split('tomorrow-shelf')[1];
+  assert.doesNotMatch(strip,/Placed all-day task|Placed timed lesson/);
+  assert.match(strip,/Next goal shelf cube/);
 });
 test('arrow clusters crowded labels with leaders and keeps exact date dots',()=>{const c=context();c.S.goals.push({...c.S.goals[0],id:'g2',title:'Second'});const html=c.arrow();assert.equal((html.match(/class="dot"/g)||[]).length,2);assert.match(html,/<path d="M 57 /);assert.match(html,/class="dr we/);assert.match(html,/class="dn today/);});
 test('calendar diamonds use project colour and disappear with hidden project',()=>{const c=context();c.S.projects[0].calendarPoints=[{day:4,at:600,title:'Calendar',color:'#f09300'}];let html=c.arrow();assert.match(html,/class="dot web"/);assert.match(html,/--important:#f09300/);c.S.projects[0].hidden=true;assert.doesNotMatch(c.arrow(),/class="dot web"/);});
@@ -97,3 +101,10 @@ test('menus expose day actions and hide manual goal closure when cube derived',(
 test('cube editor only renders http links as active anchors',()=>{const c=context();c.S.cubes[0].links=[{id:'s',url:'javascript:alert(1)',text:'unsafe'}];c.U.modal={type:'cube',id:'k'};const html=c.modalHtml();assert.doesNotMatch(html,/href="javascript:/);assert.match(html,/unsafe/);});
 test('clock preserves classic radii, labels, current hand and radial overflow wrapping',()=>{const c=context();const html=c.clockSvg(2);assert.match(html,/r="112" style="stroke-width:58"/);assert.match(html,/ck-hand/);assert.match(html,/<textPath/);assert.match(html,/>12<\/text>/);assert.match(c.sectorLabel({...c.S.cubes[0],title:'Смоделировать очень длинное основание'},780,795,58,'test',false),/<tspan/);assert.doesNotMatch(c.clockSvg(3),/class="ck-hand"/);});
 test('onboarding completes only after a goal cube is placed, not an offer',()=>{const c=context();c.S.cubes[0].day=null;assert.match(c.hints(),/Перетащи кубик/);c.S.cubes.push({goal:null,day:2});assert.notEqual(c.hints(),'');c.S.cubes[0].day=2;assert.equal(c.hints(),'');});
+test('day plan counts cubes plus timed calendar events, overlapping events once',async()=>{
+ // Owner 2026-10-28: «в плане 2,9 ч» ignored lessons and the webinar.
+ const {dayPlanMinutes}=await import('../work-ui/pool.js');
+ const cubes=[{min:80},{min:80},{min:25}],events=[{at:630,min:60},{at:840,min:60},{at:1140,min:150},{at:1150,min:30}];
+ assert.equal(dayPlanMinutes(cubes,events),185+270);
+ assert.equal(dayPlanMinutes([],[]),0);
+});

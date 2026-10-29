@@ -45,13 +45,16 @@ def _proven_task_source(planning, key, retained=None):
     if source is None or wp.deleted_cube(planning, key, key[8:]) or wp._scope_exempt(planning, source.get('task_id')):
         return None
     minutes = source.get('minutes')
-    if type(minutes) is not int or not 5 <= minutes <= 240 or minutes % 5:
+    if type(minutes) is not int or not 1 <= minutes <= 240:
         return None
+    # Forecast tails (is_remainder) may be any 1..59 minutes, while native
+    # constructor cubes use a 5-minute grid. Round up so the tail is executable.
+    minutes = min(240, -(-minutes // 5) * 5)
     blueprint = source.get('blueprint_ref') or source['id']
     planned = source.get('planned_date') or source.get('date')
     if planned not in wp._dates(planning['settings']):
         planned = None
-    return {**deepcopy(source), 'id': key, 'kind': 'task', 'blueprint_ref': blueprint, 'planned_date': planned}
+    return {**deepcopy(source), 'id': key, 'kind': 'task', 'blueprint_ref': blueprint, 'planned_date': planned, 'minutes': minutes}
 
 
 def _rows(snapshot):

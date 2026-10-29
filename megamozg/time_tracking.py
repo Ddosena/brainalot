@@ -497,7 +497,10 @@ class TimeStore:
                     segment = (max(event["start_ms"], start), min(event["end_ms"], end, wall))
                     if segment[1] - segment[0] < 1000:
                         continue
-                    task = _json({"source": "calendar", "id": event["key"], "title": event["title"]})
+                    # Owner 2026-10-28: timed calendar events (lessons) are work;
+                    # all-day reminders never reach this sync.
+                    task = _json({"source": "calendar", "id": event["key"], "title": event["title"],
+                                  "activity_kind": "work"})
                     for left, right in _free(segment, busy):
                         if right - left >= 1000:
                             db.execute("INSERT INTO intervals(start_ms,end_ms,task,mode) VALUES(?,?,?,?)",

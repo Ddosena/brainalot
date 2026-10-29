@@ -4,7 +4,7 @@ export function installDrag(ctx) {
 const {clamp,clk,ddmm,dow,iso}=ctx;
 const {U,DAY_FROM,DAY_SPAN,CUBE_MAX,HALF,PPD_MIN,PPD_MAX}=ctx;
 function setOver(el){if(ctx.D.overEl===el)return;ctx.D.overEl?.classList.remove('dz-over');ctx.D.overEl=el;el?.classList.add('dz-over');}
-function cancelDrags(){if(ctx.D.bdrag)clearTimeout(ctx.D.bdrag.timer);ctx.D.bdrag=ctx.D.gdrag=ctx.D.pdrag=ctx.D.scaling=null;U.arrowDrag=null;
+function cancelDrags(){if(ctx.D.bdrag)clearTimeout(ctx.D.bdrag.timer);if(ctx.D.pdrag)clearTimeout(ctx.D.pdrag.edgeTimer);ctx.D.bdrag=ctx.D.gdrag=ctx.D.pdrag=ctx.D.scaling=null;U.arrowDrag=null;
 if(ctx.D.rdrag){Object.assign(ctx.D.rdrag.k,{at:ctx.D.rdrag.at,min:ctx.D.rdrag.min});ctx.D.rdrag=null;}ctx.D.ghost=null;ctx.D.ghostEl?.remove();
 ctx.D.ghostEl=null;setOver(null);ctx.render();}
 function ghostText(text,out){if(!ctx.D.ghostEl){ctx.D.ghostEl=document.createElement('div');ctx.D.ghostEl.className='dragghost';
@@ -34,7 +34,7 @@ false,canDrag:false};return;}
 rz.dataset.resize==='l'||rz.dataset.resize==='t',at:k.at,min:k.min,changed:false};e.preventDefault();return;}
   const band=t.closest('.gband[data-band]');
   if(band){const grid=band.closest('.wk'),g=ctx.goal(band.dataset.goal);ctx.D.bdrag={band,g,x:e.clientX,mode:t.closest('.edge.l')?'start':
-t.closest('.edge.r')?'end':'move',s:g.s,e:g.e,ns:g.s,ne:g.e,cell:grid.clientWidth/7,timer:null,dir:0,moved:false};e.preventDefault();return;}
+t.closest('.edge.r')?'end':'move',s:g.s,e:g.e,vs:+band.dataset.vs,ve:+band.dataset.ve,ns:g.s,ne:g.e,cell:grid.clientWidth/7,timer:null,dir:0,moved:false};e.preventDefault();return;}
   const gl=t.closest('[data-gl]');
   if(gl){const g=ctx.goal(gl.dataset.goal),av=ctx.$('#av');ctx.D.gdrag={g,y0:e.clientY+(av?.scrollTop||0),x:e.clientX,y:e.clientY,delta:0,moved:
 false};e.preventDefault();return;}
@@ -64,7 +64,10 @@ function moveBand(e){
   if(!d.moved)return;
   let s=d.s,en=d.e;if(d.mode==='move'){s+=days;en+=days;}else if(d.mode==='start')s=Math.min(d.s+days,d.e);else en=Math.max(d.e+days,d.s);
   d.ns=s;d.ne=en;
-  const a=clamp(s-ws,0,6)+1,b=clamp(en-ws,0,6)+2;d.band.style.gridColumn=`${a}/${b}`;
+  // A band may show adjacent cube days beyond the period; keep that visual span while dragging.
+  const vs=Number.isFinite(d.vs)?d.vs:d.s,ve=Number.isFinite(d.ve)?d.ve:d.e;
+  const from=d.mode==='move'?vs+days:d.mode==='start'?s:vs,to=d.mode==='move'?ve+days:d.mode==='end'?en:ve;
+  const a=clamp(from-ws,0,6)+1,b=clamp(to-ws,0,6)+2;d.band.style.gridColumn=`${a}/${b}`;
   const small=d.band.querySelector('small');if(small)small.textContent=`${ddmm(s)}–${ddmm(en)}`;
   const grid=d.band.closest('.wk'),rect=grid.getBoundingClientRect(),dir=d.mode==='move'?(e.clientX>rect.right-26?1:e.clientX<rect.left+26?-1:0):0;
   if(dir!==d.dir){clearTimeout(d.timer);d.dir=dir;grid.classList.remove('edge-next','edge-prev');
@@ -112,14 +115,25 @@ function moveResize(e){
   let at=d.at,min=d.min;
   if(d.start){const end=d.at+d.min;at=clamp(m,Math.max(DAY_FROM,end-CUBE_MAX),end-15);min=end-at;}
   else min=clamp(m-d.at,15,Math.min(CUBE_MAX,24*60-d.at));
-  if(ctx.conflict(k.day,at,min,k.id))return;
+  const block=ctx.conflict(k.day,at,min,k.id);
+  if(block){
+    // Owner 2026-10-28: stretching the bottom edge through a busy slot continues the cube after it as another part.
+    const head=block.at-d.at,from=block.at+block.min,tail=d.at+min-from;
+    if(d.start||!canPart(k)||head<15||tail<15||ctx.conflict(k.day,from,tail,k.id))return;
+    k.at=d.at;k.min=head;d.split={at:from,min:tail};d.changed=true;
+    ghostText('⧉ '+t('ещё часть')+' · '+clk(from)+'–'+clk(from+tail));ctx.D.ghostEl.style.left=e.clientX+'px';ctx.D.ghostEl.style.top=e.clientY+'px';
+    ctx.paintDrop();return;
+  }
+  if(d.split){d.split=null;ctx.D.ghostEl?.remove();ctx.D.ghostEl=null;}
   if(at!==k.at||min!==k.min){k.at=at;k.min=min;d.changed=true;ctx.paintDrop();}
 }
 function endResize(){
   const d=ctx.D.rdrag;ctx.D.rdrag=null;ctx.D.suppressClick=true;setTimeout(()=>ctx.D.suppressClick=false,0);
+  ctx.D.ghostEl?.remove();ctx.D.ghostEl=null;
   if(!d.changed)return;
   const fin={at:d.k.at,min:d.k.min};Object.assign(d.k,{at:d.at,min:d.min});
-  return ctx.send('cube.update',{id:d.k.id,start_minute:fin.at,duration_minutes:fin.min});
+  const resized=fin.at===d.at&&fin.min===d.min?Promise.resolve():ctx.send('cube.update',{id:d.k.id,start_minute:fin.at,duration_minutes:fin.min});
+  return d.split?resized.then(()=>cubePart(d.k.id,d.k.day,d.split.at,d.split.min)):resized;
 }
 // Cubes: one drag for shelves, trays, the day cells, both timelines and the clock.
 function cubeDropHint(k,hit){
@@ -148,18 +162,39 @@ function moveCube(e){
   if(!d.moved){d.moved=true;d.src?.classList.add('dragsrc');}
   const k=ctx.cube(d.id),hit=hitAt(e.clientX,e.clientY);
   const {text,out}=cubeDropHint(k,hit);
-  ghostText(text,out);ctx.D.ghostEl.style.left=e.clientX+'px';ctx.D.ghostEl.style.top=e.clientY+'px';
+  const dir=dayEdge(d,e.clientX),part=e.ctrlKey&&canPart(k)&&hit&&hit.where!=='shelf';
+  ghostText(dir?(dir>0?t('следующий день →'):t('← предыдущий день')):part?'⧉ '+t('ещё часть')+' · '+text:text,out&&!dir&&!part);ctx.D.ghostEl.style.left=e.clientX+'px';ctx.D.ghostEl.style.top=e.clientY+'px';
   setOver(hit&&['shelf','tray','day'].includes(hit.where)?hit.zone:null);
   const next=hit&&hit.at!=null?{id:k.id,where:hit.where,day:hit.day,at:clamp(hit.at,DAY_FROM,24*60-k.min)}:null;
   if(JSON.stringify(next)!==JSON.stringify(ctx.D.ghost)){ctx.D.ghost=next;ctx.paintDrop();}
 }
+// Ctrl+drag leaves the cube in place and puts another part of it (same goal and title, its own minutes) at the drop.
+function canPart(k){return !!(k&&k.goal&&k.pct<100&&!k.isRepeatableTemplate);}
+function cubePart(id,day,at,minutes){
+  const k=ctx.cube(id);if(!canPart(k))return ctx.render();
+  const target=day??k.day;
+  return ctx.send('cube.create',{goal_id:k.goal,title:k.title,duration_minutes:minutes??k.min,activity_kind:k.activity_kind||'work',
+    selected_date:target==null?null:iso(target),start_minute:target==null?null:at},t('Добавлена ещё одна часть кубика'));
+}
+// Day: holding a dragged cube at the left/right window edge flips to the previous/next date.
+function dayEdge(d,x){
+  const dir=U.screen==='day'&&d.id?(x>innerWidth-48?1:x<48?-1:0):0;
+  if(dir===d.edge)return dir;
+  clearTimeout(d.edgeTimer);d.edge=dir;
+  const flip=()=>{if(ctx.D.pdrag!==d||d.edge!==dir)return;U.day+=dir;U.weekStart=ctx.weekOf(U.day);ctx.D.ghost=null;ctx.render();
+    d.edgeTimer=setTimeout(flip,900);};
+  if(dir)d.edgeTimer=setTimeout(flip,600);
+  return dir;
+}
 function endCube(e){
-  const d=ctx.D.pdrag;ctx.D.pdrag=null;ctx.D.ghostEl?.remove();ctx.D.ghostEl=null;setOver(null);ctx.D.suppressClick=true;setTimeout(()=>
-ctx.D.suppressClick=false,0);
+  const d=ctx.D.pdrag;ctx.D.pdrag=null;clearTimeout(d.edgeTimer);ctx.D.ghostEl?.remove();ctx.D.ghostEl=null;setOver(null);
+  // A plain click inside a strip (no drag, not on a cube) must reach its button, e.g. a goal chip.
+  if(d.moved||d.id){ctx.D.suppressClick=true;setTimeout(()=>ctx.D.suppressClick=false,0);}
   if(d.gesture==='scroll')return;
   const k=ctx.cube(d.id);if(!k)return;
   if(!d.moved){ctx.D.ghost=null;ctx.openModal(k.isRepeatableTemplate?{type:'repeatable',id:k.repeatableId}:{type:'cube',id:k.id});return;}
   const hit=hitAt(e.clientX,e.clientY);ctx.D.ghost=null;
+  if(e.ctrlKey&&canPart(k)&&hit&&hit.where!=='shelf')return cubePart(k.id,hit.day,hit.at==null?null:clamp(hit.at,DAY_FROM,1440-k.min));
   if(!hit||hit.where==='shelf'){if(k.day!=null)return ctx.send('cube.return',{id:k.id});return ctx.render();}
   if(k.isRepeatableTemplate)return ctx.send('repeatable.drop',{repeatable_id:k.repeatableId,selected_date:iso(hit.day),start_minute:hit.at==null?
 null:clamp(hit.at,DAY_FROM,1440-k.min)});
@@ -173,10 +208,11 @@ frac=1-(y-30)/(r.height-60);
   U.ppd=PPD_MIN*Math.pow(PPD_MAX/PPD_MIN,frac);const day=ctx.D.scaling.day;ctx.render();const av=ctx.$('#av');av.scrollTop=day*U.ppd-av.clientHeight/2;
 }
 ctx.listen(document,'wheel',e=>{
-  const strip=e.target.closest('[data-scroll-strip]');if(strip&&!e.ctrlKey){const delta=e.deltaY||e.deltaX,max=strip.scrollWidth-strip.clientWidth;if((delta>0&&strip.scrollLeft<max-1)||(delta<0&&strip.scrollLeft>0)){e.preventDefault();strip.scrollLeft+=delta;}return;}
+  // Over an overflowing strip the wheel scrolls only the strip, never the page (also at its ends).
+  const strip=e.target.closest('[data-scroll-strip]');if(strip&&!e.ctrlKey){const delta=e.deltaY||e.deltaX,max=strip.scrollWidth-strip.clientWidth;if(max>1){e.preventDefault();strip.scrollLeft=Math.max(0,Math.min(max,strip.scrollLeft+delta));}return;}
   const av=e.target.closest('#av');if(!av||!e.ctrlKey)return;e.preventDefault();
   const rect=av.getBoundingClientRect(),day=(av.scrollTop+e.clientY-rect.top)/U.ppd;
   U.ppd=clamp(U.ppd*Math.exp(-e.deltaY*.0015),PPD_MIN,PPD_MAX);ctx.render();const n=ctx.$('#av');n.scrollTop=day*U.ppd-(e.clientY-rect.top);
 },{passive:false});
-Object.assign(ctx,{setOver,cancelDrags,ghostText,hitAt,moveBand,endBand,paintArrow,moveGl,edgeScroll,endGl,moveResize,endResize,moveCube,endCube,applyScale});
+Object.assign(ctx,{cubePart,setOver,cancelDrags,ghostText,hitAt,moveBand,endBand,paintArrow,moveGl,edgeScroll,endGl,moveResize,endResize,moveCube,endCube,applyScale});
 }

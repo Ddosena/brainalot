@@ -42,11 +42,11 @@ may create a Google Calendar event, so use it only for the user's own dictation.
 
 Development checks:
 
-Current Work edition (0.2.28): Work is enabled. Day/Week share the server plan;
+Current Work edition (0.2.31): Work is enabled. Day/Week share the server plan;
 the independent no-Work edition and its update channel remain separate.
-Brainalot and Work have independent default window sizes (410x800 and 1600x1000),
-captured only by the explicit size checkbox. Panel density defaults to 70 percent
-of its adaptive scale; Work keeps its scale. Preserve these settings and data.
+Brainalot and Work have independent default window sizes (620x1000 and 1600x1000),
+captured only by the explicit size checkbox. The panel uses its adaptive scale;
+Work keeps its scale. Preserve these settings and data.
 Full, compact card and side tab are always topmost, with no hide-to-tray state.
 Window changes never change time accounting. Closing exits through safe pause.
 All clients use the same TimeStore journal and source/id task references.

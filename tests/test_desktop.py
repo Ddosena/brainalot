@@ -357,7 +357,8 @@ def test_drag_threshold_and_side_snap_do_not_command_time(tmp_path, monkeypatch)
 
 def test_deferred_right_drag_uses_native_press_origin_and_probe_does_not_begin(tmp_path, monkeypatch):
     host = desktop.DesktopHost(tmp_path,8780,"test",lambda: True)
-    monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1080)])
+    # Tall enough that the 620x1000 Brainalot window can move down without clamping.
+    monkeypatch.setattr(host,"_areas",lambda:[desktop.WorkArea(0,0,1920,1440)])
     host.create_windows(Webview());host.window_action("full")
     cursor=[(100,100)]
     monkeypatch.setattr(desktop,"cursor_position",lambda:cursor[0])
@@ -530,8 +531,8 @@ def test_full_geometry_migrates_once_then_preserves_manual_resize(tmp_path,monke
     host=desktop.DesktopHost(tmp_path,8780,'test',lambda:True)
     monkeypatch.setattr(host,'_areas',lambda:[area])
     migrated,_=host._rect('full')
-    assert migrated['width']==round(410*area.dpi/96)
-    assert migrated['height']==min(area.height,round(800*area.dpi/96))
+    assert migrated['width']==round(620*area.dpi/96)
+    assert migrated['height']==min(area.height,round(1000*area.dpi/96))
     assert area.y<=migrated['y']<=area.y+area.height-migrated['height']
     assert desktop.DesktopState(tmp_path).data['full_geometry_layout']==desktop.FULL_GEOMETRY_LAYOUT
     manual={**migrated,'width':620,'height':650,'units':'physical','dpi':area.dpi}

@@ -2,14 +2,15 @@ import {t} from '../i18n.js';
 const PLANNING = new Set(['manual_start','manual_project','manual_project_delete','manual_task','manual_task_delete','manual_cube','cube_progress',
 'cube_delete','constructor_cube','constructor_goal_status','day_outcome']);
 const PERIOD = new Set(['period_shift','period_set','period_clear','project_visibility','task_rename','cube_rename','cube_select','cube_time',
-'cube_move','cube_drop','cube_resize','cube_return','cube_pin','cube_activity_set','repeatable_save','repeatable_delete','repeatable_drop',
+'goal_hide','cube_move','cube_drop','cube_resize','cube_return','cube_pin','cube_activity_set','repeatable_save','repeatable_delete','repeatable_drop',
 'standalone_create','standalone_update','standalone_delete','standalone_undo']);
 const pad = n => String(n).padStart(2,'0');
 const hhmm = n => n == null ? null : pad(Math.floor(n / 60))+':'+pad(n % 60);
 const localDate=()=>{const d=new Date();return [d.getFullYear(),pad(d.getMonth()+1),pad(d.getDate())].join('-');};
 const addDays = (value, days) => {const d = new Date(value + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate()+days); return d.toISOString().slice(0,10);};
 export function createCommands(transport) {
-  let queue = Promise.resolve(), inverse = [];
+  // Each entry undoes one dispatched intent; Ctrl+Z walks back through them.
+  let queue = Promise.resolve(), history = [];
   const send = (action, data) => transport.command(action, data, {route:PLANNING.has(action) ? '/api/work/planning' : '/api/work/period/command'});
   async function dispatch({type, payload:p = {}}) {
     let result,sourceUndo=String(type).startsWith('standalone_');
@@ -56,6 +57,7 @@ p.planned_minutes ?? x.minutes,start:p.start_date ?? x.start,end:p.end_date ?? x
 p.delta_days)}); break;}
       case 'goal.done': {const x=get('tasks',p.id); await run('day_outcome',{task_id:p.id,date:p.done ? model().today : x.completed_on,done:!!p.done}); break;}
       case 'goal.delete': await run('manual_task_delete',{task_id:p.id}); break;
+      case 'goal.hide': await run('goal_hide',{task_id:p.id,hidden:!!p.hidden}); break;
       case 'cube.create': {
         if(p.new_project){
           await run('manual_project',{name:p.new_project.name,color:p.new_project.color});
@@ -124,15 +126,16 @@ date:model().today,start:null});
     result = steps.length === 1 ? await send(steps[0].action,steps[0].data) : await send('ui_batch',{commands:steps});
     const revision = result.result?.revision ?? result.model?.revision;
     const operation=result.result?.source_result?.operation_id;
-    inverse = sourceUndo&&operation?[{operation_id:operation}]:!sourceUndo&&!externalDelete && type !== 'plan.start' && type !== 'manual_start' &&
+    const inverse = sourceUndo&&operation?[{operation_id:operation}]:!sourceUndo&&!externalDelete && type !== 'plan.start' && type !== 'manual_start' &&
  Number.isInteger(revision) ? [revision] : [];
+    history = inverse.length ? [...history.slice(-19), inverse] : [];
     return {...result, undo:inverse.length ? true : null};
   }
   function execute(intent){const pending=queue.then(()=>dispatch(intent));queue=pending.catch(()=>{});return pending;}
-  function undo(){ const pending=queue.then(async()=>{ let result=null; while(inverse.length){const item=inverse[inverse.length-1];
-result=typeof item==='number'?await send('undo',{revision:item}):await send('standalone_undo',item);inverse.pop(); } return result; });
+  function undo(){ const pending=queue.then(async()=>{ let result=null; const inverse=history[history.length-1]||[]; while(inverse.length){const item=inverse[inverse.length-1];
+result=typeof item==='number'?await send('undo',{revision:item}):await send('standalone_undo',item);inverse.pop(); } if(!inverse.length)history.pop(); return result; });
  queue=pending.catch(()=>{}); return pending; }
-  return {execute, get canUndo(){return inverse.length > 0;}, undo,async flush(){await queue;await transport.flush?.();}};
+  return {execute, get canUndo(){return history.length > 0;}, undo,async flush(){await queue;await transport.flush?.();}};
 }
 
 
